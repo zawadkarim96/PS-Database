@@ -1,0 +1,596 @@
+import os, sqlite3, hashlib
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from textwrap import dedent
+import pandas as pd
+import streamlit as st
+
+# ---------- Config ----------
+load_dotenv()
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "ps_crm.db"))
+DATE_FMT = "%d-%m-%Y"
+
+# ---------- Schema ----------
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    pass_hash TEXT,
+    role TEXT DEFAULT 'staff',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS customers (
+    customer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    phone TEXT,
+    email TEXT,
+    address TEXT,
+    city TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    dup_flag INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS products (
+    product_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    model TEXT,
+    serial TEXT,
+    unit_price REAL,
+    dup_flag INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS orders (
+    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER,
+    order_date TEXT,
+    delivery_date TEXT,
+    notes TEXT,
+    dup_flag INTEGER DEFAULT 0,
+    FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS order_items (
+    order_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    product_id INTEGER,
+    quantity INTEGER DEFAULT 1,
+    unit_price REAL,
+    FOREIGN KEY(order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
+    FOREIGN KEY(product_id) REFERENCES products(product_id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS warranties (
+    warranty_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER,
+    product_id INTEGER,
+    serial TEXT,
+    issue_date TEXT,
+    expiry_date TEXT,
+    status TEXT DEFAULT 'active',
+    dup_flag INTEGER DEFAULT 0,
+    FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL,
+    FOREIGN KEY(product_id) REFERENCES products(product_id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS needs (
+    need_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER,
+    product TEXT,
+    unit TEXT,
+    unit_price REAL,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS interactions (
+    interaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER,
+    interaction_date TEXT,
+    channel TEXT,
+    notes TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
+);
+"""
+
+# ---------- Helpers ----------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def init_schema(conn):
+    conn.executescript(SCHEMA_SQL)
+    conn.commit()
+    # bootstrap admin if empty
+    cur = conn.execute("SELECT COUNT(*) FROM users")
+    if cur.fetchone()[0] == 0:
+        admin_user = os.getenv("ADMIN_USER", "admin")
+        admin_pass = os.getenv("ADMIN_PASS", "admin123")
+        h = hashlib.sha256(admin_pass.encode("utf-8")).hexdigest()
+        conn.execute("INSERT INTO users (username, pass_hash, role) VALUES (?, ?, 'admin')", (admin_user, h))
+        conn.commit()
+
+def df_query(conn, q, params=()):
+    return pd.read_sql_query(q, conn, params=params)
+
+def fmt_dates(df: pd.DataFrame, cols):
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime(DATE_FMT)
+    return df
+
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
+def init_ui():
+    st.set_page_config(page_title="PS Mini CRM", page_icon="🧰", layout="wide")
+    st.title("PS Engineering – Mini CRM")
+    st.caption("Customers • Warranties • Needs • Summaries")
+    if "user" not in st.session_state:
+        st.session_state.user = None
+
+# ---------- Auth ----------
+def login_box(conn):
+    st.sidebar.markdown("### Login")
+    if st.session_state.user:
+        st.sidebar.success(f"Logged in as {st.session_state.user['username']} ({st.session_state.user['role']})")
+        if st.sidebar.button("Logout"):
+            st.session_state.user = None
+            _safe_rerun()
+        return True
+    with st.sidebar.form("login_form"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Login")
+    if ok:
+        row = df_query(conn, "SELECT user_id, username, pass_hash, role FROM users WHERE username = ?", (u,))
+        if not row.empty and hashlib.sha256(p.encode("utf-8")).hexdigest() == row.iloc[0]["pass_hash"]:
+            st.session_state.user = {"user_id": int(row.iloc[0]["user_id"]), "username": row.iloc[0]["username"], "role": row.iloc[0]["role"]}
+            _safe_rerun()
+        else:
+            st.sidebar.error("Invalid credentials")
+    st.stop()
+
+def ensure_auth(role=None):
+    if role and st.session_state.user and st.session_state.user["role"] != role:
+        st.warning("You do not have permission to access this page.")
+        st.stop()
+
+# ---------- Pages ----------
+def dashboard(conn):
+    st.subheader("📊 Dashboard")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Customers", int(df_query(conn, "SELECT COUNT(*) c FROM customers").iloc[0]["c"]))
+    with col2:
+        st.metric("Active Warranties", int(df_query(conn, "SELECT COUNT(*) c FROM warranties WHERE status='active'").iloc[0]["c"]))
+    with col3:
+        st.metric("Needs", int(df_query(conn, "SELECT COUNT(*) c FROM needs").iloc[0]["c"]))
+
+    if st.session_state.user and st.session_state.user["role"] == "admin":
+        with open(DB_PATH, "rb") as dbfile:
+            st.download_button("⬇️ Download full database", dbfile, file_name=os.path.basename(DB_PATH))
+
+    st.markdown("---")
+    st.subheader("🛠️ Warranties Expiring Soon")
+    colA, colB = st.columns(2)
+
+    soon3 = df_query(conn, """
+        SELECT c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date
+        FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
+        LEFT JOIN products p ON p.product_id = w.product_id
+        WHERE w.status='active'
+          AND date(w.expiry_date) BETWEEN date('now') AND date('now', '+3 day')
+        ORDER BY date(w.expiry_date) ASC
+    """)
+    soon3 = fmt_dates(soon3, ["issue_date","expiry_date"])
+    with colA:
+        st.caption("Next **3** days")
+        st.dataframe(soon3)
+
+    soon60 = df_query(conn, """
+        SELECT c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date
+        FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
+        LEFT JOIN products p ON p.product_id = w.product_id
+        WHERE w.status='active'
+          AND date(w.expiry_date) BETWEEN date('now') AND date('now', '+60 day')
+        ORDER BY date(w.expiry_date) ASC
+    """)
+    soon60 = fmt_dates(soon60, ["issue_date","expiry_date"])
+    with colB:
+        st.caption("Next **60** days")
+        st.dataframe(soon60)
+
+def customers_page(conn):
+    st.subheader("👥 Customers")
+    with st.expander("Add new customer"):
+        with st.form("new_customer"):
+            name = st.text_input("Name *")
+            phone = st.text_input("Phone")
+            email = st.text_input("Email")
+            address = st.text_area("Address")
+            city = st.text_input("City")
+            st.markdown("**Purchase / Warranty (optional)**")
+            pur_date = st.date_input("Purchase/Issue date", value=datetime.now().date())
+            prod_name = st.text_input("Product")
+            prod_model = st.text_input("Model")
+            prod_serial = st.text_input("Serial")
+            unit = st.text_input("Unit (e.g., pcs, set)")
+            price = st.number_input("Unit price", min_value=0.0, value=0.0, step=0.01)
+            notes = st.text_input("Notes", value="")
+            submitted = st.form_submit_button("Save")
+            if submitted and name.strip():
+                cur = conn.cursor()
+                dupc = 0
+                if phone and phone.strip():
+                    cur.execute("SELECT 1 FROM customers WHERE phone=? LIMIT 1", (phone.strip(),))
+                    dupc = 1 if cur.fetchone() else 0
+                cur.execute("INSERT INTO customers (name, phone, email, address, city, dup_flag) VALUES (?, ?, ?, ?, ?, ?)",
+                            (name.strip(), phone, email, address, city, dupc))
+                cid = cur.lastrowid
+                conn.commit()
+                # If a product name is provided, create product and warranty
+                if prod_name.strip():
+                    # check for existing product by name+model
+                    cur.execute("SELECT product_id FROM products WHERE name=? AND IFNULL(model,'')=IFNULL(?, '') LIMIT 1", (prod_name.strip(), prod_model.strip() or None))
+                    row = cur.fetchone()
+                    if row:
+                        pid = row[0]
+                    else:
+                        cur.execute("INSERT INTO products (name, model, serial, unit_price) VALUES (?, ?, ?, ?)", (prod_name.strip(), prod_model.strip() or None, prod_serial.strip() or None, float(price) if price else None))
+                        pid = cur.lastrowid
+                    # create warranty 1-year from purchase date
+                    issue = pur_date.strftime("%Y-%m-%d")
+                    expiry = (pur_date + timedelta(days=365)).strftime("%Y-%m-%d")
+                    cur.execute("INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status) VALUES (?, ?, ?, ?, ?, 'active')",
+                                (cid, pid, prod_serial.strip() or None, issue, expiry))
+                    conn.commit()
+                st.success("Customer saved")
+
+    sort_dir = st.radio("Sort by created date", ["Newest first", "Oldest first"], horizontal=True)
+    order = "DESC" if sort_dir == "Newest first" else "ASC"
+    q = st.text_input("Search (name/phone/email/city)")
+    df = df_query(conn, f"""
+        SELECT customer_id as id, name, phone, email, address, city, created_at, dup_flag
+        FROM customers
+        WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR email LIKE '%'||?||'%' OR city LIKE '%'||?||'%')
+        ORDER BY datetime(created_at) {order}
+    """, (q,q,q,q,q))
+    df = fmt_dates(df, ["created_at"])
+    if "dup_flag" in df.columns:
+        df = df.assign(duplicate=df["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x)==1 else ""))
+    st.dataframe(df)
+    if not df.empty and 'dup_flag' in df.columns:
+        st.info("🔁 = duplicate phone detected")
+
+    st.markdown("**Recently Added Customers**")
+    recent_df = df_query(conn, """
+        SELECT customer_id as id, name, phone, email, city, created_at
+        FROM customers
+        ORDER BY datetime(created_at) DESC LIMIT 200
+    """)
+    recent_df = fmt_dates(recent_df, ["created_at"])
+    st.dataframe(recent_df)
+
+def warranties_page(conn):
+    st.subheader("🛡️ Warranties")
+    sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
+    order = "ASC" if sort_dir == "Soonest first" else "DESC"
+    q = st.text_input("Search (customer/product/model/serial)")
+
+    base = dedent(
+        """
+        SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial,
+               w.issue_date, w.expiry_date, w.status, w.dup_flag
+        FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
+        LEFT JOIN products p ON p.product_id = w.product_id
+        WHERE (? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')
+          AND {date_cond}
+        ORDER BY date(w.expiry_date) {order}
+        """
+    )
+
+    active = df_query(conn, base.format(date_cond="date(w.expiry_date) >= date('now')", order=order), (q,q,q,q,q))
+    active = fmt_dates(active, ["issue_date","expiry_date"])
+    if "dup_flag" in active.columns:
+        active = active.assign(duplicate=active["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
+    st.markdown("**Active Warranties**")
+    st.dataframe(active)
+
+    expired = df_query(conn, base.format(date_cond="date(w.expiry_date) < date('now')", order="DESC"), (q,q,q,q,q))
+    expired = fmt_dates(expired, ["issue_date","expiry_date"])
+    if "dup_flag" in expired.columns:
+        expired = expired.assign(duplicate=expired["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
+    st.markdown("**Expired Warranties**")
+    st.dataframe(expired)
+
+def customer_summary_page(conn):
+    st.subheader("📒 Customer Summary")
+    customers = df_query(conn, "SELECT customer_id, name FROM customers ORDER BY name ASC")
+    if customers.empty:
+        st.info("No customers yet.")
+        return
+    # Build safe mapping for Streamlit selectbox (strings only)
+    ids = customers["customer_id"].astype(int).tolist()
+    name_map = {int(i): str(n) for i, n in zip(customers["customer_id"].astype(int), customers["name"].fillna("").astype(str))}
+    cid = st.selectbox("Select customer", ids, format_func=lambda i: name_map.get(int(i), str(i)))
+    info = df_query(conn, "SELECT * FROM customers WHERE customer_id = ?", (int(cid),)).iloc[0].to_dict()
+    st.write("**Name:**", info.get("name"))
+    st.write("**Phone:**", info.get("phone"))
+    st.write("**Email:**", info.get("email"))
+    st.write("**Address:**", info.get("address"))
+    st.write("**City:**", info.get("city"))
+
+    st.markdown("---")
+    st.write("**Warranties**")
+    warr = df_query(conn, """
+        SELECT w.warranty_id as id, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.dup_flag
+        FROM warranties w
+        LEFT JOIN products p ON p.product_id = w.product_id
+        WHERE w.customer_id = ?
+        ORDER BY date(w.expiry_date) DESC
+    """, (int(cid),))
+    warr = fmt_dates(warr, ["issue_date","expiry_date"])
+    if "dup_flag" in warr.columns:
+        warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x)==1 else ""))
+    st.dataframe(warr)
+
+    st.write("**Interactions / Notes**")
+    notes = df_query(conn, "SELECT interaction_id as id, interaction_date, channel, notes FROM interactions WHERE customer_id = ? ORDER BY date(interaction_date) DESC", (int(cid),))
+    notes = fmt_dates(notes, ["interaction_date"])
+    st.dataframe(notes)
+    with st.form("add_note"):
+        when = st.date_input("Date", value=datetime.now().date())
+        channel = st.selectbox("Channel", ["call", "whatsapp", "sms, "email", "meeting", "other"])
+        note = st.text_area("Notes")
+        submitted = st.form_submit_button("Add note")
+        if submitted and note.strip():
+            conn.execute("INSERT INTO interactions (customer_id, interaction_date, channel, notes) VALUES (?, ?, ?, ?)", 
+                         (int(cid), when.strftime("%Y-%m-%d"), channel, note.strip()))
+            conn.commit()
+            st.success("Note added")
+
+# ---------- Import helpers ----------
+def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda x: [s.strip() for s in str(x).splitlines() if s.strip()] if isinstance(x, str) else [x]
+        )
+    df = df.explode(list(df.columns)).reset_index(drop=True)
+    return df
+
+def normalize_headers(cols):
+    norm = []
+    for c in cols:
+        s = str(c).strip().lower().replace(" ", "_")
+        norm.append(s)
+    return norm
+
+HEADER_MAP = {
+    "date": {"date","delivery_date","issue_date","order_date","dt","d_o","d","sale_date"},
+    "customer_name": {"customer_name","customer","company","company_name","client","party","name"},
+    "address": {"address","addr","street","location"},
+    "phone": {"phone","mobile","contact","contact_no","phone_no","phone_number","cell","whatsapp"},
+    "product": {"product","item","generator","model","description"},
+    "price": {"price","amount","unit_price","rate","value","tk","bdt"}
+}
+
+def map_headers_guess(cols):
+    cols_norm = normalize_headers(cols)
+    mapping = {"date":None,"customer_name":None,"address":None,"phone":None,"product":None,"price":None}
+    for i,cn in enumerate(cols_norm):
+        for target, aliases in HEADER_MAP.items():
+            if cn in aliases and mapping[target] is None:
+                mapping[target] = i
+                break
+    if cols_norm[:6] == ["date","customer_name","address","phone","product","price"]:
+        mapping = {k:i for i,k in enumerate(["date","customer_name","address","phone","product","price"])}
+    return mapping
+
+def coerce_excel_date(series):
+    s = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    if s.isna().mean() > 0.5:
+        try:
+            num = pd.to_numeric(series, errors="coerce")
+            if num.notna().sum() > 0 and (num.dropna().median() > 20000):
+                s = pd.to_datetime(num, unit="d", origin="1899-12-30", errors="coerce")
+        except Exception:
+            pass
+    return s
+
+def import_page(conn):
+    st.subheader("⬆️ Import from Excel/CSV (append)")
+    st.caption("We’ll auto-detect columns; you can override mapping. Dates accept DD-MM-YYYY or Excel serials.")
+    f = st.file_uploader("Upload .xlsx or .csv", type=["xlsx","csv"])
+    if f is None:
+        return
+    if f.name.endswith(".csv"):
+        df = pd.read_csv(f)
+    else:
+        df = pd.read_excel(f)
+    st.write("Preview:", df.head())
+
+    guess = map_headers_guess(list(df.columns))
+    cols = list(df.columns)
+    col1, col2, col3 = st.columns(3); col4, col5, col6 = st.columns(3)
+    sel_date = col1.selectbox("Date", options=cols, index=guess["date"] if guess["date"] is not None else 0)
+    sel_name = col2.selectbox("Customer name", options=cols, index=guess["customer_name"] if guess["customer_name"] is not None else 0)
+    sel_addr = col3.selectbox("Address", options=cols, index=guess["address"] if guess["address"] is not None else 0)
+    sel_phone = col4.selectbox("Phone", options=cols, index=guess["phone"] if guess["phone"] is not None else 0)
+    sel_prod = col5.selectbox("Product", options=cols, index=guess["product"] if guess["product"] is not None else 0)
+    sel_price = col6.selectbox("Price", options=cols, index=guess["price"] if guess["price"] is not None else 0)
+
+    df_norm = pd.DataFrame({
+        "date": df[sel_date],
+        "customer_name": df[sel_name],
+        "address": df[sel_addr],
+        "phone": df[sel_phone],
+        "product": df[sel_prod],
+        "price": df[sel_price],
+    })
+    df_norm = refine_multiline(df_norm)
+    df_norm["date"] = coerce_excel_date(df_norm["date"])
+    df_norm = df_norm.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df_norm = df_norm.drop_duplicates().sort_values(by=["date", "customer_name", "phone"]).reset_index(drop=True)
+    st.markdown("#### Dry-run preview (first 10 rows)")
+    st.dataframe(df_norm.head(10))
+
+    if st.button("Append into database"):
+        seeded, d_c, d_p = _import_clean6(conn, df_norm, tag="Manual import (mapped)")
+        if seeded == 0:
+            st.warning("No rows added (rows empty/invalid). Check mapping or file.")
+        else:
+            st.success(f"Imported {seeded} rows. Duplicates flagged — customers: {d_c}, products: {d_p}.")
+
+def duplicates_page(conn):
+    st.subheader("⚠️ Possible Duplicates")
+    cust = df_query(conn, "SELECT customer_id as id, name, phone, email, city, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC")
+    cust = fmt_dates(cust, ["created_at"])
+    prod = df_query(conn, "SELECT product_id as id, name, model, serial, unit_price, dup_flag FROM products ORDER BY name ASC")
+    warr = df_query(conn, "SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.dup_flag FROM warranties w LEFT JOIN customers c ON c.customer_id = w.customer_id LEFT JOIN products p ON p.product_id = w.product_id ORDER BY date(w.issue_date) DESC")
+    warr = fmt_dates(warr, ["issue_date","expiry_date"])
+
+    if not cust.empty:
+        cust = cust.assign(duplicate=cust["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x)==1 else ""))
+        st.markdown("**Customers (duplicate phone)**")
+        st.dataframe(cust[cust["dup_flag"]==1])
+    if not prod.empty:
+        prod = prod.assign(duplicate=prod["dup_flag"].apply(lambda x: "🔁 duplicate name+model" if int(x)==1 else ""))
+        st.markdown("**Products (duplicate name+model)**")
+        st.dataframe(prod[prod["dup_flag"]==1])
+    if not warr.empty:
+        warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
+        st.markdown("**Warranties (duplicate serial)**")
+        st.dataframe(warr[warr["dup_flag"]==1])
+
+def users_admin_page(conn):
+    ensure_auth(role="admin")
+    st.subheader("👤 Users (Admin)")
+    users = df_query(conn, "SELECT user_id as id, username, role, created_at FROM users ORDER BY datetime(created_at) DESC")
+    users = users.assign(created_at=pd.to_datetime(users["created_at"], errors="coerce").dt.strftime(DATE_FMT))
+    st.dataframe(users)
+
+    with st.expander("Add user"):
+        with st.form("add_user"):
+            u = st.textInput("Username")
+            p = st.text_input("Password", type="password")
+            role = st.selectbox("Role", ["staff", "admin"])
+            ok = st.form_submit_button("Create")
+            if ok and u.strip() and p.strip():
+                h = hashlib.sha256(p.encode("utf-8")).hexdigest()
+                try:
+                    conn.execute("INSERT INTO users (username, pass_hash, role) VALUES (?, ?, ?)", (u.strip(), h, role))
+                    conn.commit()
+                    st.success("User added")
+                except sqlite3.IntegrityError:
+                    st.error("Username already exists")
+
+    with st.expander("Reset password / delete"):
+        uid = st.number_input("User ID", min_value=1, step=1)
+        newp = st.text_input("New password", type="password")
+        col1, col2 = st.columns(2)
+        if col1.button("Set new password"):
+            h = hashlib.sha256(newp.encode("utf-8")).hexdigest()
+            conn.execute("UPDATE users SET pass_hash=? WHERE user_id=?", (h, int(uid)))
+            conn.commit()
+            st.success("Password updated")
+        if col2.button("Delete user"):
+            conn.execute("DELETE FROM users WHERE user_id=?", (int(uid),))
+            conn.commit()
+            st.warning("User deleted")
+
+# ---------- Import engine ----------
+def _import_clean6(conn, df, tag="Import"):
+    cur = conn.cursor()
+    seeded = 0
+    d_c = d_p = 0
+    for _, r in df.iterrows():
+        d = r.get("date", pd.NaT)
+        cust = r.get("customer_name"); addr = r.get("address")
+        phone = r.get("phone"); prod = r.get("product")
+        price = r.get("price")
+        if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
+            continue
+        phone = str(phone) if pd.notna(phone) else None
+        try: price = float(price) if pd.notna(price) else None
+        except Exception: price = None
+        # dup checks
+        def exists_phone(phone):
+            if not phone or str(phone).lower()=="nan": return False
+            cur.execute("SELECT 1 FROM customers WHERE phone = ? LIMIT 1", (str(phone),))
+            return cur.fetchone() is not None
+        dupc = 1 if exists_phone(phone) else 0
+        cur.execute("INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, ?)", (cust, phone, addr, dupc))
+        cid = cur.lastrowid
+        if dupc: d_c += 1
+
+        name, model = prod, None
+        if isinstance(prod, str) and "-" in prod:
+            name, model = prod.split("-", 1)
+            name, model = name.strip(), model.strip()
+        def exists_prod(name, model):
+            if not name: return False
+            cur.execute("SELECT 1 FROM products WHERE name = ? AND IFNULL(model,'') = IFNULL(?, '') LIMIT 1", (name, model))
+            return cur.fetchone() is not None
+        dupp = 1 if exists_prod(name, model) else 0
+        cur.execute("INSERT INTO products (name, model, unit_price, dup_flag) VALUES (?, ?, ?, ?)", (name, model, price, dupp))
+        pid = cur.lastrowid
+        if dupp: d_p += 1
+
+        # we still record orders (hidden) to keep a timeline if needed
+        order_date = d if pd.notna(d) else None
+        delivery_date = d if pd.notna(d) else None
+        cur.execute("INSERT INTO orders (customer_id, order_date, delivery_date, notes) VALUES (?, ?, ?, ?)", 
+                    (cid,
+                     order_date.strftime("%Y-%m-%d") if order_date is not None else None,
+                     delivery_date.strftime("%Y-%m-%d") if delivery_date is not None else None,
+                     f"Imported ({tag})"))
+        oid = cur.lastrowid
+        cur.execute("INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)", (oid, pid, 1, price))
+
+        base = d if pd.notna(d) else pd.Timestamp.now()
+        expiry = base + pd.Timedelta(days=365)
+        cur.execute("INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, dup_flag) VALUES (?, ?, ?, ?, ?, 'active', 0)",
+                    (cid, pid, None, base.strftime("%Y-%m-%d"), expiry.strftime("%Y-%m-%d")))
+        seeded += 1
+    conn.commit()
+    return seeded, d_c, d_p
+
+# ---------- Main ----------
+def main():
+    init_ui()
+    conn = get_conn()
+    init_schema(conn)
+    login_box(conn)
+
+    with st.sidebar:
+        pages = ["Dashboard", "Customers", "Customer Summary", "Warranties", "Import", "Duplicates"]
+        if st.session_state.user and st.session_state.user["role"] == "admin":
+            pages.append("Users (Admin)")
+        page = st.radio("Navigate", pages)
+
+    if page == "Dashboard":
+        dashboard(conn)
+    elif page == "Customers":
+        customers_page(conn)
+    elif page == "Customer Summary":
+        customer_summary_page(conn)
+    elif page == "Warranties":
+        warranties_page(conn)
+    elif page == "Import":
+        import_page(conn)
+    elif page == "Duplicates":
+        duplicates_page(conn)
+    elif page == "Users (Admin)":
+        users_admin_page(conn)
+
+if __name__ == "__main__":
+    main()
+
