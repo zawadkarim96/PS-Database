@@ -518,6 +518,20 @@ def users_admin_page(conn):
 
 # ---------- Import engine ----------
 def _import_clean6(conn, df, tag="Import"):
+    """Import cleaned dataframe into database.
+
+    The function is resilient to messy input: it normalizes and sorts the
+    dataframe internally so callers can pass raw data without pre-processing.
+    """
+    # ensure dataframe is normalized even if caller didn't pre-clean
+    df = df.copy()
+    df = refine_multiline(df)
+    if "date" in df.columns:
+        df["date"] = coerce_excel_date(df["date"])
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.dropna(how="all").drop_duplicates().sort_values(by=["date", "customer_name", "phone"])\
+           .reset_index(drop=True)
+
     cur = conn.cursor()
     seeded = 0
     d_c = d_p = 0
@@ -528,47 +542,77 @@ def _import_clean6(conn, df, tag="Import"):
         price = r.get("price")
         if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
             continue
+        cust = str(cust) if pd.notna(cust) else None
+        addr = str(addr) if pd.notna(addr) else None
         phone = str(phone) if pd.notna(phone) else None
-        try: price = float(price) if pd.notna(price) else None
-        except Exception: price = None
+        prod = str(prod) if pd.notna(prod) else None
+        try:
+            price = float(price) if pd.notna(price) else None
+        except Exception:
+            price = None
         # dup checks
         def exists_phone(phone):
-            if not phone or str(phone).lower()=="nan": return False
+            if not phone or str(phone).lower() == "nan":
+                return False
             cur.execute("SELECT 1 FROM customers WHERE phone = ? LIMIT 1", (str(phone),))
             return cur.fetchone() is not None
+
         dupc = 1 if exists_phone(phone) else 0
-        cur.execute("INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, ?)", (cust, phone, addr, dupc))
+        cur.execute(
+            "INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, ?)",
+            (cust, phone, addr, dupc),
+        )
         cid = cur.lastrowid
-        if dupc: d_c += 1
+        if dupc:
+            d_c += 1
 
         name, model = prod, None
         if isinstance(prod, str) and "-" in prod:
             name, model = prod.split("-", 1)
             name, model = name.strip(), model.strip()
+
         def exists_prod(name, model):
-            if not name: return False
-            cur.execute("SELECT 1 FROM products WHERE name = ? AND IFNULL(model,'') = IFNULL(?, '') LIMIT 1", (name, model))
+            if not name:
+                return False
+            cur.execute(
+                "SELECT 1 FROM products WHERE name = ? AND IFNULL(model,'') = IFNULL(?, '') LIMIT 1",
+                (name, model),
+            )
             return cur.fetchone() is not None
+
         dupp = 1 if exists_prod(name, model) else 0
-        cur.execute("INSERT INTO products (name, model, unit_price, dup_flag) VALUES (?, ?, ?, ?)", (name, model, price, dupp))
+        cur.execute(
+            "INSERT INTO products (name, model, unit_price, dup_flag) VALUES (?, ?, ?, ?)",
+            (name, model, price, dupp),
+        )
         pid = cur.lastrowid
-        if dupp: d_p += 1
+        if dupp:
+            d_p += 1
 
         # we still record orders (hidden) to keep a timeline if needed
         order_date = d if pd.notna(d) else None
         delivery_date = d if pd.notna(d) else None
-        cur.execute("INSERT INTO orders (customer_id, order_date, delivery_date, notes) VALUES (?, ?, ?, ?)", 
-                    (cid,
-                     order_date.strftime("%Y-%m-%d") if order_date is not None else None,
-                     delivery_date.strftime("%Y-%m-%d") if delivery_date is not None else None,
-                     f"Imported ({tag})"))
+        cur.execute(
+            "INSERT INTO orders (customer_id, order_date, delivery_date, notes) VALUES (?, ?, ?, ?)",
+            (
+                cid,
+                order_date.strftime("%Y-%m-%d") if order_date is not None else None,
+                delivery_date.strftime("%Y-%m-%d") if delivery_date is not None else None,
+                f"Imported ({tag})",
+            ),
+        )
         oid = cur.lastrowid
-        cur.execute("INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)", (oid, pid, 1, price))
+        cur.execute(
+            "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
+            (oid, pid, 1, price),
+        )
 
         base = d if pd.notna(d) else pd.Timestamp.now()
         expiry = base + pd.Timedelta(days=365)
-        cur.execute("INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, dup_flag) VALUES (?, ?, ?, ?, ?, 'active', 0)",
-                    (cid, pid, None, base.strftime("%Y-%m-%d"), expiry.strftime("%Y-%m-%d")))
+        cur.execute(
+            "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, dup_flag) VALUES (?, ?, ?, ?, ?, 'active', 0)",
+            (cid, pid, None, base.strftime("%Y-%m-%d"), expiry.strftime("%Y-%m-%d")),
+        )
         seeded += 1
     conn.commit()
     return seeded, d_c, d_p
