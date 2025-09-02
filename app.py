@@ -3,6 +3,16 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from textwrap import dedent
 import pandas as pd
+
+# Configure Streamlit to work on Render by honoring the PORT environment variable.
+# Render dynamically assigns a port for web services via the PORT env var, which
+# Streamlit doesn't read by default. Setting these before importing Streamlit
+# ensures the app binds to the correct interface and runs in headless mode.
+if "PORT" in os.environ:
+    os.environ["STREAMLIT_SERVER_PORT"] = os.environ["PORT"]
+    os.environ["STREAMLIT_SERVER_ADDRESS"] = "0.0.0.0"
+    os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+
 import streamlit as st
 
 # ---------- Config ----------
