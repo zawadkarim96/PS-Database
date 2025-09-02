@@ -171,7 +171,13 @@ def dashboard(conn):
     with col2:
         st.metric("Active Warranties", int(df_query(conn, "SELECT COUNT(*) c FROM warranties WHERE status='active'").iloc[0]["c"]))
     with col3:
-        st.metric("Needs", int(df_query(conn, "SELECT COUNT(*) c FROM needs").iloc[0]["c"]))
+        expired_count = int(
+            df_query(
+                conn,
+                "SELECT COUNT(*) c FROM warranties WHERE date(expiry_date) < date('now')",
+            ).iloc[0]["c"]
+        )
+        st.metric("Expired", expired_count)
 
     if st.session_state.user and st.session_state.user["role"] == "admin":
         with open(DB_PATH, "rb") as dbfile:
@@ -483,7 +489,7 @@ def users_admin_page(conn):
 
     with st.expander("Add user"):
         with st.form("add_user"):
-            u = st.textInput("Username")
+            u = st.text_input("Username")
             p = st.text_input("Password", type="password")
             role = st.selectbox("Role", ["staff", "admin"])
             ok = st.form_submit_button("Create")
