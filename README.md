@@ -7,3 +7,5 @@
 - Login safe rerun for all Streamlit versions
 
 v7.5: Fixed selectbox errors; 'Add Customer' now supports Purchase/Warranty fields (date, product, model, serial, unit, price) and auto-creates warranty.
+v7.6: Admins can bulk-delete customers from the Customers page with a select-all option.
+v7.7: Importer allows blank column mappings and optional skipping of blank rows. Dashboard counts active warranties by expiry date. Customer summaries merge duplicate records and report how many were combined.
