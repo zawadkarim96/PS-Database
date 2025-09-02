@@ -5,6 +5,9 @@ from textwrap import dedent
 import pandas as pd
 import streamlit as st
 
+# Channel options for interaction notes
+CHANNEL_OPTIONS = ["call", "whatsapp", "sms", "email", "meeting", "other"]
+
 # ---------- Config ----------
 load_dotenv()
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "ps_crm.db"))
@@ -347,11 +350,11 @@ def customer_summary_page(conn):
     st.dataframe(notes)
     with st.form("add_note"):
         when = st.date_input("Date", value=datetime.now().date())
-        channel = st.selectbox("Channel", ["call", "whatsapp", "sms, "email", "meeting", "other"])
+        channel = st.selectbox("Channel", CHANNEL_OPTIONS)
         note = st.text_area("Notes")
         submitted = st.form_submit_button("Add note")
         if submitted and note.strip():
-            conn.execute("INSERT INTO interactions (customer_id, interaction_date, channel, notes) VALUES (?, ?, ?, ?)", 
+            conn.execute("INSERT INTO interactions (customer_id, interaction_date, channel, notes) VALUES (?, ?, ?, ?)",
                          (int(cid), when.strftime("%Y-%m-%d"), channel, note.strip()))
             conn.commit()
             st.success("Note added")
@@ -438,6 +441,7 @@ def import_page(conn):
     df_norm = refine_multiline(df_norm)
     df_norm["date"] = coerce_excel_date(df_norm["date"])
     df_norm = df_norm.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df_norm = df_norm.dropna(how='all')
     df_norm = df_norm.drop_duplicates().sort_values(by=["date", "customer_name", "phone"]).reset_index(drop=True)
     st.markdown("#### Dry-run preview (first 10 rows)")
     st.dataframe(df_norm.head(10))
