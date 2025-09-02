@@ -169,7 +169,15 @@ def dashboard(conn):
     with col1:
         st.metric("Customers", int(df_query(conn, "SELECT COUNT(*) c FROM customers").iloc[0]["c"]))
     with col2:
-        st.metric("Active Warranties", int(df_query(conn, "SELECT COUNT(*) c FROM warranties WHERE status='active'").iloc[0]["c"]))
+        st.metric(
+            "Active Warranties",
+            int(
+                df_query(
+                    conn,
+                    "SELECT COUNT(*) c FROM warranties WHERE date(expiry_date) >= date('now')",
+                ).iloc[0]["c"]
+            ),
+        )
     with col3:
         expired_count = int(
             df_query(
@@ -286,6 +294,30 @@ def customers_page(conn):
     recent_df = fmt_dates(recent_df, ["created_at"])
     st.dataframe(recent_df)
 
+    if st.session_state.user and st.session_state.user.get("role") == "admin":
+        st.markdown("---")
+        st.markdown("**Delete Customers**")
+        all_cust = df_query(conn, "SELECT customer_id, name FROM customers ORDER BY name ASC")
+        if all_cust.empty:
+            st.info("No customers to delete.")
+        else:
+            ids = all_cust["customer_id"].astype(int).tolist()
+            name_map = {int(i): str(n) for i, n in zip(all_cust["customer_id"].astype(int), all_cust["name"].fillna("").astype(str))}
+            select_all = st.checkbox("Select all customers", key="del_all_customers")
+            selected = st.multiselect(
+                "Customers to delete",
+                ids,
+                default=ids if select_all else [],
+                format_func=lambda i: name_map.get(int(i), str(i)),
+                key="del_customers",
+            )
+            if selected and st.button("Delete selected", type="primary"):
+                cur = conn.cursor()
+                cur.executemany("DELETE FROM customers WHERE customer_id=?", [(int(i),) for i in selected])
+                conn.commit()
+                st.success(f"Deleted {len(selected)} customers.")
+                _safe_rerun()
+
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
     sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
@@ -321,37 +353,78 @@ def warranties_page(conn):
 
 def customer_summary_page(conn):
     st.subheader("📒 Customer Summary")
-    customers = df_query(conn, "SELECT customer_id, name FROM customers ORDER BY name ASC")
+    blank_label = "(blank)"
+    customers = df_query(
+        conn,
+        f"""
+        SELECT COALESCE(NULLIF(name, ''), '{blank_label}') AS name, GROUP_CONCAT(customer_id) AS ids, COUNT(*) AS cnt
+        FROM customers
+        GROUP BY COALESCE(NULLIF(name, ''), '{blank_label}')
+        ORDER BY name ASC
+        """,
+    )
     if customers.empty:
         st.info("No customers yet.")
         return
-    # Build safe mapping for Streamlit selectbox (strings only)
-    ids = customers["customer_id"].astype(int).tolist()
-    name_map = {int(i): str(n) for i, n in zip(customers["customer_id"].astype(int), customers["name"].fillna("").astype(str))}
-    cid = st.selectbox("Select customer", ids, format_func=lambda i: name_map.get(int(i), str(i)))
-    info = df_query(conn, "SELECT * FROM customers WHERE customer_id = ?", (int(cid),)).iloc[0].to_dict()
-    st.write("**Name:**", info.get("name"))
+
+    names = customers["name"].tolist()
+    name_map = {
+        row["name"]: f"{row['name']} ({int(row['cnt'])} records)" if int(row["cnt"]) > 1 else row["name"]
+        for _, row in customers.iterrows()
+    }
+    sel_name = st.selectbox("Select customer", names, format_func=lambda n: name_map.get(n, n))
+    row = customers[customers["name"] == sel_name].iloc[0]
+    ids = [int(i) for i in str(row["ids"]).split(",") if i]
+    cnt = int(row["cnt"])
+
+    info = df_query(
+        conn,
+        f"""
+        SELECT
+            MAX(name) AS name,
+            GROUP_CONCAT(DISTINCT phone) AS phone,
+            GROUP_CONCAT(DISTINCT email) AS email,
+            GROUP_CONCAT(DISTINCT address) AS address,
+            GROUP_CONCAT(DISTINCT city) AS city
+        FROM customers
+        WHERE customer_id IN ({','.join('?'*len(ids))})
+        """,
+        ids,
+    ).iloc[0].to_dict()
+
+    st.write("**Name:**", info.get("name") or blank_label)
     st.write("**Phone:**", info.get("phone"))
     st.write("**Email:**", info.get("email"))
     st.write("**Address:**", info.get("address"))
     st.write("**City:**", info.get("city"))
+    if cnt > 1:
+        st.caption(f"Merged from {cnt} duplicates")
 
     st.markdown("---")
     st.write("**Warranties**")
-    warr = df_query(conn, """
+    placeholders = ",".join("?" * len(ids))
+    warr = df_query(
+        conn,
+        f"""
         SELECT w.warranty_id as id, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.dup_flag
         FROM warranties w
         LEFT JOIN products p ON p.product_id = w.product_id
-        WHERE w.customer_id = ?
+        WHERE w.customer_id IN ({placeholders})
         ORDER BY date(w.expiry_date) DESC
-    """, (int(cid),))
+        """,
+        ids,
+    )
     warr = fmt_dates(warr, ["issue_date","expiry_date"])
     if "dup_flag" in warr.columns:
-        warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x)==1 else ""))
+        warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x) == 1 else ""))
     st.dataframe(warr)
 
     st.write("**Interactions / Notes**")
-    notes = df_query(conn, "SELECT interaction_id as id, interaction_date, channel, notes FROM interactions WHERE customer_id = ? ORDER BY date(interaction_date) DESC", (int(cid),))
+    notes = df_query(
+        conn,
+        f"SELECT interaction_id as id, interaction_date, channel, notes FROM interactions WHERE customer_id IN ({placeholders}) ORDER BY date(interaction_date) DESC",
+        ids,
+    )
     notes = fmt_dates(notes, ["interaction_date"])
     st.dataframe(notes)
     with st.form("add_note"):
@@ -360,8 +433,11 @@ def customer_summary_page(conn):
         note = st.text_area("Notes")
         submitted = st.form_submit_button("Add note")
         if submitted and note.strip():
-            conn.execute("INSERT INTO interactions (customer_id, interaction_date, channel, notes) VALUES (?, ?, ?, ?)",
-                         (int(cid), when.strftime("%Y-%m-%d"), channel, note.strip()))
+            for cid in ids:
+                conn.execute(
+                    "INSERT INTO interactions (customer_id, interaction_date, channel, notes) VALUES (?, ?, ?, ?)",
+                    (int(cid), when.strftime("%Y-%m-%d"), channel, note.strip()),
+                )
             conn.commit()
             st.success("Note added")
 
@@ -428,26 +504,46 @@ def import_page(conn):
 
     guess = map_headers_guess(list(df.columns))
     cols = list(df.columns)
+    opts = ["(blank)"] + cols
     col1, col2, col3 = st.columns(3); col4, col5, col6 = st.columns(3)
-    sel_date = col1.selectbox("Date", options=cols, index=guess["date"] if guess["date"] is not None else 0)
-    sel_name = col2.selectbox("Customer name", options=cols, index=guess["customer_name"] if guess["customer_name"] is not None else 0)
-    sel_addr = col3.selectbox("Address", options=cols, index=guess["address"] if guess["address"] is not None else 0)
-    sel_phone = col4.selectbox("Phone", options=cols, index=guess["phone"] if guess["phone"] is not None else 0)
-    sel_prod = col5.selectbox("Product", options=cols, index=guess["product"] if guess["product"] is not None else 0)
-    sel_price = col6.selectbox("Price", options=cols, index=guess["price"] if guess["price"] is not None else 0)
+    sel_date = col1.selectbox(
+        "Date", options=opts, index=(guess["date"] + 1) if guess["date"] is not None else 0
+    )
+    sel_name = col2.selectbox(
+        "Customer name", options=opts, index=(guess["customer_name"] + 1) if guess["customer_name"] is not None else 0
+    )
+    sel_addr = col3.selectbox(
+        "Address", options=opts, index=(guess["address"] + 1) if guess["address"] is not None else 0
+    )
+    sel_phone = col4.selectbox(
+        "Phone", options=opts, index=(guess["phone"] + 1) if guess["phone"] is not None else 0
+    )
+    sel_prod = col5.selectbox(
+        "Product", options=opts, index=(guess["product"] + 1) if guess["product"] is not None else 0
+    )
+    sel_price = col6.selectbox(
+        "Price", options=opts, index=(guess["price"] + 1) if guess["price"] is not None else 0
+    )
 
-    df_norm = pd.DataFrame({
-        "date": df[sel_date],
-        "customer_name": df[sel_name],
-        "address": df[sel_addr],
-        "phone": df[sel_phone],
-        "product": df[sel_prod],
-        "price": df[sel_price],
-    })
+    def pick(col_name):
+        return df[col_name] if col_name != "(blank)" else pd.Series([None] * len(df))
+
+    df_norm = pd.DataFrame(
+        {
+            "date": pick(sel_date),
+            "customer_name": pick(sel_name),
+            "address": pick(sel_addr),
+            "phone": pick(sel_phone),
+            "product": pick(sel_prod),
+            "price": pick(sel_price),
+        }
+    )
+    skip_blanks = st.checkbox("Skip blank rows", value=True)
     df_norm = refine_multiline(df_norm)
     df_norm["date"] = coerce_excel_date(df_norm["date"])
     df_norm = df_norm.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    df_norm = df_norm.dropna(how='all')
+    if skip_blanks:
+        df_norm = df_norm.dropna(how="all")
     df_norm = df_norm.drop_duplicates().sort_values(by=["date", "customer_name", "phone"]).reset_index(drop=True)
     st.markdown("#### Dry-run preview (first 10 rows)")
     st.dataframe(df_norm.head(10))
