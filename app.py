@@ -5,9 +5,6 @@ from textwrap import dedent
 import pandas as pd
 import streamlit as st
 
-# Channel options for interaction notes
-CHANNEL_OPTIONS = ["call", "whatsapp", "sms", "email", "meeting", "other"]
-
 # ---------- Config ----------
 load_dotenv()
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "ps_crm.db"))
@@ -79,14 +76,6 @@ CREATE TABLE IF NOT EXISTS needs (
     unit_price REAL,
     notes TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS interactions (
-    interaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_id INTEGER,
-    interaction_date TEXT,
-    channel TEXT,
-    notes TEXT,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 );
 """
@@ -239,7 +228,6 @@ def customers_page(conn):
             prod_serial = st.text_input("Serial")
             unit = st.text_input("Unit (e.g., pcs, set)")
             price = st.number_input("Unit price", min_value=0.0, value=0.0, step=0.01)
-            notes = st.text_input("Notes", value="")
             submitted = st.form_submit_button("Save")
             if submitted and name.strip():
                 cur = conn.cursor()
@@ -418,28 +406,6 @@ def customer_summary_page(conn):
     if "dup_flag" in warr.columns:
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x) == 1 else ""))
     st.dataframe(warr)
-
-    st.write("**Interactions / Notes**")
-    notes = df_query(
-        conn,
-        f"SELECT interaction_id as id, interaction_date, channel, notes FROM interactions WHERE customer_id IN ({placeholders}) ORDER BY date(interaction_date) DESC",
-        ids,
-    )
-    notes = fmt_dates(notes, ["interaction_date"])
-    st.dataframe(notes)
-    with st.form("add_note"):
-        when = st.date_input("Date", value=datetime.now().date())
-        channel = st.selectbox("Channel", CHANNEL_OPTIONS)
-        note = st.text_area("Notes")
-        submitted = st.form_submit_button("Add note")
-        if submitted and note.strip():
-            for cid in ids:
-                conn.execute(
-                    "INSERT INTO interactions (customer_id, interaction_date, channel, notes) VALUES (?, ?, ?, ?)",
-                    (int(cid), when.strftime("%Y-%m-%d"), channel, note.strip()),
-                )
-            conn.commit()
-            st.success("Note added")
 
 # ---------- Import helpers ----------
 def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
