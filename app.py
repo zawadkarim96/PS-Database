@@ -286,6 +286,30 @@ def customers_page(conn):
     recent_df = fmt_dates(recent_df, ["created_at"])
     st.dataframe(recent_df)
 
+    if st.session_state.user and st.session_state.user.get("role") == "admin":
+        st.markdown("---")
+        st.markdown("**Delete Customers**")
+        all_cust = df_query(conn, "SELECT customer_id, name FROM customers ORDER BY name ASC")
+        if all_cust.empty:
+            st.info("No customers to delete.")
+        else:
+            ids = all_cust["customer_id"].astype(int).tolist()
+            name_map = {int(i): str(n) for i, n in zip(all_cust["customer_id"].astype(int), all_cust["name"].fillna("").astype(str))}
+            select_all = st.checkbox("Select all customers", key="del_all_customers")
+            selected = st.multiselect(
+                "Customers to delete",
+                ids,
+                default=ids if select_all else [],
+                format_func=lambda i: name_map.get(int(i), str(i)),
+                key="del_customers",
+            )
+            if selected and st.button("Delete selected", type="primary"):
+                cur = conn.cursor()
+                cur.executemany("DELETE FROM customers WHERE customer_id=?", [(int(i),) for i in selected])
+                conn.commit()
+                st.success(f"Deleted {len(selected)} customers.")
+                _safe_rerun()
+
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
     sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
