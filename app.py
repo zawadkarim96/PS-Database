@@ -4,16 +4,6 @@ from dotenv import load_dotenv
 from textwrap import dedent
 import pandas as pd
 
-# Configure Streamlit defaults for hosted environments (e.g. Render).
-# Render assigns a PORT dynamically and expects the app to bind to 0.0.0.0.
-# We set these defaults before importing Streamlit so local runs can still
-# override them via CLI flags/environment variables when needed.
-port = os.environ.get("PORT")
-if port:
-    os.environ.setdefault("STREAMLIT_SERVER_PORT", port)
-os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
-os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
-os.environ.setdefault("STREAMLIT_BROWSER_GATHERUSAGESTATS", "false")
 
 import streamlit as st
 
@@ -163,45 +153,7 @@ def _safe_rerun():
         except Exception:
             pass
 
-
-def _streamlit_runtime_active() -> bool:
-    """Return True when running inside Streamlit's runtime."""
-
-    try:
-        return st.runtime.exists()
-    except Exception:
-        return False
-
-
-def _bootstrap_streamlit_app():
-    """Launch Streamlit manually when executed via `python app.py`."""
-
-    try:
-        from streamlit.web import bootstrap
-    except ImportError:  # pragma: no cover - very old Streamlit versions
-        raise RuntimeError(
-            "Streamlit bootstrap API unavailable. Upgrade Streamlit or run via `streamlit run app.py`."
-        )
-
-    port_env = os.environ.get("PORT") or os.environ.get("STREAMLIT_SERVER_PORT") or "8501"
-    try:
-        port_value = int(str(port_env).strip())
-    except (TypeError, ValueError):
-        port_value = 8501
-
-    address = os.environ.get("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
-
-    flag_options = {
-        "server_headless": True,
-        "server_address": address,
-        "server_port": port_value,
-        "browser_gatherUsageStats": False,
-    }
-
-    bootstrap.load_config_options(flag_options)
-    bootstrap.run(os.path.abspath(__file__), False, [], flag_options)
-
-
+ 
 def recalc_customer_duplicate_flag(conn, phone):
     if not phone or str(phone).strip() == "":
         return
