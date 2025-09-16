@@ -63,3 +63,30 @@ def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
         f"SELECT COUNT(*) FROM customers WHERE {app_module.customer_complete_clause()}"
     ).fetchone()[0]
     assert complete_after == 1
+
+
+def test_streamlit_flag_options_from_env_uses_port_and_host(monkeypatch, app_module):
+    monkeypatch.setenv("PORT", "9999")
+    monkeypatch.setenv("HOST", "1.2.3.4")
+    flags = app_module._streamlit_flag_options_from_env()
+    assert flags["server.port"] == 9999
+    assert flags["server.address"] == "1.2.3.4"
+    assert flags["server.headless"] is True
+
+
+def test_streamlit_flag_options_from_env_respects_headless(monkeypatch, app_module):
+    monkeypatch.setenv("STREAMLIT_SERVER_HEADLESS", "false")
+    flags = app_module._streamlit_flag_options_from_env()
+    assert flags["server.headless"] is False
+
+
+def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_module):
+    monkeypatch.setenv("PORT", "not-a-number")
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("BIND_ADDRESS", raising=False)
+    monkeypatch.delenv("RENDER_EXTERNAL_HOSTNAME", raising=False)
+    monkeypatch.delenv("STREAMLIT_SERVER_HEADLESS", raising=False)
+    flags = app_module._streamlit_flag_options_from_env()
+    assert "server.port" not in flags
+    assert flags["server.address"] == "0.0.0.0"
+    assert flags["server.headless"] is True

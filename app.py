@@ -157,6 +157,21 @@ def _safe_rerun():
 def _streamlit_runtime_active() -> bool:
     """Return True when running inside a Streamlit runtime."""
 
+    runtime = None
+    try:
+        from streamlit import runtime as st_runtime
+
+        runtime = st_runtime
+    except Exception:
+        runtime = None
+
+    if runtime is not None:
+        try:
+            if runtime.exists():
+                return True
+        except Exception:
+            pass
+
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
     except Exception:
@@ -168,6 +183,41 @@ def _streamlit_runtime_active() -> bool:
         return False
 
 
+def _streamlit_flag_options_from_env() -> dict[str, object]:
+    """Derive Streamlit bootstrap flag options from environment variables."""
+
+    flag_options: dict[str, object] = {}
+
+    port_env = os.getenv("PORT")
+    if port_env:
+        try:
+            port = int(port_env)
+        except (TypeError, ValueError):
+            port = None
+        if port and port > 0:
+            flag_options["server.port"] = port
+
+    address_env = (
+        os.getenv("HOST")
+        or os.getenv("BIND_ADDRESS")
+        or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    )
+    flag_options["server.address"] = address_env or "0.0.0.0"
+
+    headless_env = os.getenv("STREAMLIT_SERVER_HEADLESS")
+    if headless_env is None:
+        flag_options["server.headless"] = True
+    else:
+        flag_options["server.headless"] = headless_env.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    return flag_options
+
+
 def _bootstrap_streamlit_app() -> None:
     """Launch the Streamlit app when executed via ``python app.py``."""
 
@@ -177,7 +227,12 @@ def _bootstrap_streamlit_app() -> None:
         return
 
     try:
-        bootstrap.run(os.path.abspath(__file__), False, [], {})
+        bootstrap.run(
+            os.path.abspath(__file__),
+            False,
+            [],
+            _streamlit_flag_options_from_env(),
+        )
     except Exception:
         pass
 
