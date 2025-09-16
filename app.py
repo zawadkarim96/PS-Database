@@ -153,7 +153,35 @@ def _safe_rerun():
         except Exception:
             pass
 
- 
+
+def _streamlit_runtime_active() -> bool:
+    """Return True when running inside a Streamlit runtime."""
+
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:
+        return False
+
+    try:
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def _bootstrap_streamlit_app() -> None:
+    """Launch the Streamlit app when executed via ``python app.py``."""
+
+    try:
+        from streamlit.web import bootstrap
+    except Exception:
+        return
+
+    try:
+        bootstrap.run(os.path.abspath(__file__), False, [], {})
+    except Exception:
+        pass
+
+
 def recalc_customer_duplicate_flag(conn, phone):
     if not phone or str(phone).strip() == "":
         return
