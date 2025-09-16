@@ -1,10 +1,15 @@
-import os, sqlite3, hashlib
+import hashlib
+import hmac
+import os
+import sqlite3
+import string
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from textwrap import dedent
 import pandas as pd
 
 
+import bcrypt
 import streamlit as st
 
 # ---------- Config ----------
@@ -17,6 +22,41 @@ REQUIRED_CUSTOMER_FIELDS = {
     "phone": "Phone",
     "address": "Address",
 }
+
+
+def hash_password(password: str) -> str:
+    """Create a salted password hash."""
+
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def is_bcrypt_hash(value: str) -> bool:
+    return isinstance(value, str) and value.startswith("$2")
+
+
+def is_legacy_hash(value: str) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in string.hexdigits for c in value)
+
+
+def verify_password(conn, user_id: int, password: str, stored_hash: str) -> bool:
+    """Verify password for user, migrating legacy SHA-256 hashes when encountered."""
+
+    if not stored_hash:
+        return False
+    password_bytes = password.encode("utf-8")
+    if is_bcrypt_hash(stored_hash):
+        try:
+            return bcrypt.checkpw(password_bytes, stored_hash.encode("utf-8"))
+        except ValueError:
+            return False
+    if is_legacy_hash(stored_hash):
+        legacy_hash = hashlib.sha256(password_bytes).hexdigest()
+        if hmac.compare_digest(legacy_hash, stored_hash):
+            new_hash = hash_password(password)
+            conn.execute("UPDATE users SET pass_hash=? WHERE user_id=?", (new_hash, int(user_id)))
+            conn.commit()
+            return True
+    return False
 
 
 def customer_complete_clause(alias: str = "") -> str:
@@ -117,7 +157,7 @@ def init_schema(conn):
     if cur.fetchone()[0] == 0:
         admin_user = os.getenv("ADMIN_USER", "admin")
         admin_pass = os.getenv("ADMIN_PASS", "admin123")
-        h = hashlib.sha256(admin_pass.encode("utf-8")).hexdigest()
+        h = hash_password(admin_pass)
         conn.execute("INSERT INTO users (username, pass_hash, role) VALUES (?, ?, 'admin')", (admin_user, h))
         conn.commit()
 
@@ -185,11 +225,14 @@ def login_box(conn):
         ok = st.form_submit_button("Login")
     if ok:
         row = df_query(conn, "SELECT user_id, username, pass_hash, role FROM users WHERE username = ?", (u,))
-        if not row.empty and hashlib.sha256(p.encode("utf-8")).hexdigest() == row.iloc[0]["pass_hash"]:
-            st.session_state.user = {"user_id": int(row.iloc[0]["user_id"]), "username": row.iloc[0]["username"], "role": row.iloc[0]["role"]}
-            _safe_rerun()
-        else:
-            st.sidebar.error("Invalid credentials")
+        if not row.empty:
+            uid = int(row.iloc[0]["user_id"])
+            stored_hash = row.iloc[0]["pass_hash"]
+            if verify_password(conn, uid, p, stored_hash):
+                st.session_state.user = {"user_id": uid, "username": row.iloc[0]["username"], "role": row.iloc[0]["role"]}
+                _safe_rerun()
+                return
+        st.sidebar.error("Invalid credentials")
     st.stop()
 
 def ensure_auth(role=None):
@@ -719,7 +762,7 @@ def users_admin_page(conn):
             role = st.selectbox("Role", ["staff", "admin"])
             ok = st.form_submit_button("Create")
             if ok and u.strip() and p.strip():
-                h = hashlib.sha256(p.encode("utf-8")).hexdigest()
+                h = hash_password(p)
                 try:
                     conn.execute("INSERT INTO users (username, pass_hash, role) VALUES (?, ?, ?)", (u.strip(), h, role))
                     conn.commit()
@@ -732,10 +775,13 @@ def users_admin_page(conn):
         newp = st.text_input("New password", type="password")
         col1, col2 = st.columns(2)
         if col1.button("Set new password"):
-            h = hashlib.sha256(newp.encode("utf-8")).hexdigest()
-            conn.execute("UPDATE users SET pass_hash=? WHERE user_id=?", (h, int(uid)))
-            conn.commit()
-            st.success("Password updated")
+            if newp.strip():
+                h = hash_password(newp)
+                conn.execute("UPDATE users SET pass_hash=? WHERE user_id=?", (h, int(uid)))
+                conn.commit()
+                st.success("Password updated")
+            else:
+                st.error("Password cannot be blank")
         if col2.button("Delete user"):
             conn.execute("DELETE FROM users WHERE user_id=?", (int(uid),))
             conn.commit()
