@@ -20,6 +20,27 @@ load_dotenv()
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "ps_crm.db"))
 DATE_FMT = "%d-%m-%Y"
 
+REQUIRED_CUSTOMER_FIELDS = {
+    "name": "Name",
+    "phone": "Phone",
+    "address": "Address",
+}
+
+
+def customer_complete_clause(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return " AND ".join(
+        [
+            f"TRIM(COALESCE({prefix}name, '')) <> ''",
+            f"TRIM(COALESCE({prefix}phone, '')) <> ''",
+            f"TRIM(COALESCE({prefix}address, '')) <> ''",
+        ]
+    )
+
+
+def customer_incomplete_clause(alias: str = "") -> str:
+    return f"NOT ({customer_complete_clause(alias)})"
+
 # ---------- Schema ----------
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -118,6 +139,19 @@ def fmt_dates(df: pd.DataFrame, cols):
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime(DATE_FMT)
     return df
 
+
+def clean_text(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    value = str(value).strip()
+    return value or None
+
+
 def _safe_rerun():
     try:
         st.rerun()
@@ -126,6 +160,16 @@ def _safe_rerun():
             st.experimental_rerun()
         except Exception:
             pass
+
+
+def recalc_customer_duplicate_flag(conn, phone):
+    if not phone or str(phone).strip() == "":
+        return
+    cur = conn.execute("SELECT customer_id FROM customers WHERE phone = ?", (str(phone).strip(),))
+    ids = [int(row[0]) for row in cur.fetchall()]
+    dup = 1 if len(ids) > 1 else 0
+    conn.executemany("UPDATE customers SET dup_flag=? WHERE customer_id=?", [(dup, cid) for cid in ids])
+
 
 def init_ui():
     st.set_page_config(page_title="PS Mini CRM", page_icon="🧰", layout="wide")
@@ -164,10 +208,18 @@ def ensure_auth(role=None):
 # ---------- Pages ----------
 def dashboard(conn):
     st.subheader("📊 Dashboard")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
+    complete_count = int(
+        df_query(conn, f"SELECT COUNT(*) c FROM customers WHERE {customer_complete_clause()}").iloc[0]["c"]
+    )
+    scrap_count = int(
+        df_query(conn, f"SELECT COUNT(*) c FROM customers WHERE {customer_incomplete_clause()}").iloc[0]["c"]
+    )
     with col1:
-        st.metric("Customers", int(df_query(conn, "SELECT COUNT(*) c FROM customers").iloc[0]["c"]))
+        st.metric("Customers", complete_count)
     with col2:
+        st.metric("Scraps", scrap_count)
+    with col3:
         st.metric(
             "Active Warranties",
             int(
@@ -177,7 +229,7 @@ def dashboard(conn):
                 ).iloc[0]["c"]
             ),
         )
-    with col3:
+    with col4:
         expired_count = int(
             df_query(
                 conn,
@@ -279,9 +331,24 @@ def customers_page(conn):
     df = fmt_dates(df, ["created_at"])
     if "dup_flag" in df.columns:
         df = df.assign(duplicate=df["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x)==1 else ""))
+    if not df.empty:
+        df = df.assign(
+            scrap=df.apply(
+                lambda row: "🗂 scrap"
+                if any(
+                    clean_text(row.get(col)) is None
+                    for col in REQUIRED_CUSTOMER_FIELDS
+                    if col in row
+                )
+                else "",
+                axis=1,
+            )
+        )
     st.dataframe(df)
     if not df.empty and 'dup_flag' in df.columns:
         st.info("🔁 = duplicate phone detected")
+    if not df.empty:
+        st.caption("🗂 scrap = missing mandatory details. Fix these from the Scraps page.")
 
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
@@ -295,7 +362,10 @@ def customers_page(conn):
     if st.session_state.user and st.session_state.user.get("role") == "admin":
         st.markdown("---")
         st.markdown("**Delete Customers**")
-        all_cust = df_query(conn, "SELECT customer_id, name FROM customers ORDER BY name ASC")
+        all_cust = df_query(
+            conn,
+            f"SELECT customer_id, name FROM customers WHERE {customer_complete_clause()} ORDER BY name ASC",
+        )
         if all_cust.empty:
             st.info("No customers to delete.")
         else:
@@ -352,17 +422,19 @@ def warranties_page(conn):
 def customer_summary_page(conn):
     st.subheader("📒 Customer Summary")
     blank_label = "(blank)"
+    complete_clause = customer_complete_clause()
     customers = df_query(
         conn,
         f"""
-        SELECT COALESCE(NULLIF(name, ''), '{blank_label}') AS name, GROUP_CONCAT(customer_id) AS ids, COUNT(*) AS cnt
+        SELECT TRIM(name) AS name, GROUP_CONCAT(customer_id) AS ids, COUNT(*) AS cnt
         FROM customers
-        GROUP BY COALESCE(NULLIF(name, ''), '{blank_label}')
-        ORDER BY name ASC
+        WHERE {complete_clause}
+        GROUP BY TRIM(name)
+        ORDER BY TRIM(name) ASC
         """,
     )
     if customers.empty:
-        st.info("No customers yet.")
+        st.info("No complete customers yet. Check the Scraps page for records that need details.")
         return
 
     names = customers["name"].tolist()
@@ -416,6 +488,95 @@ def customer_summary_page(conn):
     if "dup_flag" in warr.columns:
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x) == 1 else ""))
     st.dataframe(warr)
+
+
+def scraps_page(conn):
+    st.subheader("🗂️ Scraps (Incomplete Records)")
+    st.caption(
+        "Rows listed here are missing key details (name, phone, or address). They stay hidden from summaries until completed."
+    )
+    scraps = df_query(
+        conn,
+        f"""
+        SELECT customer_id as id, name, phone, email, address, city, created_at
+        FROM customers
+        WHERE {customer_incomplete_clause()}
+        ORDER BY datetime(created_at) DESC
+        """,
+    )
+    scraps = fmt_dates(scraps, ["created_at"])
+    if scraps.empty:
+        st.success("No scraps! All customer rows have the required details.")
+        return
+
+    def missing_fields(row):
+        missing = []
+        for col, label in REQUIRED_CUSTOMER_FIELDS.items():
+            val = row.get(col)
+            if pd.isna(val) or str(val).strip() == "":
+                missing.append(label)
+        return ", ".join(missing)
+
+    scraps = scraps.assign(missing=scraps.apply(missing_fields, axis=1))
+    display_cols = ["id", "name", "phone", "email", "address", "city", "missing", "created_at"]
+    st.dataframe(scraps[display_cols])
+
+    st.markdown("### Update scrap record")
+    records = scraps.to_dict("records")
+    option_keys = [int(r["id"]) for r in records]
+    option_labels = {}
+    for r in records:
+        rid = int(r["id"])
+        name_label = clean_text(r.get("name")) or "(no name)"
+        missing_label = clean_text(r.get("missing")) or "—"
+        option_labels[rid] = f"#{rid} – {name_label} (missing: {missing_label})"
+    selected_id = st.selectbox(
+        "Choose a record to fix",
+        option_keys,
+        format_func=lambda k: option_labels[k],
+    )
+    selected = next(r for r in records if int(r["id"]) == selected_id)
+
+    def existing_value(key):
+        return clean_text(selected.get(key)) or ""
+
+    with st.form("scrap_update_form"):
+        name = st.text_input("Name", existing_value("name"))
+        phone = st.text_input("Phone", existing_value("phone"))
+        email = st.text_input("Email", existing_value("email"))
+        address = st.text_area("Address", existing_value("address"))
+        city = st.text_input("City", existing_value("city"))
+        col1, col2 = st.columns(2)
+        save = col1.form_submit_button("Save changes", type="primary")
+        delete = col2.form_submit_button("Delete scrap")
+
+    if save:
+        new_name = clean_text(name)
+        new_phone = clean_text(phone)
+        new_email = clean_text(email)
+        new_address = clean_text(address)
+        new_city = clean_text(city)
+        old_phone = clean_text(selected.get("phone"))
+        conn.execute(
+            "UPDATE customers SET name=?, phone=?, email=?, address=?, city=?, dup_flag=0 WHERE customer_id=?",
+            (new_name, new_phone, new_email, new_address, new_city, int(selected_id)),
+        )
+        if old_phone and old_phone != new_phone:
+            recalc_customer_duplicate_flag(conn, old_phone)
+        if new_phone:
+            recalc_customer_duplicate_flag(conn, new_phone)
+        conn.commit()
+        if new_name and new_phone and new_address:
+            st.success("Details saved. This record is now complete and will appear in other pages.")
+        else:
+            st.info("Details saved, but the record is still incomplete and will remain in Scraps until all required fields are filled.")
+        _safe_rerun()
+
+    if delete:
+        conn.execute("DELETE FROM customers WHERE customer_id=?", (int(selected_id),))
+        conn.commit()
+        st.warning("Scrap record deleted.")
+        _safe_rerun()
 
 # ---------- Import helpers ----------
 def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
@@ -697,7 +858,7 @@ def main():
     login_box(conn)
 
     with st.sidebar:
-        pages = ["Dashboard", "Customers", "Customer Summary", "Warranties", "Import", "Duplicates"]
+        pages = ["Dashboard", "Customers", "Customer Summary", "Scraps", "Warranties", "Import", "Duplicates"]
         if st.session_state.user and st.session_state.user["role"] == "admin":
             pages.append("Users (Admin)")
         page = st.radio("Navigate", pages)
@@ -708,6 +869,8 @@ def main():
         customers_page(conn)
     elif page == "Customer Summary":
         customer_summary_page(conn)
+    elif page == "Scraps":
+        scraps_page(conn)
     elif page == "Warranties":
         warranties_page(conn)
     elif page == "Import":
