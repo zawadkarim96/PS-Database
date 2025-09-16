@@ -63,3 +63,52 @@ def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
         f"SELECT COUNT(*) FROM customers WHERE {app_module.customer_complete_clause()}"
     ).fetchone()[0]
     assert complete_after == 1
+
+
+def test_streamlit_flag_options_from_env_uses_port_and_host(monkeypatch, app_module):
+    monkeypatch.setenv("PORT", "9999")
+    monkeypatch.setenv("HOST", "1.2.3.4")
+    flags = app_module._streamlit_flag_options_from_env()
+    assert flags["server.port"] == 9999
+    assert flags["server.address"] == "1.2.3.4"
+    assert flags["server.headless"] is True
+
+
+def test_streamlit_flag_options_from_env_respects_headless(monkeypatch, app_module):
+    monkeypatch.setenv("STREAMLIT_SERVER_HEADLESS", "false")
+    flags = app_module._streamlit_flag_options_from_env()
+    assert flags["server.headless"] is False
+
+
+def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_module):
+    monkeypatch.setenv("PORT", "not-a-number")
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("BIND_ADDRESS", raising=False)
+    monkeypatch.delenv("RENDER_EXTERNAL_HOSTNAME", raising=False)
+    monkeypatch.delenv("STREAMLIT_SERVER_HEADLESS", raising=False)
+    flags = app_module._streamlit_flag_options_from_env()
+    assert "server.port" not in flags
+    assert flags["server.address"] == "0.0.0.0"
+    assert flags["server.headless"] is True
+
+
+def test_streamlit_runtime_active_falls_back_to_parent(monkeypatch, app_module):
+    from streamlit.runtime import scriptrunner as st_scriptrunner
+    from streamlit import runtime as st_runtime
+
+    monkeypatch.setattr(st_runtime, "exists", lambda: False, raising=False)
+    monkeypatch.setattr(st_scriptrunner, "get_script_run_ctx", lambda: None, raising=False)
+    monkeypatch.setattr(app_module, "_parent_looks_like_streamlit_cli", lambda: True)
+
+    assert app_module._streamlit_runtime_active() is True
+
+
+def test_streamlit_runtime_active_parent_heuristic_false(monkeypatch, app_module):
+    from streamlit.runtime import scriptrunner as st_scriptrunner
+    from streamlit import runtime as st_runtime
+
+    monkeypatch.setattr(st_runtime, "exists", lambda: False, raising=False)
+    monkeypatch.setattr(st_scriptrunner, "get_script_run_ctx", lambda: None, raising=False)
+    monkeypatch.setattr(app_module, "_parent_looks_like_streamlit_cli", lambda: False)
+
+    assert app_module._streamlit_runtime_active() is False
