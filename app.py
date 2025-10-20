@@ -2,6 +2,7 @@ import io
 import os
 import sqlite3
 import hashlib
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
@@ -21,6 +22,8 @@ DATE_FMT = "%d-%m-%Y"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 DELIVERY_ORDER_DIR = UPLOADS_DIR / "delivery_orders"
+SERVICE_DOCS_DIR = UPLOADS_DIR / "service_documents"
+MAINTENANCE_DOCS_DIR = UPLOADS_DIR / "maintenance_documents"
 
 REQUIRED_CUSTOMER_FIELDS = {
     "name": "Name",
@@ -134,6 +137,22 @@ CREATE TABLE IF NOT EXISTS maintenance_records (
     FOREIGN KEY(do_number) REFERENCES delivery_orders(do_number) ON DELETE SET NULL,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
 );
+CREATE TABLE IF NOT EXISTS service_documents (
+    document_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_id INTEGER,
+    file_path TEXT,
+    original_name TEXT,
+    uploaded_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(service_id) REFERENCES services(service_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS maintenance_documents (
+    document_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    maintenance_id INTEGER,
+    file_path TEXT,
+    original_name TEXT,
+    uploaded_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(maintenance_id) REFERENCES maintenance_records(maintenance_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS needs (
     need_id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER,
@@ -228,7 +247,7 @@ def _streamlit_runtime_active() -> bool:
 
 
 def ensure_upload_dirs():
-    for path in (UPLOADS_DIR, DELIVERY_ORDER_DIR):
+    for path in (UPLOADS_DIR, DELIVERY_ORDER_DIR, SERVICE_DOCS_DIR, MAINTENANCE_DOCS_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -261,19 +280,119 @@ def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     return path
 
 
-def fetch_customer_choices(conn):
+def _sanitize_path_component(value: Optional[str]) -> str:
+    if not value:
+        return "item"
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.() ")
+    cleaned = "".join(ch if ch in allowed else "_" for ch in str(value))
+    cleaned = cleaned.strip()
+    return cleaned or "item"
+
+
+def build_customer_groups(conn, only_complete: bool = True):
+    where_clause = ""
+    params = ()
+    if only_complete:
+        where_clause = f"WHERE {customer_complete_clause()}"
     df = df_query(
         conn,
-        f"SELECT customer_id, name FROM customers WHERE {customer_complete_clause()} ORDER BY name COLLATE NOCASE",
+        f"SELECT customer_id, TRIM(name) AS name FROM customers {where_clause}",
+        params,
     )
+    if df.empty:
+        return [], {}
+    df["name"] = df["name"].fillna("")
+    df["norm_name"] = df["name"].astype(str).str.strip()
+    df.sort_values(by=["norm_name", "customer_id"], inplace=True)
+    groups = []
+    label_by_id = {}
+    for norm_name, group in df.groupby("norm_name", sort=False):
+        ids = group["customer_id"].astype(int).tolist()
+        primary = ids[0]
+        raw_name = clean_text(group.iloc[0].get("name"))
+        count = len(ids)
+        base_label = raw_name or f"Customer #{primary}"
+        if raw_name and count > 1:
+            display_label = f"{base_label} ({count} records)"
+        else:
+            display_label = base_label
+        groups.append(
+            {
+                "norm_name": norm_name,
+                "primary_id": primary,
+                "ids": ids,
+                "raw_name": raw_name,
+                "label": display_label,
+                "count": count,
+            }
+        )
+        for cid in ids:
+            label_by_id[int(cid)] = display_label
+    groups.sort(key=lambda g: (g["norm_name"] or "").lower())
+    return groups, label_by_id
+
+
+def fetch_customer_choices(conn):
+    groups, label_by_id = build_customer_groups(conn, only_complete=True)
     options = [None]
     labels = {None: "-- Select customer --"}
-    for _, row in df.iterrows():
-        cid = int(row["customer_id"])
-        name = clean_text(row.get("name")) or f"Customer #{cid}"
-        options.append(cid)
-        labels[cid] = name
-    return options, labels
+    group_map = {}
+    for group in groups:
+        primary = group["primary_id"]
+        options.append(primary)
+        labels[primary] = group["label"]
+        group_map[primary] = group["ids"]
+    return options, labels, group_map, label_by_id
+
+
+def attach_documents(
+    conn,
+    table: str,
+    fk_column: str,
+    record_id: int,
+    files,
+    target_dir: Path,
+    prefix: str,
+):
+    if not files:
+        return 0
+    saved = 0
+    for idx, uploaded in enumerate(files, start=1):
+        if uploaded is None:
+            continue
+        original_name = uploaded.name or f"{prefix}_{idx}.pdf"
+        safe_original = Path(original_name).name
+        filename = f"{prefix}_{idx}_{safe_original}"
+        saved_path = save_uploaded_file(uploaded, target_dir, filename=filename)
+        if not saved_path:
+            continue
+        try:
+            stored_path = str(saved_path.relative_to(BASE_DIR))
+        except ValueError:
+            stored_path = str(saved_path)
+        conn.execute(
+            f"INSERT INTO {table} ({fk_column}, file_path, original_name) VALUES (?, ?, ?)",
+            (int(record_id), stored_path, safe_original),
+        )
+        saved += 1
+    return saved
+
+
+def bundle_documents_zip(documents):
+    if not documents:
+        return None
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for doc in documents:
+            path = doc.get("path")
+            archive_name = doc.get("archive_name")
+            if not path or not archive_name:
+                continue
+            if not path.exists():
+                continue
+            zf.write(path, archive_name)
+    buffer.seek(0)
+    return buffer
 
 
 def dedupe_join(values: Iterable[Optional[str]]) -> str:
@@ -703,22 +822,7 @@ def dashboard(conn):
             """,
         ).iloc[0]["c"]
     )
-    col5, col6, col7 = st.columns(3)
-    with col5:
-        st.metric("Expired this month", month_expired)
-    with col6:
-        st.metric("Services this month", service_month)
-    with col7:
-        st.metric("Maintenance this month", maintenance_month)
-
-    st.markdown(" ")
-    col_master, _ = st.columns([1, 3])
-    with col_master:
-        if st.button("Open Master Sheet", type="primary"):
-            st.session_state.page = "Master Sheet"
-            _safe_rerun()
-
-    today_expired = df_query(
+    today_expired_df = df_query(
         conn,
         """
         SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
@@ -729,8 +833,19 @@ def dashboard(conn):
         ORDER BY date(w.expiry_date) ASC
         """,
     )
-    if not today_expired.empty:
-        notice = collapse_warranty_rows(today_expired)
+    today_expired_count = len(today_expired_df.index)
+    col5, col6, col7, col8 = st.columns(4)
+    with col5:
+        st.metric("Expired this month", month_expired)
+    with col6:
+        st.metric("Services this month", service_month)
+    with col7:
+        st.metric("Maintenance this month", maintenance_month)
+    with col8:
+        st.metric("Expired today", today_expired_count)
+
+    if not today_expired_df.empty:
+        notice = collapse_warranty_rows(today_expired_df)
         lines = []
         for _, row in notice.iterrows():
             customer = row.get("Customer") or "(unknown)"
@@ -1042,7 +1157,7 @@ def warranties_page(conn):
 
 def delivery_orders_page(conn):
     st.subheader("🚚 Delivery Orders")
-    customer_options, customer_labels = fetch_customer_choices(conn)
+    customer_options, customer_labels, _, _ = fetch_customer_choices(conn)
 
     with st.form("delivery_order_form"):
         do_number = st.text_input("Delivery Order Serial *")
@@ -1139,6 +1254,7 @@ def delivery_orders_page(conn):
 
 def services_page(conn):
     st.subheader("🛠️ Service Records")
+    _, customer_label_map = build_customer_groups(conn, only_complete=False)
     do_df = df_query(
         conn,
         """
@@ -1158,7 +1274,7 @@ def services_page(conn):
             continue
         cust_id = int(row["customer_id"]) if not pd.isna(row.get("customer_id")) else None
         summary = clean_text(row.get("description"))
-        cust_name = clean_text(row.get("customer_name"))
+        cust_name = customer_label_map.get(cust_id) if cust_id else clean_text(row.get("customer_name"))
         label = do_num
         if summary:
             label = f"{do_num} – {summary[:40]}" + ("…" if len(summary) > 40 else "")
@@ -1182,6 +1298,12 @@ def services_page(conn):
         service_date = st.date_input("Service date", value=datetime.now().date())
         description = st.text_area("Service description")
         remarks = st.text_area("Remarks / updates")
+        service_files = st.file_uploader(
+            "Attach service documents (PDF)",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="service_new_docs",
+        )
         submit = st.form_submit_button("Log service", type="primary")
 
     if submit:
@@ -1189,7 +1311,8 @@ def services_page(conn):
             st.error("Delivery Order is required for service records.")
         else:
             selected_customer = do_customer_map.get(selected_do)
-            conn.execute(
+            cur = conn.cursor()
+            cur.execute(
                 "INSERT INTO services (do_number, customer_id, service_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     selected_do,
@@ -1200,8 +1323,21 @@ def services_page(conn):
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
+            service_id = cur.lastrowid
+            saved_docs = attach_documents(
+                conn,
+                "service_documents",
+                "service_id",
+                service_id,
+                service_files,
+                SERVICE_DOCS_DIR,
+                f"service_{service_id}",
+            )
             conn.commit()
-            st.success("Service record saved.")
+            message = "Service record saved."
+            if saved_docs:
+                message = f"{message} Attached {saved_docs} document(s)."
+            st.success(message)
             _safe_rerun()
 
     service_df = df_query(
@@ -1213,11 +1349,14 @@ def services_page(conn):
                s.description,
                s.remarks,
                s.updated_at,
-               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COUNT(sd.document_id) AS doc_count
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
         LEFT JOIN delivery_orders d ON d.do_number = s.do_number
         LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        LEFT JOIN service_documents sd ON sd.service_id = s.service_id
+        GROUP BY s.service_id
         ORDER BY datetime(s.service_date) DESC, s.service_id DESC
         """,
     )
@@ -1232,6 +1371,7 @@ def services_page(conn):
                 "description": "Description",
                 "remarks": "Remarks",
                 "customer": "Customer",
+                "doc_count": "Documents",
             }
         )
         st.markdown("### Service history")
@@ -1266,12 +1406,67 @@ def services_page(conn):
             conn.commit()
             st.success("Service remarks updated.")
             _safe_rerun()
+
+        attachments_df = df_query(
+            conn,
+            """
+            SELECT document_id, file_path, original_name, uploaded_at
+            FROM service_documents
+            WHERE service_id = ?
+            ORDER BY datetime(uploaded_at) DESC, document_id DESC
+            """,
+            (int(selected_service_id),),
+        )
+        st.markdown("**Attached documents**")
+        if attachments_df.empty:
+            st.caption("No documents attached yet.")
+        else:
+            for _, doc_row in attachments_df.iterrows():
+                path = resolve_upload_path(doc_row.get("file_path"))
+                display_name = clean_text(doc_row.get("original_name"))
+                if path and path.exists():
+                    label = display_name or path.name
+                    st.download_button(
+                        f"Download {label}",
+                        data=path.read_bytes(),
+                        file_name=path.name,
+                        key=f"service_doc_dl_{int(doc_row['document_id'])}",
+                    )
+                else:
+                    label = display_name or "Document"
+                    st.caption(f"⚠️ Missing file: {label}")
+
+        with st.form(f"service_doc_upload_{selected_service_id}"):
+            more_docs = st.file_uploader(
+                "Add more service documents (PDF)",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key=f"service_doc_files_{selected_service_id}",
+            )
+            upload_docs = st.form_submit_button("Upload documents")
+        if upload_docs:
+            if more_docs:
+                saved = attach_documents(
+                    conn,
+                    "service_documents",
+                    "service_id",
+                    int(selected_service_id),
+                    more_docs,
+                    SERVICE_DOCS_DIR,
+                    f"service_{selected_service_id}",
+                )
+                conn.commit()
+                st.success(f"Uploaded {saved} document(s).")
+                _safe_rerun()
+            else:
+                st.info("Select at least one PDF to upload.")
     else:
         st.info("No service records yet. Log one using the form above.")
 
 
 def maintenance_page(conn):
     st.subheader("🔧 Maintenance Records")
+    _, customer_label_map = build_customer_groups(conn, only_complete=False)
     do_df = df_query(
         conn,
         """
@@ -1291,7 +1486,7 @@ def maintenance_page(conn):
             continue
         cust_id = int(row["customer_id"]) if not pd.isna(row.get("customer_id")) else None
         summary = clean_text(row.get("description"))
-        cust_name = clean_text(row.get("customer_name"))
+        cust_name = customer_label_map.get(cust_id) if cust_id else clean_text(row.get("customer_name"))
         label = do_num
         if summary:
             label = f"{do_num} – {summary[:40]}" + ("…" if len(summary) > 40 else "")
@@ -1314,6 +1509,12 @@ def maintenance_page(conn):
         maintenance_date = st.date_input("Maintenance date", value=datetime.now().date())
         description = st.text_area("Maintenance description")
         remarks = st.text_area("Remarks / updates")
+        maintenance_files = st.file_uploader(
+            "Attach maintenance documents (PDF)",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="maintenance_new_docs",
+        )
         submit = st.form_submit_button("Log maintenance", type="primary")
 
     if submit:
@@ -1321,7 +1522,8 @@ def maintenance_page(conn):
             st.error("Delivery Order is required for maintenance records.")
         else:
             selected_customer = do_customer_map.get(selected_do)
-            conn.execute(
+            cur = conn.cursor()
+            cur.execute(
                 "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     selected_do,
@@ -1332,8 +1534,21 @@ def maintenance_page(conn):
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
+            maintenance_id = cur.lastrowid
+            saved_docs = attach_documents(
+                conn,
+                "maintenance_documents",
+                "maintenance_id",
+                maintenance_id,
+                maintenance_files,
+                MAINTENANCE_DOCS_DIR,
+                f"maintenance_{maintenance_id}",
+            )
             conn.commit()
-            st.success("Maintenance record saved.")
+            message = "Maintenance record saved."
+            if saved_docs:
+                message = f"{message} Attached {saved_docs} document(s)."
+            st.success(message)
             _safe_rerun()
 
     maintenance_df = df_query(
@@ -1345,11 +1560,14 @@ def maintenance_page(conn):
                m.description,
                m.remarks,
                m.updated_at,
-               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COUNT(md.document_id) AS doc_count
         FROM maintenance_records m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
         LEFT JOIN delivery_orders d ON d.do_number = m.do_number
         LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        LEFT JOIN maintenance_documents md ON md.maintenance_id = m.maintenance_id
+        GROUP BY m.maintenance_id
         ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
         """,
     )
@@ -1364,6 +1582,7 @@ def maintenance_page(conn):
                 "description": "Description",
                 "remarks": "Remarks",
                 "customer": "Customer",
+                "doc_count": "Documents",
             }
         )
         st.markdown("### Maintenance history")
@@ -1398,220 +1617,63 @@ def maintenance_page(conn):
             conn.commit()
             st.success("Maintenance remarks updated.")
             _safe_rerun()
+
+        attachments_df = df_query(
+            conn,
+            """
+            SELECT document_id, file_path, original_name, uploaded_at
+            FROM maintenance_documents
+            WHERE maintenance_id = ?
+            ORDER BY datetime(uploaded_at) DESC, document_id DESC
+            """,
+            (int(selected_maintenance_id),),
+        )
+        st.markdown("**Attached documents**")
+        if attachments_df.empty:
+            st.caption("No documents attached yet.")
+        else:
+            for _, doc_row in attachments_df.iterrows():
+                path = resolve_upload_path(doc_row.get("file_path"))
+                display_name = clean_text(doc_row.get("original_name"))
+                if path and path.exists():
+                    label = display_name or path.name
+                    st.download_button(
+                        f"Download {label}",
+                        data=path.read_bytes(),
+                        file_name=path.name,
+                        key=f"maintenance_doc_dl_{int(doc_row['document_id'])}",
+                    )
+                else:
+                    label = display_name or "Document"
+                    st.caption(f"⚠️ Missing file: {label}")
+
+        with st.form(f"maintenance_doc_upload_{selected_maintenance_id}"):
+            more_docs = st.file_uploader(
+                "Add more maintenance documents (PDF)",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key=f"maintenance_doc_files_{selected_maintenance_id}",
+            )
+            upload_docs = st.form_submit_button("Upload documents")
+        if upload_docs:
+            if more_docs:
+                saved = attach_documents(
+                    conn,
+                    "maintenance_documents",
+                    "maintenance_id",
+                    int(selected_maintenance_id),
+                    more_docs,
+                    MAINTENANCE_DOCS_DIR,
+                    f"maintenance_{selected_maintenance_id}",
+                )
+                conn.commit()
+                st.success(f"Uploaded {saved} document(s).")
+                _safe_rerun()
+            else:
+                st.info("Select at least one PDF to upload.")
     else:
         st.info("No maintenance records yet. Log one using the form above.")
 
-
-def master_sheet_page(conn):
-    st.subheader("🗃 Master Sheet")
-    st.caption("Adjust warranty coverage and manage delivery order files from one place.")
-
-    warr_tab, files_tab = st.tabs(["Warranties", "Delivery order files"])
-
-    with warr_tab:
-        warr_df = df_query(
-            conn,
-            """
-            SELECT w.warranty_id,
-                   c.name AS customer,
-                   p.name AS product,
-                   p.model,
-                   w.serial,
-                   w.issue_date,
-                   w.expiry_date,
-                   w.status
-            FROM warranties w
-            LEFT JOIN customers c ON c.customer_id = w.customer_id
-            LEFT JOIN products p ON p.product_id = w.product_id
-            ORDER BY date(w.expiry_date) DESC, w.warranty_id DESC
-            """,
-        )
-        warr_df = fmt_dates(warr_df, ["issue_date", "expiry_date"])
-        if warr_df.empty:
-            st.info("No warranties recorded yet.")
-        else:
-            display = warr_df.rename(
-                columns={
-                    "customer": "Customer",
-                    "product": "Product",
-                    "model": "Model",
-                    "serial": "Serial",
-                    "issue_date": "Issue date",
-                    "expiry_date": "Expiry date",
-                    "status": "Status",
-                }
-            )
-            st.dataframe(
-                display.drop(columns=["warranty_id"], errors="ignore"),
-                use_container_width=True,
-            )
-
-            records = warr_df.to_dict("records")
-            option_ids = [int(r["warranty_id"]) for r in records]
-            labels = {
-                int(r["warranty_id"]): dedupe_join(
-                    [
-                        clean_text(r.get("customer")) or "(no customer)",
-                        clean_text(r.get("product")),
-                        clean_text(r.get("model")),
-                    ]
-                )
-                for r in records
-            }
-            if not option_ids:
-                st.info("No warranties available to edit.")
-            else:
-                with st.form("warranty_master_form"):
-                    selected_id = st.selectbox(
-                        "Select warranty",
-                        option_ids,
-                        format_func=lambda wid: labels.get(wid, f"#{wid}"),
-                    )
-                    selected_record = next(r for r in records if int(r["warranty_id"]) == int(selected_id))
-                    expiry_val = pd.to_datetime(selected_record.get("expiry_date"), errors="coerce")
-                    expiry_default = expiry_val.date() if pd.notna(expiry_val) else datetime.now().date()
-                    expiry_input = st.date_input(
-                        "Expiry date",
-                        value=expiry_default,
-                        key=f"master_expiry_{selected_id}",
-                    )
-                    extend_days = st.number_input(
-                        "Extend by days",
-                        min_value=0,
-                        value=0,
-                        step=1,
-                        help="Optional. Adds days to the selected expiry date before saving.",
-                        key=f"master_extend_{selected_id}",
-                    )
-                    base_statuses = ["active", "expired", "void", "pending"]
-                    current_status = clean_text(selected_record.get("status")) or "active"
-                    status_choices = base_statuses + ([current_status] if current_status not in base_statuses else [])
-                    status_index = status_choices.index(current_status)
-                    new_status = st.selectbox(
-                        "Status",
-                        status_choices,
-                        index=status_index,
-                        key=f"master_status_{selected_id}",
-                    )
-                    save = st.form_submit_button("Save warranty changes", type="primary")
-
-                if save:
-                    final_expiry = expiry_input + timedelta(days=int(extend_days))
-                    conn.execute(
-                        "UPDATE warranties SET expiry_date = ?, status = ? WHERE warranty_id = ?",
-                        (
-                            final_expiry.strftime("%Y-%m-%d"),
-                            new_status,
-                            int(selected_id),
-                        ),
-                    )
-                    conn.commit()
-                    st.success("Warranty updated.")
-                    _safe_rerun()
-
-    with files_tab:
-        do_df = df_query(
-            conn,
-            """
-            SELECT d.do_number,
-                   c.name AS customer,
-                   d.description,
-                   d.sales_person,
-                   d.file_path,
-                   d.created_at
-            FROM delivery_orders d
-            LEFT JOIN customers c ON c.customer_id = d.customer_id
-            ORDER BY datetime(d.created_at) DESC, d.do_number ASC
-            """,
-        )
-        do_df = fmt_dates(do_df, ["created_at"])
-        if do_df.empty:
-            st.info("No delivery orders recorded yet.")
-        else:
-            st.dataframe(
-                do_df.rename(
-                    columns={
-                        "do_number": "DO Serial",
-                        "customer": "Customer",
-                        "description": "Description",
-                        "sales_person": "Sales person",
-                        "created_at": "Created",
-                    }
-                ).drop(columns=["file_path"], errors="ignore"),
-                use_container_width=True,
-            )
-            records = do_df.to_dict("records")
-            options = [clean_text(r.get("do_number")) for r in records if clean_text(r.get("do_number"))]
-            label_map = {
-                clean_text(r.get("do_number")): dedupe_join(
-                    [
-                        clean_text(r.get("do_number")),
-                        clean_text(r.get("customer")),
-                        clean_text(r.get("description")),
-                    ]
-                )
-                for r in records
-                if clean_text(r.get("do_number"))
-            }
-            file_map = {clean_text(r.get("do_number")): r.get("file_path") for r in records if clean_text(r.get("do_number"))}
-            if not options:
-                st.info("No delivery order codes available yet.")
-            else:
-                selected_do = st.selectbox(
-                    "Select delivery order",
-                    options,
-                    format_func=lambda do: label_map.get(do, do),
-                    key="master_do_select",
-                )
-                current_file = resolve_upload_path(file_map.get(selected_do)) if selected_do else None
-                if current_file and current_file.exists():
-                    st.caption(f"Current file: {current_file.name}")
-                upload_file = st.file_uploader(
-                    "Upload replacement PDF",
-                    type=["pdf"],
-                    key="master_do_upload",
-                )
-                col_a, col_b = st.columns(2)
-                if col_a.button("Save / replace file", type="primary"):
-                    if not selected_do:
-                        st.warning("Choose a delivery order first.")
-                    elif upload_file is None:
-                        st.warning("Upload a PDF to replace the existing file.")
-                    else:
-                        saved = save_uploaded_file(upload_file, DELIVERY_ORDER_DIR, filename=f"{selected_do}.pdf")
-                        if saved:
-                            if current_file and current_file.exists() and current_file != saved:
-                                try:
-                                    current_file.unlink()
-                                except Exception:
-                                    pass
-                            try:
-                                stored_path = str(saved.relative_to(BASE_DIR))
-                            except ValueError:
-                                stored_path = str(saved)
-                            conn.execute(
-                                "UPDATE delivery_orders SET file_path = ? WHERE do_number = ?",
-                                (stored_path, selected_do),
-                            )
-                            conn.commit()
-                            st.success("Delivery order file updated.")
-                            _safe_rerun()
-                if col_b.button("Remove file"):
-                    if not selected_do:
-                        st.warning("Choose a delivery order first.")
-                    else:
-                        if current_file and current_file.exists():
-                            try:
-                                current_file.unlink()
-                            except Exception:
-                                pass
-                        conn.execute(
-                            "UPDATE delivery_orders SET file_path = NULL WHERE do_number = ?",
-                            (selected_do,),
-                        )
-                        conn.commit()
-                        st.success("Delivery order file removed.")
-                        _safe_rerun()
 
 def customer_summary_page(conn):
     st.subheader("📒 Customer Summary")
@@ -1665,8 +1727,8 @@ def customer_summary_page(conn):
         st.caption(f"Merged from {cnt} duplicates")
 
     st.markdown("---")
-    st.write("**Warranties**")
     placeholders = ",".join("?" * len(ids))
+
     warr = df_query(
         conn,
         f"""
@@ -1683,74 +1745,328 @@ def customer_summary_page(conn):
     if "dup_flag" in warr.columns:
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x) == 1 else ""))
     warr_display = format_warranty_table(warr)
+
+    service_df = df_query(
+        conn,
+        f"""
+        SELECT s.service_id,
+               s.do_number,
+               s.service_date,
+               s.description,
+               s.remarks,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COUNT(sd.document_id) AS doc_count
+        FROM services s
+        LEFT JOIN customers c ON c.customer_id = s.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        LEFT JOIN service_documents sd ON sd.service_id = s.service_id
+        WHERE COALESCE(s.customer_id, d.customer_id) IN ({placeholders})
+        GROUP BY s.service_id
+        ORDER BY datetime(s.service_date) DESC, s.service_id DESC
+        """,
+        ids,
+    )
+    service_df = fmt_dates(service_df, ["service_date"])
+
+    maintenance_df = df_query(
+        conn,
+        f"""
+        SELECT m.maintenance_id,
+               m.do_number,
+               m.maintenance_date,
+               m.description,
+               m.remarks,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               COUNT(md.document_id) AS doc_count
+        FROM maintenance_records m
+        LEFT JOIN customers c ON c.customer_id = m.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        LEFT JOIN maintenance_documents md ON md.maintenance_id = m.maintenance_id
+        WHERE COALESCE(m.customer_id, d.customer_id) IN ({placeholders})
+        GROUP BY m.maintenance_id
+        ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
+        """,
+        ids,
+    )
+    maintenance_df = fmt_dates(maintenance_df, ["maintenance_date"])
+
+    do_df = df_query(
+        conn,
+        f"""
+        SELECT d.do_number,
+               COALESCE(c.name, '(unknown)') AS customer,
+               d.description,
+               d.sales_person,
+               d.created_at,
+               d.file_path
+        FROM delivery_orders d
+        LEFT JOIN customers c ON c.customer_id = d.customer_id
+        WHERE d.customer_id IN ({placeholders})
+        ORDER BY datetime(d.created_at) DESC
+        """,
+        ids,
+    )
+    if not do_df.empty:
+        do_df = fmt_dates(do_df, ["created_at"])
+        do_df["do_number"] = do_df["do_number"].apply(clean_text)
+        do_df["Document"] = do_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
+
+    do_numbers = set()
+    if not do_df.empty and "do_number" in do_df.columns:
+        do_numbers.update(val for val in do_df["do_number"].tolist() if val)
+    if not service_df.empty and "do_number" in service_df.columns:
+        do_numbers.update(clean_text(val) for val in service_df["do_number"].tolist() if clean_text(val))
+    if not maintenance_df.empty and "do_number" in maintenance_df.columns:
+        do_numbers.update(clean_text(val) for val in maintenance_df["do_number"].tolist() if clean_text(val))
+    do_numbers = {val for val in do_numbers if val}
+
+    present_dos = set()
+    if not do_df.empty and "do_number" in do_df.columns:
+        present_dos.update(val for val in do_df["do_number"].tolist() if val)
+    missing_dos = sorted(do for do in do_numbers if do not in present_dos)
+    if missing_dos:
+        extra_df = df_query(
+            conn,
+            f"""
+            SELECT d.do_number,
+                   COALESCE(c.name, '(unknown)') AS customer,
+                   d.description,
+                   d.sales_person,
+                   d.created_at,
+                   d.file_path
+            FROM delivery_orders d
+            LEFT JOIN customers c ON c.customer_id = d.customer_id
+            WHERE d.do_number IN ({','.join('?' * len(missing_dos))})
+            """,
+            missing_dos,
+        )
+        if not extra_df.empty:
+            extra_df = fmt_dates(extra_df, ["created_at"])
+            extra_df["do_number"] = extra_df["do_number"].apply(clean_text)
+            extra_df["Document"] = extra_df["file_path"].apply(lambda fp: "📎" if clean_text(fp) else "")
+            do_df = pd.concat([do_df, extra_df], ignore_index=True) if not do_df.empty else extra_df
+            present_dos.update(val for val in extra_df["do_number"].tolist() if val)
+    orphan_dos = sorted(do for do in do_numbers if do not in present_dos)
+
+    st.markdown("**Delivery orders**")
+    if (do_df is None or do_df.empty) and not orphan_dos:
+        st.info("No delivery orders found for this customer.")
+    else:
+        if do_df is not None and not do_df.empty:
+            st.dataframe(
+                do_df.rename(
+                    columns={
+                        "do_number": "DO Serial",
+                        "customer": "Customer",
+                        "description": "Description",
+                        "sales_person": "Sales person",
+                        "created_at": "Created",
+                        "Document": "Document",
+                    }
+                ).drop(columns=["file_path"], errors="ignore"),
+                use_container_width=True,
+            )
+        if orphan_dos:
+            st.caption("Referenced DO codes without a recorded delivery order: " + ", ".join(orphan_dos))
+
+    st.markdown("**Warranties**")
     if warr_display is None or warr_display.empty:
         st.info("No warranties recorded for this customer.")
     else:
         st.dataframe(warr_display)
 
     st.markdown("**Service records**")
-    service_df = df_query(
-        conn,
-        f"""
-        SELECT s.do_number, s.service_date, s.description, s.remarks,
-               COALESCE(c.name, cdo.name, '(unknown)') AS customer
-        FROM services s
-        LEFT JOIN customers c ON c.customer_id = s.customer_id
-        LEFT JOIN delivery_orders d ON d.do_number = s.do_number
-        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
-        WHERE COALESCE(s.customer_id, d.customer_id) IN ({placeholders})
-        ORDER BY datetime(s.service_date) DESC, s.service_id DESC
-        """,
-        ids,
-    )
-    service_df = fmt_dates(service_df, ["service_date"])
     if service_df.empty:
         st.info("No service records found for this customer.")
     else:
+        service_display = service_df.rename(
+            columns={
+                "do_number": "DO Serial",
+                "service_date": "Service date",
+                "description": "Description",
+                "remarks": "Remarks",
+                "customer": "Customer",
+                "doc_count": "Documents",
+            }
+        )
         st.dataframe(
-            service_df.rename(
-                columns={
-                    "do_number": "DO Serial",
-                    "service_date": "Service date",
-                    "description": "Description",
-                    "remarks": "Remarks",
-                    "customer": "Customer",
-                }
-            ),
+            service_display.drop(columns=["service_id"], errors="ignore"),
             use_container_width=True,
         )
 
     st.markdown("**Maintenance records**")
-    maintenance_df = df_query(
-        conn,
-        f"""
-        SELECT m.do_number, m.maintenance_date, m.description, m.remarks,
-               COALESCE(c.name, cdo.name, '(unknown)') AS customer
-        FROM maintenance_records m
-        LEFT JOIN customers c ON c.customer_id = m.customer_id
-        LEFT JOIN delivery_orders d ON d.do_number = m.do_number
-        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
-        WHERE COALESCE(m.customer_id, d.customer_id) IN ({placeholders})
-        ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
-        """,
-        ids,
-    )
-    maintenance_df = fmt_dates(maintenance_df, ["maintenance_date"])
     if maintenance_df.empty:
         st.info("No maintenance records found for this customer.")
     else:
+        maintenance_display = maintenance_df.rename(
+            columns={
+                "do_number": "DO Serial",
+                "maintenance_date": "Maintenance date",
+                "description": "Description",
+                "remarks": "Remarks",
+                "customer": "Customer",
+                "doc_count": "Documents",
+            }
+        )
         st.dataframe(
-            maintenance_df.rename(
-                columns={
-                    "do_number": "DO Serial",
-                    "maintenance_date": "Maintenance date",
-                    "description": "Description",
-                    "remarks": "Remarks",
-                    "customer": "Customer",
-                }
-            ),
+            maintenance_display.drop(columns=["maintenance_id"], errors="ignore"),
             use_container_width=True,
         )
+
+    documents = []
+    if do_df is not None and not do_df.empty:
+        for _, row in do_df.iterrows():
+            path = resolve_upload_path(row.get("file_path"))
+            if not path or not path.exists():
+                continue
+            do_ref = clean_text(row.get("do_number")) or "delivery_order"
+            display_name = path.name
+            archive_name = "/".join(
+                [
+                    _sanitize_path_component("delivery_orders"),
+                    f"{_sanitize_path_component(do_ref)}_{_sanitize_path_component(display_name)}",
+                ]
+            )
+            documents.append(
+                {
+                    "source": "Delivery order",
+                    "reference": do_ref,
+                    "display": display_name,
+                    "path": path,
+                    "archive_name": archive_name,
+                    "key": f"do_{do_ref}",
+                }
+            )
+
+    service_docs = pd.DataFrame()
+    if "service_id" in service_df.columns and not service_df.empty:
+        service_ids = [int(val) for val in service_df["service_id"].dropna().astype(int).tolist()]
+        if service_ids:
+            service_docs = df_query(
+                conn,
+                f"""
+                SELECT document_id, service_id, file_path, original_name, uploaded_at
+                FROM service_documents
+                WHERE service_id IN ({','.join('?' * len(service_ids))})
+                ORDER BY datetime(uploaded_at) DESC, document_id DESC
+                """,
+                service_ids,
+            )
+    service_lookup = {}
+    if "service_id" in service_df.columns and not service_df.empty:
+        for _, row in service_df.iterrows():
+            if pd.isna(row.get("service_id")):
+                continue
+            service_lookup[int(row["service_id"])] = row
+    if not service_docs.empty:
+        for _, doc_row in service_docs.iterrows():
+            path = resolve_upload_path(doc_row.get("file_path"))
+            if not path or not path.exists():
+                continue
+            service_id = int(doc_row.get("service_id"))
+            record = service_lookup.get(service_id, {})
+            reference = clean_text(record.get("do_number")) or f"Service #{service_id}"
+            display_name = clean_text(doc_row.get("original_name")) or path.name
+            uploaded = pd.to_datetime(doc_row.get("uploaded_at"), errors="coerce")
+            uploaded_fmt = uploaded.strftime("%d-%m-%Y %H:%M") if pd.notna(uploaded) else None
+            archive_name = "/".join(
+                [
+                    _sanitize_path_component("service"),
+                    f"{_sanitize_path_component(reference)}_{_sanitize_path_component(display_name)}",
+                ]
+            )
+            documents.append(
+                {
+                    "source": "Service",
+                    "reference": reference,
+                    "display": display_name,
+                    "uploaded": uploaded_fmt,
+                    "path": path,
+                    "archive_name": archive_name,
+                    "key": f"service_{service_id}_{int(doc_row['document_id'])}",
+                }
+            )
+
+    maintenance_docs = pd.DataFrame()
+    if "maintenance_id" in maintenance_df.columns and not maintenance_df.empty:
+        maintenance_ids = [int(val) for val in maintenance_df["maintenance_id"].dropna().astype(int).tolist()]
+        if maintenance_ids:
+            maintenance_docs = df_query(
+                conn,
+                f"""
+                SELECT document_id, maintenance_id, file_path, original_name, uploaded_at
+                FROM maintenance_documents
+                WHERE maintenance_id IN ({','.join('?' * len(maintenance_ids))})
+                ORDER BY datetime(uploaded_at) DESC, document_id DESC
+                """,
+                maintenance_ids,
+            )
+    maintenance_lookup = {}
+    if "maintenance_id" in maintenance_df.columns and not maintenance_df.empty:
+        for _, row in maintenance_df.iterrows():
+            if pd.isna(row.get("maintenance_id")):
+                continue
+            maintenance_lookup[int(row["maintenance_id"])] = row
+    if not maintenance_docs.empty:
+        for _, doc_row in maintenance_docs.iterrows():
+            path = resolve_upload_path(doc_row.get("file_path"))
+            if not path or not path.exists():
+                continue
+            maintenance_id = int(doc_row.get("maintenance_id"))
+            record = maintenance_lookup.get(maintenance_id, {})
+            reference = clean_text(record.get("do_number")) or f"Maintenance #{maintenance_id}"
+            display_name = clean_text(doc_row.get("original_name")) or path.name
+            uploaded = pd.to_datetime(doc_row.get("uploaded_at"), errors="coerce")
+            uploaded_fmt = uploaded.strftime("%d-%m-%Y %H:%M") if pd.notna(uploaded) else None
+            archive_name = "/".join(
+                [
+                    _sanitize_path_component("maintenance"),
+                    f"{_sanitize_path_component(reference)}_{_sanitize_path_component(display_name)}",
+                ]
+            )
+            documents.append(
+                {
+                    "source": "Maintenance",
+                    "reference": reference,
+                    "display": display_name,
+                    "uploaded": uploaded_fmt,
+                    "path": path,
+                    "archive_name": archive_name,
+                    "key": f"maintenance_{maintenance_id}_{int(doc_row['document_id'])}",
+                }
+            )
+
+    documents.sort(key=lambda d: (d["source"], d.get("reference") or "", d.get("display") or ""))
+
+    st.markdown("**Documents**")
+    if not documents:
+        st.info("No documents attached for this customer.")
+    else:
+        for idx, doc in enumerate(documents, start=1):
+            path = doc.get("path")
+            if not path or not path.exists():
+                continue
+            label = f"{doc['source']}: {doc['reference']} – {doc['display']}"
+            if doc.get("uploaded"):
+                label = f"{label} (uploaded {doc['uploaded']})"
+            st.download_button(
+                f"Download {label}",
+                data=path.read_bytes(),
+                file_name=path.name,
+                key=f"cust_doc_{doc['key']}_{idx}",
+            )
+        zip_buffer = bundle_documents_zip(documents)
+        if zip_buffer is not None:
+            archive_title = _sanitize_path_component(info.get("name") or blank_label)
+            st.download_button(
+                "⬇️ Download all documents (.zip)",
+                data=zip_buffer.getvalue(),
+                file_name=f"{archive_title}_documents.zip",
+                mime="application/zip",
+                key="cust_docs_zip",
+            )
 
     pdf_bytes = generate_customer_summary_pdf(
         info.get("name") or blank_label,
@@ -2165,7 +2481,7 @@ def main():
         pages = ["Dashboard", "Customers", "Customer Summary", "Scraps", "Warranties", "Import", "Duplicates"]
         if st.session_state.user and st.session_state.user["role"] == "admin":
             pages.append("Users (Admin)")
-        pages.extend(["Delivery Orders", "Service", "Maintenance", "Master Sheet"])
+        pages.extend(["Delivery Orders", "Service", "Maintenance"])
         current_index = pages.index(st.session_state.page) if st.session_state.page in pages else 0
         page = st.radio("Navigate", pages, index=current_index, key="nav_page")
         st.session_state.page = page
@@ -2194,8 +2510,6 @@ def main():
         services_page(conn)
     elif page == "Maintenance":
         maintenance_page(conn)
-    elif page == "Master Sheet":
-        master_sheet_page(conn)
 
 if _streamlit_runtime_active():
     main()
