@@ -372,6 +372,9 @@ def format_warranty_table(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     work = df.copy()
+    expiry_raw = pd.to_datetime(work.get("expiry_date"), errors="coerce")
+    today = pd.Timestamp.now().normalize()
+    status_labels = []
     work["Description"] = work.apply(
         lambda row: dedupe_join(
             [
@@ -382,17 +385,156 @@ def format_warranty_table(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
+    for idx in work.index:
+        exp = expiry_raw.loc[idx] if expiry_raw is not None and idx in expiry_raw.index else pd.NaT
+        if pd.notna(exp) and exp.normalize() < today:
+            status_labels.append("Expired")
+        else:
+            base_status = clean_text(work.loc[idx, "status"]) if "status" in work.columns else None
+            status_labels.append((base_status or "Active").title())
+    work["Status"] = status_labels
     for col in ("product", "model", "serial"):
         if col in work.columns:
             work.drop(columns=[col], inplace=True)
+    if "status" in work.columns:
+        work.drop(columns=["status"], inplace=True)
     rename_map = {
         "customer": "Customer",
         "issue_date": "Issue date",
         "expiry_date": "Expiry date",
-        "status": "Status",
     }
     work.rename(columns={k: v for k, v in rename_map.items() if k in work.columns}, inplace=True)
+    for col in ("dup_flag", "id", "duplicate"):
+        if col in work.columns:
+            work.drop(columns=[col], inplace=True)
     return work
+
+
+def _pdf_escape_text(value: str) -> str:
+    replacements = [("\\", "\\\\"), ("(", "\\("), (")", "\\)")]
+    escaped = value
+    for old, new in replacements:
+        escaped = escaped.replace(old, new)
+    return escaped
+
+
+def _build_simple_pdf_document(lines: list[str]) -> bytes:
+    if not lines:
+        lines = [""]
+    commands = ["BT", "/F1 12 Tf", "72 770 Td"]
+    for idx, line in enumerate(lines):
+        escaped = _pdf_escape_text(line)
+        if idx == 0:
+            commands.append(f"({escaped}) Tj")
+        else:
+            commands.append("0 -14 Td")
+            commands.append(f"({escaped}) Tj")
+    commands.append("ET")
+    stream_bytes = "\n".join(commands).encode("latin-1", "replace")
+
+    buffer = io.BytesIO()
+    buffer.write(b"%PDF-1.4\n")
+    offsets = []
+
+    def write_obj(obj_id: int, body: bytes) -> None:
+        offsets.append(buffer.tell())
+        buffer.write(f"{obj_id} 0 obj\n".encode("latin-1"))
+        buffer.write(body)
+        if not body.endswith(b"\n"):
+            buffer.write(b"\n")
+        buffer.write(b"endobj\n")
+
+    write_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>\n")
+    write_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n")
+    write_obj(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n",
+    )
+    stream_obj = b"<< /Length %d >>\nstream\n" % len(stream_bytes) + stream_bytes + b"\nendstream\n"
+    write_obj(4, stream_obj)
+    write_obj(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n")
+
+    xref_offset = buffer.tell()
+    buffer.write(f"xref\n0 {len(offsets) + 1}\n".encode("latin-1"))
+    buffer.write(b"0000000000 65535 f \n")
+    for off in offsets:
+        buffer.write(f"{off:010d} 00000 n \n".encode("latin-1"))
+    buffer.write(b"trailer\n")
+    buffer.write(f"<< /Size {len(offsets) + 1} /Root 1 0 R >>\n".encode("latin-1"))
+    buffer.write(b"startxref\n")
+    buffer.write(f"{xref_offset}\n".encode("latin-1"))
+    buffer.write(b"%%EOF\n")
+    return buffer.getvalue()
+
+
+def generate_customer_summary_pdf(customer_name: str, info: dict, warranties: Optional[pd.DataFrame], services: pd.DataFrame, maintenance: pd.DataFrame) -> bytes:
+    lines: list[str] = [f"Customer Summary – {customer_name}", ""]
+    lines.extend(
+        [
+            f"Phone: {clean_text(info.get('phone')) or '-'}",
+            f"Email: {clean_text(info.get('email')) or '-'}",
+            f"Address: {clean_text(info.get('address')) or '-'}",
+            f"City: {clean_text(info.get('city')) or '-'}",
+            "",
+        ]
+    )
+
+    def extend_section(title: str, rows: list[str]) -> None:
+        lines.append(title)
+        if not rows:
+            lines.append("  (no records)")
+        else:
+            for row in rows:
+                lines.append(f"  • {row}")
+        lines.append("")
+
+    warranty_rows: list[str] = []
+    if warranties is not None and isinstance(warranties, pd.DataFrame) and not warranties.empty:
+        for _, row in warranties.iterrows():
+            warranty_rows.append(
+                " | ".join(
+                    [
+                        f"Description: {clean_text(row.get('Description')) or '-'}",
+                        f"Issue: {clean_text(row.get('Issue date')) or '-'}",
+                        f"Expiry: {clean_text(row.get('Expiry date')) or '-'}",
+                        f"Status: {clean_text(row.get('Status')) or '-'}",
+                    ]
+                )
+            )
+
+    service_rows: list[str] = []
+    if isinstance(services, pd.DataFrame) and not services.empty:
+        for _, row in services.iterrows():
+            service_rows.append(
+                " | ".join(
+                    [
+                        f"DO: {clean_text(row.get('do_number')) or '-'}",
+                        f"Date: {clean_text(row.get('service_date')) or '-'}",
+                        f"Desc: {clean_text(row.get('description')) or '-'}",
+                        f"Remarks: {clean_text(row.get('remarks')) or '-'}",
+                    ]
+                )
+            )
+
+    maintenance_rows: list[str] = []
+    if isinstance(maintenance, pd.DataFrame) and not maintenance.empty:
+        for _, row in maintenance.iterrows():
+            maintenance_rows.append(
+                " | ".join(
+                    [
+                        f"DO: {clean_text(row.get('do_number')) or '-'}",
+                        f"Date: {clean_text(row.get('maintenance_date')) or '-'}",
+                        f"Desc: {clean_text(row.get('description')) or '-'}",
+                        f"Remarks: {clean_text(row.get('remarks')) or '-'}",
+                    ]
+                )
+            )
+
+    extend_section("Warranties", warranty_rows)
+    extend_section("Service history", service_rows)
+    extend_section("Maintenance history", maintenance_rows)
+
+    return _build_simple_pdf_document(lines)
 
 
 def _streamlit_flag_options_from_env() -> dict[str, object]:
@@ -472,6 +614,7 @@ def login_box(conn):
         st.sidebar.success(f"Logged in as {st.session_state.user['username']} ({st.session_state.user['role']})")
         if st.sidebar.button("Logout"):
             st.session_state.user = None
+            st.session_state.page = "Dashboard"
             _safe_rerun()
         return True
     with st.sidebar.form("login_form"):
@@ -482,6 +625,8 @@ def login_box(conn):
         row = df_query(conn, "SELECT user_id, username, pass_hash, role FROM users WHERE username = ?", (u,))
         if not row.empty and hashlib.sha256(p.encode("utf-8")).hexdigest() == row.iloc[0]["pass_hash"]:
             st.session_state.user = {"user_id": int(row.iloc[0]["user_id"]), "username": row.iloc[0]["username"], "role": row.iloc[0]["role"]}
+            st.session_state.page = "Dashboard"
+            st.session_state.just_logged_in = True
             _safe_rerun()
         else:
             st.sidebar.error("Invalid credentials")
@@ -525,6 +670,54 @@ def dashboard(conn):
         )
         st.metric("Expired", expired_count)
 
+    month_expired = int(
+        df_query(
+            conn,
+            """
+            SELECT COUNT(*) c
+            FROM warranties
+            WHERE date(expiry_date) < date('now')
+              AND strftime('%Y-%m', expiry_date) = strftime('%Y-%m', 'now')
+            """,
+        ).iloc[0]["c"]
+    )
+    service_month = int(
+        df_query(
+            conn,
+            """
+            SELECT COUNT(*) c
+            FROM services
+            WHERE service_date IS NOT NULL
+              AND strftime('%Y-%m', service_date) = strftime('%Y-%m', 'now')
+            """,
+        ).iloc[0]["c"]
+    )
+    maintenance_month = int(
+        df_query(
+            conn,
+            """
+            SELECT COUNT(*) c
+            FROM maintenance_records
+            WHERE maintenance_date IS NOT NULL
+              AND strftime('%Y-%m', maintenance_date) = strftime('%Y-%m', 'now')
+            """,
+        ).iloc[0]["c"]
+    )
+    col5, col6, col7 = st.columns(3)
+    with col5:
+        st.metric("Expired this month", month_expired)
+    with col6:
+        st.metric("Services this month", service_month)
+    with col7:
+        st.metric("Maintenance this month", maintenance_month)
+
+    st.markdown(" ")
+    col_master, _ = st.columns([1, 3])
+    with col_master:
+        if st.button("Open Master Sheet", type="primary"):
+            st.session_state.page = "Master Sheet"
+            _safe_rerun()
+
     today_expired = df_query(
         conn,
         """
@@ -558,20 +751,132 @@ def dashboard(conn):
         )
 
     st.markdown("---")
-    st.subheader("🛠️ Warranties Expiring Soon")
-    colA, colB = st.columns(2)
+    st.subheader("🔎 Quick snapshots")
+    tab1, tab2, tab3 = st.tabs(["Upcoming expiries", "Recent services", "Recent maintenance"])
 
-    soon3 = fetch_warranty_window(conn, 0, 3)
-    soon3 = collapse_warranty_rows(soon3)
-    with colA:
-        st.caption("Next **3** days")
-        st.dataframe(soon3, use_container_width=True)
+    with tab1:
+        upcoming = fetch_warranty_window(conn, 0, 30)
+        upcoming = format_warranty_table(upcoming)
+        st.dataframe(upcoming.head(10), use_container_width=True)
 
-    soon60 = fetch_warranty_window(conn, 0, 60)
-    soon60 = collapse_warranty_rows(soon60)
-    with colB:
-        st.caption("Next **60** days")
-        st.dataframe(soon60, use_container_width=True)
+    with tab2:
+        recent_services = df_query(
+            conn,
+            """
+            SELECT s.do_number,
+                   s.service_date,
+                   COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+                   s.description
+            FROM services s
+            LEFT JOIN customers c ON c.customer_id = s.customer_id
+            LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+            LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+            ORDER BY datetime(s.service_date) DESC, s.service_id DESC
+            LIMIT 10
+            """,
+        )
+        recent_services = fmt_dates(recent_services, ["service_date"])
+        st.dataframe(
+            recent_services.rename(
+                columns={
+                    "do_number": "DO Serial",
+                    "service_date": "Service date",
+                    "customer": "Customer",
+                    "description": "Description",
+                }
+            ),
+            use_container_width=True,
+        )
+
+    with tab3:
+        recent_maintenance = df_query(
+            conn,
+            """
+            SELECT m.do_number,
+                   m.maintenance_date,
+                   COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+                   m.description
+            FROM maintenance_records m
+            LEFT JOIN customers c ON c.customer_id = m.customer_id
+            LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+            LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+            ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
+            LIMIT 10
+            """,
+        )
+        recent_maintenance = fmt_dates(recent_maintenance, ["maintenance_date"])
+        st.dataframe(
+            recent_maintenance.rename(
+                columns={
+                    "do_number": "DO Serial",
+                    "maintenance_date": "Maintenance date",
+                    "customer": "Customer",
+                    "description": "Description",
+                }
+            ),
+            use_container_width=True,
+        )
+
+
+def show_expiry_notifications(conn):
+    if not st.session_state.get("just_logged_in"):
+        return
+
+    total_expired = int(
+        df_query(
+            conn,
+            "SELECT COUNT(*) c FROM warranties WHERE date(expiry_date) < date('now')",
+        ).iloc[0]["c"]
+    )
+    if total_expired == 0:
+        st.session_state.just_logged_in = False
+        return
+    month_expired = int(
+        df_query(
+            conn,
+            """
+            SELECT COUNT(*) c
+            FROM warranties
+            WHERE date(expiry_date) < date('now')
+              AND strftime('%Y-%m', expiry_date) = strftime('%Y-%m', 'now')
+            """,
+        ).iloc[0]["c"]
+    )
+    expired_recent = df_query(
+        conn,
+        """
+        SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
+        FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
+        LEFT JOIN products p ON p.product_id = w.product_id
+        WHERE date(w.expiry_date) < date('now')
+        ORDER BY date(w.expiry_date) DESC
+        LIMIT 12
+        """,
+    )
+    formatted = format_warranty_table(expired_recent)
+    try:
+        with st.modal("Expired warranties alert"):
+            st.markdown("### Warranties needing attention")
+            st.write(
+                f"Total expired: **{total_expired}**, expired this month: **{month_expired}**."
+            )
+            if formatted is None or formatted.empty:
+                st.info("No expired warranties found.")
+            else:
+                st.dataframe(formatted, use_container_width=True)
+    except Exception:
+        if total_expired > 0:
+            st.warning(
+                f"{total_expired} warranties are past expiry. {month_expired} expired this month."
+            )
+    try:
+        if total_expired > 0:
+            st.toast(f"{total_expired} warranties require attention.")
+    except Exception:
+        pass
+
+    st.session_state.just_logged_in = False
 
 def customers_page(conn):
     st.subheader("👥 Customers")
@@ -738,19 +1043,6 @@ def warranties_page(conn):
 def delivery_orders_page(conn):
     st.subheader("🚚 Delivery Orders")
     customer_options, customer_labels = fetch_customer_choices(conn)
-    orders_df = df_query(conn, "SELECT order_id, order_date FROM orders ORDER BY datetime(order_date) DESC")
-    order_options = [None]
-    order_labels = {None: "-- Not linked --"}
-    for _, row in orders_df.iterrows():
-        oid = int(row["order_id"])
-        date_label = clean_text(row.get("order_date"))
-        if date_label:
-            dt = pd.to_datetime(date_label, errors="coerce")
-            if pd.notna(dt):
-                date_label = dt.strftime(DATE_FMT)
-        label = f"Order #{oid}" + (f" – {date_label}" if date_label else "")
-        order_options.append(oid)
-        order_labels[oid] = label
 
     with st.form("delivery_order_form"):
         do_number = st.text_input("Delivery Order Serial *")
@@ -760,11 +1052,6 @@ def delivery_orders_page(conn):
             options=customer_options,
             index=selected_customer_index,
             format_func=lambda cid: customer_labels.get(cid, str(cid)),
-        )
-        selected_order = st.selectbox(
-            "Related Order",
-            options=order_options,
-            format_func=lambda oid: order_labels.get(oid, str(oid)),
         )
         description = st.text_area("Description")
         sales_person = st.text_input("Sales person")
@@ -793,7 +1080,7 @@ def delivery_orders_page(conn):
                     (
                         serial,
                         int(selected_customer) if selected_customer else None,
-                        int(selected_order) if selected_order else None,
+                        None,
                         clean_text(description),
                         clean_text(sales_person),
                         stored_path,
@@ -822,12 +1109,14 @@ def delivery_orders_page(conn):
                 "description": "Description",
                 "sales_person": "Sales person",
                 "created_at": "Created",
-                "order_id": "Order",
             },
             inplace=True,
         )
         st.markdown("### Recorded Delivery Orders")
-        st.dataframe(display.drop(columns=["file_path"], errors="ignore"), use_container_width=True)
+        st.dataframe(
+            display.drop(columns=["file_path", "order_id"], errors="ignore"),
+            use_container_width=True,
+        )
 
         downloadable = do_df.to_dict("records")
         with st.expander("Delivery Order files", expanded=False):
@@ -850,26 +1139,33 @@ def delivery_orders_page(conn):
 
 def services_page(conn):
     st.subheader("🛠️ Service Records")
-    customer_options, customer_labels = fetch_customer_choices(conn)
     do_df = df_query(
         conn,
-        "SELECT do_number, customer_id, description FROM delivery_orders ORDER BY datetime(created_at) DESC",
+        """
+        SELECT d.do_number, d.customer_id, COALESCE(c.name, '(unknown)') AS customer_name, d.description
+        FROM delivery_orders d
+        LEFT JOIN customers c ON c.customer_id = d.customer_id
+        ORDER BY datetime(d.created_at) DESC
+        """,
     )
     do_options = [None]
     do_labels = {None: "-- Select delivery order --"}
     do_customer_map = {}
+    do_customer_name_map = {}
     for _, row in do_df.iterrows():
         do_num = clean_text(row.get("do_number"))
         if not do_num:
             continue
         cust_id = int(row["customer_id"]) if not pd.isna(row.get("customer_id")) else None
         summary = clean_text(row.get("description"))
+        cust_name = clean_text(row.get("customer_name"))
         label = do_num
         if summary:
             label = f"{do_num} – {summary[:40]}" + ("…" if len(summary) > 40 else "")
         do_options.append(do_num)
         do_labels[do_num] = label
         do_customer_map[do_num] = cust_id
+        do_customer_name_map[do_num] = cust_name or "(not linked)"
 
     with st.form("service_form"):
         selected_do = st.selectbox(
@@ -877,16 +1173,11 @@ def services_page(conn):
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
-        default_customer = do_customer_map.get(selected_do)
-        try:
-            customer_index = customer_options.index(default_customer) if default_customer in customer_options else 0
-        except ValueError:
-            customer_index = 0
-        selected_customer = st.selectbox(
+        customer_name_display = do_customer_name_map.get(selected_do)
+        st.text_input(
             "Customer",
-            options=customer_options,
-            index=customer_index,
-            format_func=lambda cid: customer_labels.get(cid, str(cid)),
+            value=customer_name_display or "(not linked)",
+            disabled=True,
         )
         service_date = st.date_input("Service date", value=datetime.now().date())
         description = st.text_area("Service description")
@@ -897,6 +1188,7 @@ def services_page(conn):
         if not selected_do:
             st.error("Delivery Order is required for service records.")
         else:
+            selected_customer = do_customer_map.get(selected_do)
             conn.execute(
                 "INSERT INTO services (do_number, customer_id, service_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -915,9 +1207,17 @@ def services_page(conn):
     service_df = df_query(
         conn,
         """
-        SELECT s.service_id, s.do_number, s.service_date, s.description, s.remarks, s.updated_at, c.name AS customer
+        SELECT s.service_id,
+               s.do_number,
+               s.service_date,
+               s.description,
+               s.remarks,
+               s.updated_at,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
         ORDER BY datetime(s.service_date) DESC, s.service_id DESC
         """,
     )
@@ -935,14 +1235,17 @@ def services_page(conn):
             }
         )
         st.markdown("### Service history")
-        st.dataframe(display.drop(columns=["updated_at"], errors="ignore"), use_container_width=True)
+        st.dataframe(
+            display.drop(columns=["updated_at", "service_id"], errors="ignore"),
+            use_container_width=True,
+        )
 
         records = service_df.to_dict("records")
         st.markdown("#### Update remarks")
         options = [int(r["service_id"]) for r in records]
         labels = {
-            int(r["service_id"]): f"#{int(r['service_id'])} – {r.get('DO Serial', r.get('do_number'))}"
-            for r in display.to_dict("records")
+            int(r["service_id"]): f"#{int(r['service_id'])} – {r.get('do_number')}"
+            for r in records
         }
         selected_service_id = st.selectbox(
             "Select service entry",
@@ -969,26 +1272,33 @@ def services_page(conn):
 
 def maintenance_page(conn):
     st.subheader("🔧 Maintenance Records")
-    customer_options, customer_labels = fetch_customer_choices(conn)
     do_df = df_query(
         conn,
-        "SELECT do_number, customer_id, description FROM delivery_orders ORDER BY datetime(created_at) DESC",
+        """
+        SELECT d.do_number, d.customer_id, COALESCE(c.name, '(unknown)') AS customer_name, d.description
+        FROM delivery_orders d
+        LEFT JOIN customers c ON c.customer_id = d.customer_id
+        ORDER BY datetime(d.created_at) DESC
+        """,
     )
     do_options = [None]
     do_labels = {None: "-- Select delivery order --"}
     do_customer_map = {}
+    do_customer_name_map = {}
     for _, row in do_df.iterrows():
         do_num = clean_text(row.get("do_number"))
         if not do_num:
             continue
         cust_id = int(row["customer_id"]) if not pd.isna(row.get("customer_id")) else None
         summary = clean_text(row.get("description"))
+        cust_name = clean_text(row.get("customer_name"))
         label = do_num
         if summary:
             label = f"{do_num} – {summary[:40]}" + ("…" if len(summary) > 40 else "")
         do_options.append(do_num)
         do_labels[do_num] = label
         do_customer_map[do_num] = cust_id
+        do_customer_name_map[do_num] = cust_name or "(not linked)"
 
     with st.form("maintenance_form"):
         selected_do = st.selectbox(
@@ -996,16 +1306,10 @@ def maintenance_page(conn):
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
-        default_customer = do_customer_map.get(selected_do)
-        try:
-            customer_index = customer_options.index(default_customer) if default_customer in customer_options else 0
-        except ValueError:
-            customer_index = 0
-        selected_customer = st.selectbox(
+        st.text_input(
             "Customer",
-            options=customer_options,
-            index=customer_index,
-            format_func=lambda cid: customer_labels.get(cid, str(cid)),
+            value=do_customer_name_map.get(selected_do) or "(not linked)",
+            disabled=True,
         )
         maintenance_date = st.date_input("Maintenance date", value=datetime.now().date())
         description = st.text_area("Maintenance description")
@@ -1016,6 +1320,7 @@ def maintenance_page(conn):
         if not selected_do:
             st.error("Delivery Order is required for maintenance records.")
         else:
+            selected_customer = do_customer_map.get(selected_do)
             conn.execute(
                 "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -1034,9 +1339,17 @@ def maintenance_page(conn):
     maintenance_df = df_query(
         conn,
         """
-        SELECT m.maintenance_id, m.do_number, m.maintenance_date, m.description, m.remarks, m.updated_at, c.name AS customer
+        SELECT m.maintenance_id,
+               m.do_number,
+               m.maintenance_date,
+               m.description,
+               m.remarks,
+               m.updated_at,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer
         FROM maintenance_records m
         LEFT JOIN customers c ON c.customer_id = m.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
         ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
         """,
     )
@@ -1054,7 +1367,10 @@ def maintenance_page(conn):
             }
         )
         st.markdown("### Maintenance history")
-        st.dataframe(display.drop(columns=["updated_at"], errors="ignore"), use_container_width=True)
+        st.dataframe(
+            display.drop(columns=["updated_at", "maintenance_id"], errors="ignore"),
+            use_container_width=True,
+        )
 
         records = maintenance_df.to_dict("records")
         st.markdown("#### Update remarks")
@@ -1084,6 +1400,218 @@ def maintenance_page(conn):
             _safe_rerun()
     else:
         st.info("No maintenance records yet. Log one using the form above.")
+
+
+def master_sheet_page(conn):
+    st.subheader("🗃 Master Sheet")
+    st.caption("Adjust warranty coverage and manage delivery order files from one place.")
+
+    warr_tab, files_tab = st.tabs(["Warranties", "Delivery order files"])
+
+    with warr_tab:
+        warr_df = df_query(
+            conn,
+            """
+            SELECT w.warranty_id,
+                   c.name AS customer,
+                   p.name AS product,
+                   p.model,
+                   w.serial,
+                   w.issue_date,
+                   w.expiry_date,
+                   w.status
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            LEFT JOIN products p ON p.product_id = w.product_id
+            ORDER BY date(w.expiry_date) DESC, w.warranty_id DESC
+            """,
+        )
+        warr_df = fmt_dates(warr_df, ["issue_date", "expiry_date"])
+        if warr_df.empty:
+            st.info("No warranties recorded yet.")
+        else:
+            display = warr_df.rename(
+                columns={
+                    "customer": "Customer",
+                    "product": "Product",
+                    "model": "Model",
+                    "serial": "Serial",
+                    "issue_date": "Issue date",
+                    "expiry_date": "Expiry date",
+                    "status": "Status",
+                }
+            )
+            st.dataframe(
+                display.drop(columns=["warranty_id"], errors="ignore"),
+                use_container_width=True,
+            )
+
+            records = warr_df.to_dict("records")
+            option_ids = [int(r["warranty_id"]) for r in records]
+            labels = {
+                int(r["warranty_id"]): dedupe_join(
+                    [
+                        clean_text(r.get("customer")) or "(no customer)",
+                        clean_text(r.get("product")),
+                        clean_text(r.get("model")),
+                    ]
+                )
+                for r in records
+            }
+            if not option_ids:
+                st.info("No warranties available to edit.")
+            else:
+                with st.form("warranty_master_form"):
+                    selected_id = st.selectbox(
+                        "Select warranty",
+                        option_ids,
+                        format_func=lambda wid: labels.get(wid, f"#{wid}"),
+                    )
+                    selected_record = next(r for r in records if int(r["warranty_id"]) == int(selected_id))
+                    expiry_val = pd.to_datetime(selected_record.get("expiry_date"), errors="coerce")
+                    expiry_default = expiry_val.date() if pd.notna(expiry_val) else datetime.now().date()
+                    expiry_input = st.date_input(
+                        "Expiry date",
+                        value=expiry_default,
+                        key=f"master_expiry_{selected_id}",
+                    )
+                    extend_days = st.number_input(
+                        "Extend by days",
+                        min_value=0,
+                        value=0,
+                        step=1,
+                        help="Optional. Adds days to the selected expiry date before saving.",
+                        key=f"master_extend_{selected_id}",
+                    )
+                    base_statuses = ["active", "expired", "void", "pending"]
+                    current_status = clean_text(selected_record.get("status")) or "active"
+                    status_choices = base_statuses + ([current_status] if current_status not in base_statuses else [])
+                    status_index = status_choices.index(current_status)
+                    new_status = st.selectbox(
+                        "Status",
+                        status_choices,
+                        index=status_index,
+                        key=f"master_status_{selected_id}",
+                    )
+                    save = st.form_submit_button("Save warranty changes", type="primary")
+
+                if save:
+                    final_expiry = expiry_input + timedelta(days=int(extend_days))
+                    conn.execute(
+                        "UPDATE warranties SET expiry_date = ?, status = ? WHERE warranty_id = ?",
+                        (
+                            final_expiry.strftime("%Y-%m-%d"),
+                            new_status,
+                            int(selected_id),
+                        ),
+                    )
+                    conn.commit()
+                    st.success("Warranty updated.")
+                    _safe_rerun()
+
+    with files_tab:
+        do_df = df_query(
+            conn,
+            """
+            SELECT d.do_number,
+                   c.name AS customer,
+                   d.description,
+                   d.sales_person,
+                   d.file_path,
+                   d.created_at
+            FROM delivery_orders d
+            LEFT JOIN customers c ON c.customer_id = d.customer_id
+            ORDER BY datetime(d.created_at) DESC, d.do_number ASC
+            """,
+        )
+        do_df = fmt_dates(do_df, ["created_at"])
+        if do_df.empty:
+            st.info("No delivery orders recorded yet.")
+        else:
+            st.dataframe(
+                do_df.rename(
+                    columns={
+                        "do_number": "DO Serial",
+                        "customer": "Customer",
+                        "description": "Description",
+                        "sales_person": "Sales person",
+                        "created_at": "Created",
+                    }
+                ).drop(columns=["file_path"], errors="ignore"),
+                use_container_width=True,
+            )
+            records = do_df.to_dict("records")
+            options = [clean_text(r.get("do_number")) for r in records if clean_text(r.get("do_number"))]
+            label_map = {
+                clean_text(r.get("do_number")): dedupe_join(
+                    [
+                        clean_text(r.get("do_number")),
+                        clean_text(r.get("customer")),
+                        clean_text(r.get("description")),
+                    ]
+                )
+                for r in records
+                if clean_text(r.get("do_number"))
+            }
+            file_map = {clean_text(r.get("do_number")): r.get("file_path") for r in records if clean_text(r.get("do_number"))}
+            if not options:
+                st.info("No delivery order codes available yet.")
+            else:
+                selected_do = st.selectbox(
+                    "Select delivery order",
+                    options,
+                    format_func=lambda do: label_map.get(do, do),
+                    key="master_do_select",
+                )
+                current_file = resolve_upload_path(file_map.get(selected_do)) if selected_do else None
+                if current_file and current_file.exists():
+                    st.caption(f"Current file: {current_file.name}")
+                upload_file = st.file_uploader(
+                    "Upload replacement PDF",
+                    type=["pdf"],
+                    key="master_do_upload",
+                )
+                col_a, col_b = st.columns(2)
+                if col_a.button("Save / replace file", type="primary"):
+                    if not selected_do:
+                        st.warning("Choose a delivery order first.")
+                    elif upload_file is None:
+                        st.warning("Upload a PDF to replace the existing file.")
+                    else:
+                        saved = save_uploaded_file(upload_file, DELIVERY_ORDER_DIR, filename=f"{selected_do}.pdf")
+                        if saved:
+                            if current_file and current_file.exists() and current_file != saved:
+                                try:
+                                    current_file.unlink()
+                                except Exception:
+                                    pass
+                            try:
+                                stored_path = str(saved.relative_to(BASE_DIR))
+                            except ValueError:
+                                stored_path = str(saved)
+                            conn.execute(
+                                "UPDATE delivery_orders SET file_path = ? WHERE do_number = ?",
+                                (stored_path, selected_do),
+                            )
+                            conn.commit()
+                            st.success("Delivery order file updated.")
+                            _safe_rerun()
+                if col_b.button("Remove file"):
+                    if not selected_do:
+                        st.warning("Choose a delivery order first.")
+                    else:
+                        if current_file and current_file.exists():
+                            try:
+                                current_file.unlink()
+                            except Exception:
+                                pass
+                        conn.execute(
+                            "UPDATE delivery_orders SET file_path = NULL WHERE do_number = ?",
+                            (selected_do,),
+                        )
+                        conn.commit()
+                        st.success("Delivery order file removed.")
+                        _safe_rerun()
 
 def customer_summary_page(conn):
     st.subheader("📒 Customer Summary")
@@ -1142,18 +1670,101 @@ def customer_summary_page(conn):
     warr = df_query(
         conn,
         f"""
-        SELECT w.warranty_id as id, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.dup_flag
+        SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.dup_flag
         FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
         LEFT JOIN products p ON p.product_id = w.product_id
         WHERE w.customer_id IN ({placeholders})
         ORDER BY date(w.expiry_date) DESC
         """,
         ids,
     )
-    warr = fmt_dates(warr, ["issue_date","expiry_date"])
+    warr = fmt_dates(warr, ["issue_date", "expiry_date"])
     if "dup_flag" in warr.columns:
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate" if int(x) == 1 else ""))
-    st.dataframe(warr)
+    warr_display = format_warranty_table(warr)
+    if warr_display is None or warr_display.empty:
+        st.info("No warranties recorded for this customer.")
+    else:
+        st.dataframe(warr_display)
+
+    st.markdown("**Service records**")
+    service_df = df_query(
+        conn,
+        f"""
+        SELECT s.do_number, s.service_date, s.description, s.remarks,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+        FROM services s
+        LEFT JOIN customers c ON c.customer_id = s.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        WHERE COALESCE(s.customer_id, d.customer_id) IN ({placeholders})
+        ORDER BY datetime(s.service_date) DESC, s.service_id DESC
+        """,
+        ids,
+    )
+    service_df = fmt_dates(service_df, ["service_date"])
+    if service_df.empty:
+        st.info("No service records found for this customer.")
+    else:
+        st.dataframe(
+            service_df.rename(
+                columns={
+                    "do_number": "DO Serial",
+                    "service_date": "Service date",
+                    "description": "Description",
+                    "remarks": "Remarks",
+                    "customer": "Customer",
+                }
+            ),
+            use_container_width=True,
+        )
+
+    st.markdown("**Maintenance records**")
+    maintenance_df = df_query(
+        conn,
+        f"""
+        SELECT m.do_number, m.maintenance_date, m.description, m.remarks,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+        FROM maintenance_records m
+        LEFT JOIN customers c ON c.customer_id = m.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        WHERE COALESCE(m.customer_id, d.customer_id) IN ({placeholders})
+        ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
+        """,
+        ids,
+    )
+    maintenance_df = fmt_dates(maintenance_df, ["maintenance_date"])
+    if maintenance_df.empty:
+        st.info("No maintenance records found for this customer.")
+    else:
+        st.dataframe(
+            maintenance_df.rename(
+                columns={
+                    "do_number": "DO Serial",
+                    "maintenance_date": "Maintenance date",
+                    "description": "Description",
+                    "remarks": "Remarks",
+                    "customer": "Customer",
+                }
+            ),
+            use_container_width=True,
+        )
+
+    pdf_bytes = generate_customer_summary_pdf(
+        info.get("name") or blank_label,
+        info,
+        warr_display,
+        service_df,
+        maintenance_df,
+    )
+    st.download_button(
+        "⬇️ Download summary (PDF)",
+        data=pdf_bytes,
+        file_name=f"customer_summary_{clean_text(info.get('name')) or 'customer'}.pdf",
+        mime="application/pdf",
+    )
 
 
 def scraps_page(conn):
@@ -1262,24 +1873,26 @@ def normalize_headers(cols):
     return norm
 
 HEADER_MAP = {
-    "date": {"date","delivery_date","issue_date","order_date","dt","d_o","d","sale_date"},
-    "customer_name": {"customer_name","customer","company","company_name","client","party","name"},
-    "address": {"address","addr","street","location"},
-    "phone": {"phone","mobile","contact","contact_no","phone_no","phone_number","cell","whatsapp"},
-    "product": {"product","item","generator","model","description"},
-    "price": {"price","amount","unit_price","rate","value","tk","bdt"}
+    "date": {"date", "delivery_date", "issue_date", "order_date", "dt", "d_o", "d", "sale_date"},
+    "customer_name": {"customer_name", "customer", "company", "company_name", "client", "party", "name"},
+    "address": {"address", "addr", "street", "location"},
+    "phone": {"phone", "mobile", "contact", "contact_no", "phone_no", "phone_number", "cell", "whatsapp"},
+    "product": {"product", "item", "generator", "model", "description"},
+    "price": {"price", "amount", "unit_price", "rate", "value", "tk", "bdt"},
+    "do_code": {"do_code", "delivery_order", "delivery_order_code", "delivery_order_no", "do", "d_o_code", "do_number"},
 }
 
 def map_headers_guess(cols):
     cols_norm = normalize_headers(cols)
-    mapping = {"date":None,"customer_name":None,"address":None,"phone":None,"product":None,"price":None}
-    for i,cn in enumerate(cols_norm):
+    mapping = {k: None for k in HEADER_MAP.keys()}
+    for i, cn in enumerate(cols_norm):
         for target, aliases in HEADER_MAP.items():
             if cn in aliases and mapping[target] is None:
                 mapping[target] = i
                 break
-    if cols_norm[:6] == ["date","customer_name","address","phone","product","price"]:
-        mapping = {k:i for i,k in enumerate(["date","customer_name","address","phone","product","price"])}
+    default_order = ["date", "customer_name", "address", "phone", "product", "price", "do_code"]
+    if cols_norm[: len(default_order)] == default_order:
+        mapping = {field: idx for idx, field in enumerate(default_order)}
     return mapping
 
 def coerce_excel_date(series):
@@ -1308,24 +1921,29 @@ def import_page(conn):
     guess = map_headers_guess(list(df.columns))
     cols = list(df.columns)
     opts = ["(blank)"] + cols
-    col1, col2, col3 = st.columns(3); col4, col5, col6 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
+    col4, col5, col6 = st.columns(3)
+    col7, _, _ = st.columns(3)
     sel_date = col1.selectbox(
-        "Date", options=opts, index=(guess["date"] + 1) if guess["date"] is not None else 0
+        "Date", options=opts, index=(guess["date"] + 1) if guess.get("date") is not None else 0
     )
     sel_name = col2.selectbox(
-        "Customer name", options=opts, index=(guess["customer_name"] + 1) if guess["customer_name"] is not None else 0
+        "Customer name", options=opts, index=(guess["customer_name"] + 1) if guess.get("customer_name") is not None else 0
     )
     sel_addr = col3.selectbox(
-        "Address", options=opts, index=(guess["address"] + 1) if guess["address"] is not None else 0
+        "Address", options=opts, index=(guess["address"] + 1) if guess.get("address") is not None else 0
     )
     sel_phone = col4.selectbox(
-        "Phone", options=opts, index=(guess["phone"] + 1) if guess["phone"] is not None else 0
+        "Phone", options=opts, index=(guess["phone"] + 1) if guess.get("phone") is not None else 0
     )
     sel_prod = col5.selectbox(
-        "Product", options=opts, index=(guess["product"] + 1) if guess["product"] is not None else 0
+        "Product", options=opts, index=(guess["product"] + 1) if guess.get("product") is not None else 0
     )
     sel_price = col6.selectbox(
-        "Price", options=opts, index=(guess["price"] + 1) if guess["price"] is not None else 0
+        "Price", options=opts, index=(guess["price"] + 1) if guess.get("price") is not None else 0
+    )
+    sel_do = col7.selectbox(
+        "Delivery order code", options=opts, index=(guess["do_code"] + 1) if guess.get("do_code") is not None else 0
     )
 
     def pick(col_name):
@@ -1339,6 +1957,7 @@ def import_page(conn):
             "phone": pick(sel_phone),
             "product": pick(sel_prod),
             "price": pick(sel_price),
+            "do_code": pick(sel_do),
         }
     )
     skip_blanks = st.checkbox("Skip blank rows", value=True)
@@ -1347,7 +1966,7 @@ def import_page(conn):
     df_norm = df_norm.applymap(lambda x: x.strip() if isinstance(x, str) else x)
     if skip_blanks:
         df_norm = df_norm.dropna(how="all")
-    df_norm = df_norm.drop_duplicates().sort_values(by=["date", "customer_name", "phone"]).reset_index(drop=True)
+    df_norm = df_norm.drop_duplicates().sort_values(by=["date", "customer_name", "phone", "do_code"]).reset_index(drop=True)
     st.markdown("#### Dry-run preview (first 10 rows)")
     st.dataframe(df_norm.head(10))
 
@@ -1439,6 +2058,7 @@ def _import_clean6(conn, df, tag="Import"):
         cust = r.get("customer_name"); addr = r.get("address")
         phone = r.get("phone"); prod = r.get("product")
         price = r.get("price")
+        do_code = r.get("do_code")
         if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
             continue
         cust = str(cust) if pd.notna(cust) else None
@@ -1512,6 +2132,21 @@ def _import_clean6(conn, df, tag="Import"):
             "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, dup_flag) VALUES (?, ?, ?, ?, ?, 'active', 0)",
             (cid, pid, None, base.strftime("%Y-%m-%d"), expiry.strftime("%Y-%m-%d")),
         )
+
+        do_serial = clean_text(do_code)
+        if do_serial:
+            description = clean_text(prod)
+            cur.execute(
+                "INSERT OR IGNORE INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    do_serial,
+                    cid,
+                    oid,
+                    description,
+                    None,
+                    None,
+                ),
+            )
         seeded += 1
     conn.commit()
     return seeded, d_c, d_p
@@ -1523,12 +2158,19 @@ def main():
     init_schema(conn)
     login_box(conn)
 
+    if "page" not in st.session_state:
+        st.session_state.page = "Dashboard"
+
     with st.sidebar:
         pages = ["Dashboard", "Customers", "Customer Summary", "Scraps", "Warranties", "Import", "Duplicates"]
         if st.session_state.user and st.session_state.user["role"] == "admin":
             pages.append("Users (Admin)")
-        pages.extend(["Delivery Orders", "Service", "Maintenance"])
-        page = st.radio("Navigate", pages)
+        pages.extend(["Delivery Orders", "Service", "Maintenance", "Master Sheet"])
+        current_index = pages.index(st.session_state.page) if st.session_state.page in pages else 0
+        page = st.radio("Navigate", pages, index=current_index, key="nav_page")
+        st.session_state.page = page
+
+    show_expiry_notifications(conn)
 
     if page == "Dashboard":
         dashboard(conn)
@@ -1552,6 +2194,8 @@ def main():
         services_page(conn)
     elif page == "Maintenance":
         maintenance_page(conn)
+    elif page == "Master Sheet":
+        master_sheet_page(conn)
 
 if _streamlit_runtime_active():
     main()
