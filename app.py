@@ -670,11 +670,7 @@ def _streamlit_flag_options_from_env() -> dict[str, object]:
         if port and port > 0:
             flag_options["server.port"] = port
 
-    address_env = (
-        os.getenv("HOST")
-        or os.getenv("BIND_ADDRESS")
-        or os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    )
+    address_env = os.getenv("HOST") or os.getenv("BIND_ADDRESS")
     flag_options["server.address"] = address_env or "0.0.0.0"
 
     headless_env = os.getenv("STREAMLIT_SERVER_HEADLESS")
@@ -867,11 +863,16 @@ def dashboard(conn):
 
     st.markdown("---")
     st.subheader("🔎 Quick snapshots")
-    tab1, tab2, tab3 = st.tabs(["Upcoming expiries", "Recent services", "Recent maintenance"])
+    tab1, tab2, tab3 = st.tabs([
+        "Upcoming expiries (next 60 days)",
+        "Recent services",
+        "Recent maintenance",
+    ])
 
     with tab1:
-        upcoming = fetch_warranty_window(conn, 0, 30)
+        upcoming = fetch_warranty_window(conn, 0, 60)
         upcoming = format_warranty_table(upcoming)
+        st.caption("Active warranties scheduled to expire in the next 60 days.")
         st.dataframe(upcoming.head(10), use_container_width=True)
 
     with tab2:
