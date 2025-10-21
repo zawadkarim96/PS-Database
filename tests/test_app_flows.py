@@ -48,8 +48,8 @@ def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
     new_phone = app_module.clean_text("777-8888")
     new_address = app_module.clean_text(" 42 Hero Lane ")
     db_conn.execute(
-        "UPDATE customers SET name=?, phone=?, address=?, city=?, dup_flag=0 WHERE customer_id=?",
-        (new_name, new_phone, new_address, "Metropolis", scrap_id),
+        "UPDATE customers SET name=?, phone=?, address=?, dup_flag=0 WHERE customer_id=?",
+        (new_name, new_phone, new_address, scrap_id),
     )
     app_module.recalc_customer_duplicate_flag(db_conn, new_phone)
     db_conn.commit()
