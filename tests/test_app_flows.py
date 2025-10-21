@@ -1,4 +1,7 @@
 import hashlib
+import io
+
+import pandas as pd
 
 
 def test_admin_user_seeded(db_conn, app_module):
@@ -90,3 +93,52 @@ def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_m
     assert "server.port" not in flags
     assert flags["server.address"] == "0.0.0.0"
     assert flags["server.headless"] is True
+
+
+def test_export_database_to_excel_has_curated_sheets(db_conn, app_module):
+    cur = db_conn.cursor()
+    cur.execute(
+        "INSERT INTO customers (name, phone, email, address, dup_flag) VALUES (?, ?, ?, ?, 0)",
+        ("Charlie", "123", "charlie@example.com", "42 Test Way"),
+    )
+    customer_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO products (name, model, serial, dup_flag) VALUES (?, ?, ?, 0)",
+        ("Air Conditioner", "AC-01", "SER123"),
+    )
+    product_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person) VALUES (?, ?, NULL, ?, ?)",
+        ("DO-1", customer_id, "Main unit", "Sam"),
+    )
+    cur.execute(
+        "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status) VALUES (?, ?, ?, ?, ?, ?)",
+        (customer_id, product_id, "SER123", "2024-01-01", "2025-01-01", "active"),
+    )
+    cur.execute(
+        "INSERT INTO services (do_number, customer_id, service_date, description, remarks) VALUES (?, ?, ?, ?, ?)",
+        ("DO-1", customer_id, "2024-06-01", "Installation", "All good"),
+    )
+    cur.execute(
+        "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, remarks) VALUES (?, ?, ?, ?, ?)",
+        ("DO-1", customer_id, "2024-07-01", "Checkup", "No issues"),
+    )
+    db_conn.commit()
+
+    excel_bytes = app_module.export_database_to_excel(db_conn)
+    workbook = pd.ExcelFile(io.BytesIO(excel_bytes))
+
+    assert workbook.sheet_names == [
+        "Master",
+        "Customers",
+        "Delivery orders",
+        "Warranties",
+        "Services",
+        "Maintenance",
+    ]
+
+    master_df = workbook.parse("Master")
+    assert list(master_df.columns) == ["Sheet", "Details"]
+    summary = dict(zip(master_df["Sheet"], master_df["Details"]))
+    assert "Customers" in summary and summary["Customers"].startswith("1 ")
+    assert "Warranties" in summary and summary["Warranties"].startswith("1 ")

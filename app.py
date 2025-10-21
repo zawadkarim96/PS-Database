@@ -609,19 +609,206 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def _build_customers_export(conn) -> pd.DataFrame:
+    query = dedent(
+        """
+        SELECT customer_id,
+               name,
+               phone,
+               email,
+               address,
+               purchase_date,
+               product_info,
+               delivery_order_code,
+               created_at
+        FROM customers
+        ORDER BY datetime(created_at) DESC, customer_id DESC
+        """
+    )
+    df = df_query(conn, query)
+    df = fmt_dates(df, ["purchase_date", "created_at"])
+    return df.rename(
+        columns={
+            "customer_id": "Customer ID",
+            "name": "Customer",
+            "phone": "Phone",
+            "email": "Email",
+            "address": "Address",
+            "purchase_date": "Purchase date",
+            "product_info": "Product info",
+            "delivery_order_code": "Delivery order",
+            "created_at": "Created at",
+        }
+    )
+
+
+def _build_delivery_orders_export(conn) -> pd.DataFrame:
+    query = dedent(
+        """
+        SELECT d.do_number,
+               COALESCE(c.name, '(unknown)') AS customer,
+               d.description,
+               d.sales_person,
+               d.created_at
+        FROM delivery_orders d
+        LEFT JOIN customers c ON c.customer_id = d.customer_id
+        ORDER BY datetime(d.created_at) DESC, d.do_number DESC
+        """
+    )
+    df = df_query(conn, query)
+    df = fmt_dates(df, ["created_at"])
+    return df.rename(
+        columns={
+            "do_number": "DO number",
+            "customer": "Customer",
+            "description": "Description",
+            "sales_person": "Sales person",
+            "created_at": "Created at",
+        }
+    )
+
+
+def _build_warranties_export(conn) -> pd.DataFrame:
+    query = dedent(
+        """
+        SELECT w.warranty_id,
+               COALESCE(c.name, '(unknown)') AS customer,
+               COALESCE(p.name, '') AS product,
+               p.model,
+               w.serial,
+               w.issue_date,
+               w.expiry_date,
+               w.status
+        FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
+        LEFT JOIN products p ON p.product_id = w.product_id
+        ORDER BY date(w.expiry_date) ASC, w.warranty_id ASC
+        """
+    )
+    df = df_query(conn, query)
+    df = fmt_dates(df, ["issue_date", "expiry_date"])
+    if "status" in df.columns:
+        df["status"] = df["status"].fillna("Active").apply(lambda x: str(x).title())
+    return df.rename(
+        columns={
+            "warranty_id": "Warranty ID",
+            "customer": "Customer",
+            "product": "Product",
+            "model": "Model",
+            "serial": "Serial",
+            "issue_date": "Issue date",
+            "expiry_date": "Expiry date",
+            "status": "Status",
+        }
+    )
+
+
+def _build_services_export(conn) -> pd.DataFrame:
+    query = dedent(
+        """
+        SELECT s.service_id,
+               s.do_number,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               s.service_date,
+               s.description,
+               s.remarks,
+               s.updated_at
+        FROM services s
+        LEFT JOIN customers c ON c.customer_id = s.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        ORDER BY datetime(s.service_date) DESC, s.service_id DESC
+        """
+    )
+    df = df_query(conn, query)
+    df = fmt_dates(df, ["service_date", "updated_at"])
+    return df.rename(
+        columns={
+            "service_id": "Service ID",
+            "do_number": "DO number",
+            "customer": "Customer",
+            "service_date": "Service date",
+            "description": "Description",
+            "remarks": "Remarks",
+            "updated_at": "Updated at",
+        }
+    )
+
+
+def _build_maintenance_export(conn) -> pd.DataFrame:
+    query = dedent(
+        """
+        SELECT m.maintenance_id,
+               m.do_number,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer,
+               m.maintenance_date,
+               m.description,
+               m.remarks,
+               m.updated_at
+        FROM maintenance_records m
+        LEFT JOIN customers c ON c.customer_id = m.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
+        """
+    )
+    df = df_query(conn, query)
+    df = fmt_dates(df, ["maintenance_date", "updated_at"])
+    return df.rename(
+        columns={
+            "maintenance_id": "Maintenance ID",
+            "do_number": "DO number",
+            "customer": "Customer",
+            "maintenance_date": "Maintenance date",
+            "description": "Description",
+            "remarks": "Remarks",
+            "updated_at": "Updated at",
+        }
+    )
+
+
+def _build_master_sheet(sheets: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    rows = [
+        {
+            "Sheet": "Export generated at",
+            "Details": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    ]
+    for sheet_name, df in sheets:
+        count = len(df.index) if df is not None else 0
+        label = "record" if count == 1 else "records"
+        rows.append({"Sheet": sheet_name, "Details": f"{count} {label}"})
+    return pd.DataFrame(rows, columns=["Sheet", "Details"])
+
+
 def export_database_to_excel(conn) -> bytes:
-    tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'") if not str(row[0]).startswith("sqlite_")]
+    sheet_builders = [
+        ("Customers", _build_customers_export),
+        ("Delivery orders", _build_delivery_orders_export),
+        ("Warranties", _build_warranties_export),
+        ("Services", _build_services_export),
+        ("Maintenance", _build_maintenance_export),
+    ]
+
+    sheet_data: list[tuple[str, pd.DataFrame]] = []
+    for name, builder in sheet_builders:
+        df = builder(conn)
+        sheet_data.append((name, df))
+
+    master_df = _build_master_sheet(sheet_data)
+    ordered_sheets = [("Master", master_df)] + sheet_data
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for table in tables:
-            df = df_query(conn, f"SELECT * FROM {table}")
-            if df.empty:
-                cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-                df = pd.DataFrame(columns=cols)
-            sheet_name = table[:31] if table else "Sheet"
-            if not sheet_name:
-                sheet_name = "Sheet"
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+        for sheet_name, df in ordered_sheets[:6]:
+            safe_name = sheet_name[:31] if sheet_name else "Sheet"
+            if not safe_name:
+                safe_name = "Sheet"
+            if df is None or df.empty:
+                df_to_write = pd.DataFrame()
+            else:
+                df_to_write = df
+            df_to_write.to_excel(writer, sheet_name=safe_name, index=False)
     buffer.seek(0)
     return buffer.getvalue()
 
