@@ -870,9 +870,17 @@ def dashboard(conn):
     ])
 
     with tab1:
-        upcoming = fetch_warranty_window(conn, 0, 60)
+        days_window = st.slider(
+            "Upcoming window (days)",
+            min_value=7,
+            max_value=180,
+            value=60,
+            step=1,
+            help="Adjust how far ahead to look for upcoming warranty expiries.",
+        )
+        upcoming = fetch_warranty_window(conn, 0, int(days_window))
         upcoming = format_warranty_table(upcoming)
-        st.caption("Active warranties scheduled to expire in the next 60 days.")
+        st.caption(f"Active warranties scheduled to expire in the next {int(days_window)} days.")
         st.dataframe(upcoming.head(10), use_container_width=True)
 
     with tab2:
@@ -1064,7 +1072,8 @@ def customers_page(conn):
                 axis=1,
             )
         )
-    st.dataframe(df)
+    display_df = df.drop(columns=["id", "dup_flag"], errors="ignore")
+    st.dataframe(display_df)
     if not df.empty and 'dup_flag' in df.columns:
         st.info("🔁 = duplicate phone detected")
     if not df.empty:
@@ -1077,7 +1086,7 @@ def customers_page(conn):
         ORDER BY datetime(created_at) DESC LIMIT 200
     """)
     recent_df = fmt_dates(recent_df, ["created_at"])
-    st.dataframe(recent_df)
+    st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
 
     if st.session_state.user and st.session_state.user.get("role") == "admin":
         st.markdown("---")
@@ -1256,6 +1265,7 @@ def delivery_orders_page(conn):
 def services_page(conn):
     st.subheader("🛠️ Service Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
+    customer_options, customer_labels, _, label_by_id = fetch_customer_choices(conn)
     do_df = df_query(
         conn,
         """
@@ -1276,9 +1286,15 @@ def services_page(conn):
         cust_id = int(row["customer_id"]) if not pd.isna(row.get("customer_id")) else None
         summary = clean_text(row.get("description"))
         cust_name = customer_label_map.get(cust_id) if cust_id else clean_text(row.get("customer_name"))
-        label = do_num
+        label_parts = [do_num]
+        if cust_name:
+            label_parts.append(f"({cust_name})")
         if summary:
-            label = f"{do_num} – {summary[:40]}" + ("…" if len(summary) > 40 else "")
+            snippet = summary[:40]
+            if len(summary) > 40:
+                snippet += "…"
+            label_parts.append(f"– {snippet}")
+        label = " ".join(part for part in label_parts if part)
         do_options.append(do_num)
         do_labels[do_num] = label
         do_customer_map[do_num] = cust_id
@@ -1290,11 +1306,29 @@ def services_page(conn):
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
-        customer_name_display = do_customer_name_map.get(selected_do)
-        st.text_input(
+        default_customer = do_customer_map.get(selected_do)
+        choices = list(customer_options)
+        if default_customer and default_customer not in choices:
+            choices.append(default_customer)
+            if default_customer not in customer_labels:
+                customer_labels[default_customer] = (
+                    customer_label_map.get(default_customer)
+                    or label_by_id.get(default_customer)
+                    or f"Customer #{default_customer}"
+                )
+        state_key = "service_customer_link"
+        last_do_key = "service_customer_last_do"
+        if st.session_state.get(last_do_key) != selected_do:
+            st.session_state[last_do_key] = selected_do
+            if default_customer in choices:
+                st.session_state[state_key] = default_customer
+            else:
+                st.session_state[state_key] = None
+        linked_customer = st.selectbox(
             "Customer",
-            value=customer_name_display or "(not linked)",
-            disabled=True,
+            options=choices,
+            format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+            key=state_key,
         )
         service_date = st.date_input("Service date", value=datetime.now().date())
         description = st.text_area("Service description")
@@ -1311,7 +1345,7 @@ def services_page(conn):
         if not selected_do:
             st.error("Delivery Order is required for service records.")
         else:
-            selected_customer = do_customer_map.get(selected_do)
+            selected_customer = linked_customer if linked_customer else do_customer_map.get(selected_do)
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO services (do_number, customer_id, service_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1325,6 +1359,11 @@ def services_page(conn):
                 ),
             )
             service_id = cur.lastrowid
+            if selected_customer:
+                conn.execute(
+                    "UPDATE delivery_orders SET customer_id=? WHERE do_number=?",
+                    (int(selected_customer), selected_do),
+                )
             saved_docs = attach_documents(
                 conn,
                 "service_documents",
@@ -1384,14 +1423,22 @@ def services_page(conn):
         records = service_df.to_dict("records")
         st.markdown("#### Update remarks")
         options = [int(r["service_id"]) for r in records]
-        labels = {
-            int(r["service_id"]): f"#{int(r['service_id'])} – {r.get('do_number')}"
-            for r in records
-        }
+        def service_label(record):
+            do_ref = clean_text(record.get("do_number")) or "(no DO)"
+            date_ref = clean_text(record.get("service_date"))
+            customer_ref = clean_text(record.get("customer"))
+            parts = [do_ref]
+            if date_ref:
+                parts.append(f"· {date_ref}")
+            if customer_ref:
+                parts.append(f"· {customer_ref}")
+            return " ".join(parts)
+
+        labels = {int(r["service_id"]): service_label(r) for r in records}
         selected_service_id = st.selectbox(
             "Select service entry",
             options,
-            format_func=lambda rid: labels.get(rid, f"#{rid}"),
+            format_func=lambda rid: labels.get(rid, str(rid)),
         )
         selected_record = next(r for r in records if int(r["service_id"]) == int(selected_service_id))
         new_remarks = st.text_area(
@@ -1468,6 +1515,7 @@ def services_page(conn):
 def maintenance_page(conn):
     st.subheader("🔧 Maintenance Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
+    customer_options, customer_labels, _, label_by_id = fetch_customer_choices(conn)
     do_df = df_query(
         conn,
         """
@@ -1488,9 +1536,15 @@ def maintenance_page(conn):
         cust_id = int(row["customer_id"]) if not pd.isna(row.get("customer_id")) else None
         summary = clean_text(row.get("description"))
         cust_name = customer_label_map.get(cust_id) if cust_id else clean_text(row.get("customer_name"))
-        label = do_num
+        label_parts = [do_num]
+        if cust_name:
+            label_parts.append(f"({cust_name})")
         if summary:
-            label = f"{do_num} – {summary[:40]}" + ("…" if len(summary) > 40 else "")
+            snippet = summary[:40]
+            if len(summary) > 40:
+                snippet += "…"
+            label_parts.append(f"– {snippet}")
+        label = " ".join(part for part in label_parts if part)
         do_options.append(do_num)
         do_labels[do_num] = label
         do_customer_map[do_num] = cust_id
@@ -1502,10 +1556,29 @@ def maintenance_page(conn):
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
-        st.text_input(
+        default_customer = do_customer_map.get(selected_do)
+        choices = list(customer_options)
+        if default_customer and default_customer not in choices:
+            choices.append(default_customer)
+            if default_customer not in customer_labels:
+                customer_labels[default_customer] = (
+                    customer_label_map.get(default_customer)
+                    or label_by_id.get(default_customer)
+                    or f"Customer #{default_customer}"
+                )
+        state_key = "maintenance_customer_link"
+        last_do_key = "maintenance_customer_last_do"
+        if st.session_state.get(last_do_key) != selected_do:
+            st.session_state[last_do_key] = selected_do
+            if default_customer in choices:
+                st.session_state[state_key] = default_customer
+            else:
+                st.session_state[state_key] = None
+        linked_customer = st.selectbox(
             "Customer",
-            value=do_customer_name_map.get(selected_do) or "(not linked)",
-            disabled=True,
+            options=choices,
+            format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+            key=state_key,
         )
         maintenance_date = st.date_input("Maintenance date", value=datetime.now().date())
         description = st.text_area("Maintenance description")
@@ -1522,7 +1595,7 @@ def maintenance_page(conn):
         if not selected_do:
             st.error("Delivery Order is required for maintenance records.")
         else:
-            selected_customer = do_customer_map.get(selected_do)
+            selected_customer = linked_customer if linked_customer else do_customer_map.get(selected_do)
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1536,6 +1609,11 @@ def maintenance_page(conn):
                 ),
             )
             maintenance_id = cur.lastrowid
+            if selected_customer:
+                conn.execute(
+                    "UPDATE delivery_orders SET customer_id=? WHERE do_number=?",
+                    (int(selected_customer), selected_do),
+                )
             saved_docs = attach_documents(
                 conn,
                 "maintenance_documents",
@@ -1595,14 +1673,22 @@ def maintenance_page(conn):
         records = maintenance_df.to_dict("records")
         st.markdown("#### Update remarks")
         options = [int(r["maintenance_id"]) for r in records]
-        labels = {
-            int(r["maintenance_id"]): f"#{int(r['maintenance_id'])} – {r.get('do_number')}"
-            for r in records
-        }
+        def maintenance_label(record):
+            do_ref = clean_text(record.get("do_number")) or "(no DO)"
+            date_ref = clean_text(record.get("maintenance_date"))
+            customer_ref = clean_text(record.get("customer"))
+            parts = [do_ref]
+            if date_ref:
+                parts.append(f"· {date_ref}")
+            if customer_ref:
+                parts.append(f"· {customer_ref}")
+            return " ".join(parts)
+
+        labels = {int(r["maintenance_id"]): maintenance_label(r) for r in records}
         selected_maintenance_id = st.selectbox(
             "Select maintenance entry",
             options,
-            format_func=lambda rid: labels.get(rid, f"#{rid}"),
+            format_func=lambda rid: labels.get(rid, str(rid)),
         )
         selected_record = next(r for r in records if int(r["maintenance_id"]) == int(selected_maintenance_id))
         new_remarks = st.text_area(
@@ -2112,7 +2198,7 @@ def scraps_page(conn):
         return ", ".join(missing)
 
     scraps = scraps.assign(missing=scraps.apply(missing_fields, axis=1))
-    display_cols = ["id", "name", "phone", "email", "address", "city", "missing", "created_at"]
+    display_cols = ["name", "phone", "email", "address", "city", "missing", "created_at"]
     st.dataframe(scraps[display_cols])
 
     st.markdown("### Update scrap record")
@@ -2123,7 +2209,10 @@ def scraps_page(conn):
         rid = int(r["id"])
         name_label = clean_text(r.get("name")) or "(no name)"
         missing_label = clean_text(r.get("missing")) or "—"
-        option_labels[rid] = f"#{rid} – {name_label} (missing: {missing_label})"
+        details = missing_label or "complete"
+        created = clean_text(r.get("created_at"))
+        created_fmt = f" – added {created}" if created else ""
+        option_labels[rid] = f"{name_label or '(no name)'} (missing: {details}){created_fmt}"
     selected_id = st.selectbox(
         "Choose a record to fix",
         option_keys,
@@ -2239,8 +2328,8 @@ def import_page(conn):
     cols = list(df.columns)
     opts = ["(blank)"] + cols
     col1, col2, col3 = st.columns(3)
-    col4, col5, col6 = st.columns(3)
-    col7, _, _ = st.columns(3)
+    col4, col5 = st.columns(2)
+    col6, _ = st.columns(2)
     sel_date = col1.selectbox(
         "Date", options=opts, index=(guess["date"] + 1) if guess.get("date") is not None else 0
     )
@@ -2256,10 +2345,7 @@ def import_page(conn):
     sel_prod = col5.selectbox(
         "Product", options=opts, index=(guess["product"] + 1) if guess.get("product") is not None else 0
     )
-    sel_price = col6.selectbox(
-        "Price", options=opts, index=(guess["price"] + 1) if guess.get("price") is not None else 0
-    )
-    sel_do = col7.selectbox(
+    sel_do = col6.selectbox(
         "Delivery order code", options=opts, index=(guess["do_code"] + 1) if guess.get("do_code") is not None else 0
     )
 
@@ -2273,7 +2359,6 @@ def import_page(conn):
             "address": pick(sel_addr),
             "phone": pick(sel_phone),
             "product": pick(sel_prod),
-            "price": pick(sel_price),
             "do_code": pick(sel_do),
         }
     )
@@ -2305,22 +2390,31 @@ def duplicates_page(conn):
     if not cust.empty:
         cust = cust.assign(duplicate=cust["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x)==1 else ""))
         st.markdown("**Customers (duplicate phone)**")
-        st.dataframe(cust[cust["dup_flag"]==1])
+        st.dataframe(
+            cust[cust["dup_flag"] == 1].drop(columns=["id", "dup_flag"], errors="ignore"),
+            use_container_width=True,
+        )
     if not prod.empty:
         prod = prod.assign(duplicate=prod["dup_flag"].apply(lambda x: "🔁 duplicate name+model" if int(x)==1 else ""))
         st.markdown("**Products (duplicate name+model)**")
-        st.dataframe(prod[prod["dup_flag"]==1])
+        st.dataframe(
+            prod[prod["dup_flag"] == 1].drop(columns=["id", "dup_flag"], errors="ignore"),
+            use_container_width=True,
+        )
     if not warr.empty:
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
         st.markdown("**Warranties (duplicate serial)**")
-        st.dataframe(warr[warr["dup_flag"]==1])
+        st.dataframe(
+            warr[warr["dup_flag"] == 1].drop(columns=["id", "dup_flag"], errors="ignore"),
+            use_container_width=True,
+        )
 
 def users_admin_page(conn):
     ensure_auth(role="admin")
     st.subheader("👤 Users (Admin)")
     users = df_query(conn, "SELECT user_id as id, username, role, created_at FROM users ORDER BY datetime(created_at) DESC")
     users = users.assign(created_at=pd.to_datetime(users["created_at"], errors="coerce").dt.strftime(DATE_FMT))
-    st.dataframe(users)
+    st.dataframe(users.drop(columns=["id"], errors="ignore"))
 
     with st.expander("Add user"):
         with st.form("add_user"):
@@ -2364,8 +2458,10 @@ def _import_clean6(conn, df, tag="Import"):
     if "date" in df.columns:
         df["date"] = coerce_excel_date(df["date"])
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    df = df.dropna(how="all").drop_duplicates().sort_values(by=["date", "customer_name", "phone"])\
-           .reset_index(drop=True)
+    sort_cols = [col for col in ["date", "customer_name", "phone", "do_code"] if col in df.columns]
+    if not sort_cols:
+        sort_cols = df.columns.tolist()
+    df = df.dropna(how="all").drop_duplicates().sort_values(by=sort_cols).reset_index(drop=True)
 
     cur = conn.cursor()
     seeded = 0
@@ -2374,7 +2470,7 @@ def _import_clean6(conn, df, tag="Import"):
         d = r.get("date", pd.NaT)
         cust = r.get("customer_name"); addr = r.get("address")
         phone = r.get("phone"); prod = r.get("product")
-        price = r.get("price")
+        raw_price = r.get("price") if "price" in df.columns else None
         do_code = r.get("do_code")
         if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
             continue
@@ -2382,10 +2478,14 @@ def _import_clean6(conn, df, tag="Import"):
         addr = str(addr) if pd.notna(addr) else None
         phone = str(phone) if pd.notna(phone) else None
         prod = str(prod) if pd.notna(prod) else None
-        try:
-            price = float(price) if pd.notna(price) else None
-        except Exception:
-            price = None
+        price = None
+        if raw_price is not None and (not pd.isna(raw_price)):
+            try:
+                text = str(raw_price).strip()
+                if text:
+                    price = float(text)
+            except Exception:
+                price = None
         # dup checks
         def exists_phone(phone):
             if not phone or str(phone).lower() == "nan":
