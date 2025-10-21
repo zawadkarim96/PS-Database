@@ -591,7 +591,6 @@ def generate_customer_summary_pdf(customer_name: str, info: dict, warranties: Op
     lines.extend(
         [
             f"Phone: {clean_text(info.get('phone')) or '-'}",
-            f"Email: {clean_text(info.get('email')) or '-'}",
             f"Address: {clean_text(info.get('address')) or '-'}",
             f"City: {clean_text(info.get('city')) or '-'}",
             "",
@@ -1008,16 +1007,16 @@ def customers_page(conn):
         with st.form("new_customer"):
             name = st.text_input("Name *")
             phone = st.text_input("Phone")
-            email = st.text_input("Email")
             address = st.text_area("Address")
             city = st.text_input("City")
+            do_code = st.text_input("Delivery order code")
+            do_pdf = st.file_uploader("Attach Delivery Order (PDF)", type=["pdf"])
             st.markdown("**Purchase / Warranty (optional)**")
             pur_date = st.date_input("Purchase/Issue date", value=datetime.now().date())
             prod_name = st.text_input("Product")
             prod_model = st.text_input("Model")
             prod_serial = st.text_input("Serial")
             unit = st.text_input("Unit (e.g., pcs, set)")
-            price = st.number_input("Unit price", min_value=0.0, value=0.0, step=0.01)
             submitted = st.form_submit_button("Save")
             if submitted and name.strip():
                 cur = conn.cursor()
@@ -1025,8 +1024,10 @@ def customers_page(conn):
                 if phone and phone.strip():
                     cur.execute("SELECT 1 FROM customers WHERE phone=? LIMIT 1", (phone.strip(),))
                     dupc = 1 if cur.fetchone() else 0
-                cur.execute("INSERT INTO customers (name, phone, email, address, city, dup_flag) VALUES (?, ?, ?, ?, ?, ?)",
-                            (name.strip(), phone, email, address, city, dupc))
+                cur.execute(
+                    "INSERT INTO customers (name, phone, address, city, dup_flag) VALUES (?, ?, ?, ?, ?)",
+                    (name.strip(), phone, address, city, dupc),
+                )
                 cid = cur.lastrowid
                 conn.commit()
                 # If a product name is provided, create product and warranty
@@ -1037,7 +1038,10 @@ def customers_page(conn):
                     if row:
                         pid = row[0]
                     else:
-                        cur.execute("INSERT INTO products (name, model, serial, unit_price) VALUES (?, ?, ?, ?)", (prod_name.strip(), prod_model.strip() or None, prod_serial.strip() or None, float(price) if price else None))
+                        cur.execute(
+                            "INSERT INTO products (name, model, serial, unit_price) VALUES (?, ?, ?, ?)",
+                            (prod_name.strip(), prod_model.strip() or None, prod_serial.strip() or None, None),
+                        )
                         pid = cur.lastrowid
                     # create warranty 1-year from purchase date
                     issue = pur_date.strftime("%Y-%m-%d")
@@ -1045,17 +1049,45 @@ def customers_page(conn):
                     cur.execute("INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status) VALUES (?, ?, ?, ?, ?, 'active')",
                                 (cid, pid, prod_serial.strip() or None, issue, expiry))
                     conn.commit()
+                do_serial = clean_text(do_code)
+                if do_serial:
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1 FROM delivery_orders WHERE do_number = ?", (do_serial,))
+                    if cur.fetchone():
+                        st.warning("Delivery order code already exists. Skipped linking.")
+                    else:
+                        stored_path = None
+                        if do_pdf is not None:
+                            safe_name = _sanitize_path_component(do_serial)
+                            saved = save_uploaded_file(do_pdf, DELIVERY_ORDER_DIR, filename=f"{safe_name}.pdf")
+                            if saved:
+                                try:
+                                    stored_path = str(saved.relative_to(BASE_DIR))
+                                except ValueError:
+                                    stored_path = str(saved)
+                        conn.execute(
+                            "INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path) VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                do_serial,
+                                cid,
+                                None,
+                                clean_text(prod_name) or None,
+                                None,
+                                stored_path,
+                            ),
+                        )
+                        conn.commit()
                 st.success("Customer saved")
 
     sort_dir = st.radio("Sort by created date", ["Newest first", "Oldest first"], horizontal=True)
     order = "DESC" if sort_dir == "Newest first" else "ASC"
-    q = st.text_input("Search (name/phone/email/city)")
+    q = st.text_input("Search (name/phone/city)")
     df = df_query(conn, f"""
-        SELECT customer_id as id, name, phone, email, address, city, created_at, dup_flag
+        SELECT customer_id as id, name, phone, address, city, created_at, dup_flag
         FROM customers
-        WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR email LIKE '%'||?||'%' OR city LIKE '%'||?||'%')
+        WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR city LIKE '%'||?||'%')
         ORDER BY datetime(created_at) {order}
-    """, (q,q,q,q,q))
+    """, (q, q, q, q))
     df = fmt_dates(df, ["created_at"])
     if "dup_flag" in df.columns:
         df = df.assign(duplicate=df["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x)==1 else ""))
@@ -1081,7 +1113,7 @@ def customers_page(conn):
 
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
-        SELECT customer_id as id, name, phone, email, city, created_at
+        SELECT customer_id as id, name, phone, city, created_at
         FROM customers
         ORDER BY datetime(created_at) DESC LIMIT 200
     """)
@@ -1796,7 +1828,6 @@ def customer_summary_page(conn):
         SELECT
             MAX(name) AS name,
             GROUP_CONCAT(DISTINCT phone) AS phone,
-            GROUP_CONCAT(DISTINCT email) AS email,
             GROUP_CONCAT(DISTINCT address) AS address,
             GROUP_CONCAT(DISTINCT city) AS city
         FROM customers
@@ -1807,7 +1838,6 @@ def customer_summary_page(conn):
 
     st.write("**Name:**", info.get("name") or blank_label)
     st.write("**Phone:**", info.get("phone"))
-    st.write("**Email:**", info.get("email"))
     st.write("**Address:**", info.get("address"))
     st.write("**City:**", info.get("city"))
     if cnt > 1:
@@ -2178,7 +2208,7 @@ def scraps_page(conn):
     scraps = df_query(
         conn,
         f"""
-        SELECT customer_id as id, name, phone, email, address, city, created_at
+        SELECT customer_id as id, name, phone, address, city, created_at
         FROM customers
         WHERE {customer_incomplete_clause()}
         ORDER BY datetime(created_at) DESC
@@ -2198,7 +2228,7 @@ def scraps_page(conn):
         return ", ".join(missing)
 
     scraps = scraps.assign(missing=scraps.apply(missing_fields, axis=1))
-    display_cols = ["name", "phone", "email", "address", "city", "missing", "created_at"]
+    display_cols = ["name", "phone", "address", "city", "missing", "created_at"]
     st.dataframe(scraps[display_cols])
 
     st.markdown("### Update scrap record")
@@ -2226,7 +2256,6 @@ def scraps_page(conn):
     with st.form("scrap_update_form"):
         name = st.text_input("Name", existing_value("name"))
         phone = st.text_input("Phone", existing_value("phone"))
-        email = st.text_input("Email", existing_value("email"))
         address = st.text_area("Address", existing_value("address"))
         city = st.text_input("City", existing_value("city"))
         col1, col2 = st.columns(2)
@@ -2236,13 +2265,12 @@ def scraps_page(conn):
     if save:
         new_name = clean_text(name)
         new_phone = clean_text(phone)
-        new_email = clean_text(email)
         new_address = clean_text(address)
         new_city = clean_text(city)
         old_phone = clean_text(selected.get("phone"))
         conn.execute(
-            "UPDATE customers SET name=?, phone=?, email=?, address=?, city=?, dup_flag=0 WHERE customer_id=?",
-            (new_name, new_phone, new_email, new_address, new_city, int(selected_id)),
+            "UPDATE customers SET name=?, phone=?, address=?, city=?, dup_flag=0 WHERE customer_id=?",
+            (new_name, new_phone, new_address, new_city, int(selected_id)),
         )
         if old_phone and old_phone != new_phone:
             recalc_customer_duplicate_flag(conn, old_phone)
@@ -2284,7 +2312,6 @@ HEADER_MAP = {
     "address": {"address", "addr", "street", "location"},
     "phone": {"phone", "mobile", "contact", "contact_no", "phone_no", "phone_number", "cell", "whatsapp"},
     "product": {"product", "item", "generator", "model", "description"},
-    "price": {"price", "amount", "unit_price", "rate", "value", "tk", "bdt"},
     "do_code": {"do_code", "delivery_order", "delivery_order_code", "delivery_order_no", "do", "d_o_code", "do_number"},
 }
 
@@ -2296,7 +2323,7 @@ def map_headers_guess(cols):
             if cn in aliases and mapping[target] is None:
                 mapping[target] = i
                 break
-    default_order = ["date", "customer_name", "address", "phone", "product", "price", "do_code"]
+    default_order = ["date", "customer_name", "address", "phone", "product", "do_code"]
     if cols_norm[: len(default_order)] == default_order:
         mapping = {field: idx for idx, field in enumerate(default_order)}
     return mapping
@@ -2381,9 +2408,9 @@ def import_page(conn):
 
 def duplicates_page(conn):
     st.subheader("⚠️ Possible Duplicates")
-    cust = df_query(conn, "SELECT customer_id as id, name, phone, email, city, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC")
+    cust = df_query(conn, "SELECT customer_id as id, name, phone, city, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC")
     cust = fmt_dates(cust, ["created_at"])
-    prod = df_query(conn, "SELECT product_id as id, name, model, serial, unit_price, dup_flag FROM products ORDER BY name ASC")
+    prod = df_query(conn, "SELECT product_id as id, name, model, serial, dup_flag FROM products ORDER BY name ASC")
     warr = df_query(conn, "SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.dup_flag FROM warranties w LEFT JOIN customers c ON c.customer_id = w.customer_id LEFT JOIN products p ON p.product_id = w.product_id ORDER BY date(w.issue_date) DESC")
     warr = fmt_dates(warr, ["issue_date","expiry_date"])
 
@@ -2470,7 +2497,6 @@ def _import_clean6(conn, df, tag="Import"):
         d = r.get("date", pd.NaT)
         cust = r.get("customer_name"); addr = r.get("address")
         phone = r.get("phone"); prod = r.get("product")
-        raw_price = r.get("price") if "price" in df.columns else None
         do_code = r.get("do_code")
         if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
             continue
@@ -2478,14 +2504,6 @@ def _import_clean6(conn, df, tag="Import"):
         addr = str(addr) if pd.notna(addr) else None
         phone = str(phone) if pd.notna(phone) else None
         prod = str(prod) if pd.notna(prod) else None
-        price = None
-        if raw_price is not None and (not pd.isna(raw_price)):
-            try:
-                text = str(raw_price).strip()
-                if text:
-                    price = float(text)
-            except Exception:
-                price = None
         # dup checks
         def exists_phone(phone):
             if not phone or str(phone).lower() == "nan":
@@ -2519,7 +2537,7 @@ def _import_clean6(conn, df, tag="Import"):
         dupp = 1 if exists_prod(name, model) else 0
         cur.execute(
             "INSERT INTO products (name, model, unit_price, dup_flag) VALUES (?, ?, ?, ?)",
-            (name, model, price, dupp),
+            (name, model, None, dupp),
         )
         pid = cur.lastrowid
         if dupp:
@@ -2540,7 +2558,7 @@ def _import_clean6(conn, df, tag="Import"):
         oid = cur.lastrowid
         cur.execute(
             "INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)",
-            (oid, pid, 1, price),
+            (oid, pid, 1, None),
         )
 
         base = d if pd.notna(d) else pd.Timestamp.now()
