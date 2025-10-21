@@ -10,12 +10,12 @@ def test_admin_user_seeded(db_conn, app_module):
 def test_customer_creation_and_duplicate_flag(db_conn, app_module):
     cur = db_conn.cursor()
     cur.execute(
-        "INSERT INTO customers (name, phone, email, address, city, dup_flag) VALUES (?, ?, ?, ?, ?, 0)",
-        ("Alice", "555-0000", "alice@example.com", "123 Road", "Dhaka"),
+        "INSERT INTO customers (name, phone, email, address, dup_flag) VALUES (?, ?, ?, ?, 0)",
+        ("Alice", "555-0000", "alice@example.com", "123 Road"),
     )
     cur.execute(
-        "INSERT INTO customers (name, phone, email, address, city, dup_flag) VALUES (?, ?, ?, ?, ?, 0)",
-        ("Bob", "555-0000", "bob@example.com", "456 Lane", "Dhaka"),
+        "INSERT INTO customers (name, phone, email, address, dup_flag) VALUES (?, ?, ?, ?, 0)",
+        ("Bob", "555-0000", "bob@example.com", "456 Lane"),
     )
     db_conn.commit()
 
@@ -33,8 +33,8 @@ def test_customer_creation_and_duplicate_flag(db_conn, app_module):
 def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
     cur = db_conn.cursor()
     cur.execute(
-        "INSERT INTO customers (name, phone, email, address, city, dup_flag) VALUES (?, ?, ?, ?, ?, 0)",
-        ("Scrappy", None, None, "", "Metropolis"),
+        "INSERT INTO customers (name, phone, email, address, dup_flag) VALUES (?, ?, ?, ?, 0)",
+        ("Scrappy", None, None, ""),
     )
     scrap_id = cur.lastrowid
     db_conn.commit()
@@ -48,8 +48,8 @@ def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
     new_phone = app_module.clean_text("777-8888")
     new_address = app_module.clean_text(" 42 Hero Lane ")
     db_conn.execute(
-        "UPDATE customers SET name=?, phone=?, address=?, city=?, dup_flag=0 WHERE customer_id=?",
-        (new_name, new_phone, new_address, "Metropolis", scrap_id),
+        "UPDATE customers SET name=?, phone=?, address=?, dup_flag=0 WHERE customer_id=?",
+        (new_name, new_phone, new_address, scrap_id),
     )
     app_module.recalc_customer_duplicate_flag(db_conn, new_phone)
     db_conn.commit()
