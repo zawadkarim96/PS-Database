@@ -10,6 +10,9 @@
 ## Run Without Touching the Command Line
 These launchers create a dedicated virtual environment, install dependencies from `requirements.txt`, and then open the Streamlit app in your browser. You only need Python 3.9+ installed.
 
+### Any Platform (single command or double-click)
+Run `python run_app.py` from the repository root, or double-click the file in your file explorer. The script prepares the environment and launches the app using your default browser.
+
 ### Windows
 1. Double-click `run_app.bat`.
 2. Wait for the first run to finish creating the virtual environment and installing dependencies. A browser tab will open automatically.

@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Convenience launcher for the PS Mini CRM Streamlit app.
+
+Running this script will create (or reuse) a local virtual environment in
+```.venv``` next to the repository, install the dependencies declared in
+``requirements.txt``, and finally launch the Streamlit app.  It is intended to
+provide a one-click/one-command way to get to the login page without touching
+pip manually.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent
+VENV_DIR = ROOT_DIR / ".venv"
+REQUIREMENTS = ROOT_DIR / "requirements.txt"
+APP_FILE = ROOT_DIR / "app.py"
+
+
+class LauncherError(RuntimeError):
+    """Raised when a critical step in the launch process fails."""
+
+
+def run_command(command: list[str], *, cwd: Path | None = None) -> None:
+    """Execute a subprocess command, raising LauncherError on failure."""
+
+    try:
+        subprocess.check_call(command, cwd=str(cwd) if cwd else None)
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - defensive
+        raise LauncherError(f"Command failed with exit code {exc.returncode}: {command}") from exc
+
+
+def ensure_virtual_environment() -> Path:
+    """Create the project's dedicated virtual environment if missing."""
+
+    if not VENV_DIR.exists():
+        print("Creating Python virtual environment in .venv ...")
+        run_command([sys.executable, "-m", "venv", str(VENV_DIR)])
+
+    if os.name == "nt":
+        python_path = VENV_DIR / "Scripts" / "python.exe"
+    else:
+        python_path = VENV_DIR / "bin" / "python"
+
+    if not python_path.exists():  # pragma: no cover - should never happen
+        raise LauncherError("The virtual environment was created but the Python binary is missing.")
+
+    return python_path
+
+
+def install_dependencies(venv_python: Path) -> None:
+    """Install or update required dependencies inside the virtual environment."""
+
+    pip_base = [str(venv_python), "-m", "pip", "--disable-pip-version-check"]
+    print("Ensuring pip is up to date ...")
+    run_command(pip_base + ["install", "--upgrade", "pip"])
+
+    print("Installing project requirements ...")
+    run_command(pip_base + ["install", "-r", str(REQUIREMENTS)])
+
+
+def launch_streamlit(venv_python: Path) -> None:
+    """Launch the Streamlit application using the virtual environment's Python."""
+
+    print("Starting the PS Mini CRM app ...")
+    command = [str(venv_python), "-m", "streamlit", "run", str(APP_FILE)]
+    run_command(command, cwd=ROOT_DIR)
+
+
+def main() -> None:
+    try:
+        venv_python = ensure_virtual_environment()
+        install_dependencies(venv_python)
+        launch_streamlit(venv_python)
+    except LauncherError as exc:
+        print(f"\nERROR: {exc}\n")
+        print("Please ensure Python 3.9+ is installed and try again.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
