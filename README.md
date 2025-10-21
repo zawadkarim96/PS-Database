@@ -23,6 +23,22 @@ Run `python run_app.py` from the repository root, or double-click the file in yo
 2. Double-click `run_app.sh` in your file manager **or** run `./run_app.sh` from a terminal.
 3. The script prepares the environment and opens the app in your default browser.
 
+## Build a One-Click Desktop App for Your Team
+If your staff does not have Python installed, you can package the project into a standalone application and distribute it like a regular program.
+
+1. On a machine with Python 3.9+ installed, open a terminal in the repository root.
+2. Run `python build_executable.py`. The script creates a temporary virtual environment, installs PyInstaller, and produces a bundle inside `dist/ps_mini_crm/`.
+3. Share the contents of `dist/ps_mini_crm/` with your staff. Windows users can double-click `ps_mini_crm.exe`; macOS and Linux users can run the executable from Finder/File Explorer or the terminal.
+
+### Where user data lives
+When launched from the packaged app, databases, uploads, and the Excel import template are stored in a writable folder per operating system:
+
+- **Windows:** `%APPDATA%\ps-mini-crm`
+- **macOS:** `~/Library/Application Support/ps-mini-crm`
+- **Linux:** `${XDG_DATA_HOME:-~/.local/share}/ps-mini-crm`
+
+Staff can back up or migrate the application by copying that folder. Deleting it resets the app to a clean state the next time the executable is opened.
+
 ## Troubleshooting
 - If Python is not installed or not on your `PATH`, install it from [python.org](https://www.python.org/downloads/) (Windows) or via your package manager (macOS/Linux).
 - To reset everything, delete the `.venv` folder and rerun the launcher to recreate a clean environment.

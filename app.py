@@ -16,7 +16,9 @@ import streamlit as st
 
 # ---------- Config ----------
 load_dotenv()
-BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.getenv("APP_STORAGE_DIR", DEFAULT_BASE_DIR))
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
 DATE_FMT = "%d-%m-%Y"
 
