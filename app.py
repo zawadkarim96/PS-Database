@@ -454,6 +454,117 @@ def dedupe_join(values: Iterable[Optional[str]]) -> str:
     return ", ".join(seen)
 
 
+def merge_customer_records(conn, customer_ids) -> bool:
+    ids = []
+    for cid in customer_ids:
+        cid_int = int_or_none(cid)
+        if cid_int is not None and cid_int not in ids:
+            ids.append(cid_int)
+    if len(ids) < 2:
+        return False
+
+    placeholders = ",".join(["?"] * len(ids))
+    query = dedent(
+        f"""
+        SELECT customer_id, name, phone, address, purchase_date, product_info, delivery_order_code, created_at
+        FROM customers
+        WHERE customer_id IN ({placeholders})
+        """
+    )
+    df = df_query(conn, query, params=tuple(ids))
+    if df.empty:
+        return False
+
+    df["created_at_dt"] = pd.to_datetime(df.get("created_at"), errors="coerce")
+    df.sort_values(by=["created_at_dt", "customer_id"], inplace=True, na_position="last")
+    base_row = df.iloc[0]
+    base_id = int(base_row.get("customer_id"))
+    other_ids = []
+    for row in df.get("customer_id", pd.Series(dtype=object)).tolist():
+        rid = int_or_none(row)
+        if rid is not None and rid != base_id and rid not in other_ids:
+            other_ids.append(rid)
+    if not other_ids:
+        return False
+
+    name_values = [clean_text(v) for v in df.get("name", pd.Series(dtype=object)).tolist()]
+    name_values = [v for v in name_values if v]
+    address_values = [clean_text(v) for v in df.get("address", pd.Series(dtype=object)).tolist()]
+    address_values = [v for v in address_values if v]
+    phone_values = [clean_text(v) for v in df.get("phone", pd.Series(dtype=object)).tolist()]
+    phone_values = [v for v in phone_values if v]
+
+    base_name = clean_text(base_row.get("name")) or (name_values[0] if name_values else None)
+    base_address = clean_text(base_row.get("address")) or (address_values[0] if address_values else None)
+    base_phone = clean_text(base_row.get("phone")) or (phone_values[0] if phone_values else None)
+
+    do_codes = []
+    product_lines = []
+    fallback_products = []
+    purchase_dates = []
+
+    for record in df.to_dict("records"):
+        date_raw = clean_text(record.get("purchase_date"))
+        product_raw = clean_text(record.get("product_info"))
+        do_raw = clean_text(record.get("delivery_order_code"))
+        if do_raw:
+            do_codes.append(do_raw)
+        if product_raw:
+            fallback_products.append(product_raw)
+        dt = parse_date_value(record.get("purchase_date"))
+        if dt is not None:
+            purchase_dates.append(dt)
+            date_label = dt.strftime(DATE_FMT)
+        else:
+            date_label = date_raw
+        if date_label and product_raw:
+            product_lines.append(f"{date_label} – {product_raw}")
+        elif product_raw:
+            product_lines.append(product_raw)
+        elif date_label:
+            product_lines.append(date_label)
+
+    earliest_purchase = min(purchase_dates).strftime("%Y-%m-%d") if purchase_dates else None
+    combined_products = dedupe_join(product_lines or fallback_products)
+    combined_do_codes = dedupe_join(do_codes)
+
+    conn.execute(
+        """
+        UPDATE customers
+        SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0
+        WHERE customer_id=?
+        """,
+        (
+            base_name,
+            base_phone,
+            base_address,
+            earliest_purchase,
+            clean_text(combined_products),
+            clean_text(combined_do_codes),
+            base_id,
+        ),
+    )
+
+    related_tables = (
+        "orders",
+        "warranties",
+        "delivery_orders",
+        "services",
+        "maintenance_records",
+        "needs",
+    )
+    for cid in other_ids:
+        for table in related_tables:
+            conn.execute(f"UPDATE {table} SET customer_id=? WHERE customer_id=?", (base_id, cid))
+        conn.execute("UPDATE import_history SET customer_id=? WHERE customer_id=?", (base_id, cid))
+        conn.execute("DELETE FROM customers WHERE customer_id=?", (cid,))
+
+    if base_phone:
+        recalc_customer_duplicate_flag(conn, base_phone)
+    conn.commit()
+    return True
+
+
 def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -2931,6 +3042,25 @@ def duplicates_page(conn):
                     }
                 )
                 st.dataframe(preview, use_container_width=True)
+
+                merge_ids = [int_or_none(v) for v in group.get("id", pd.Series(dtype=object)).tolist()]
+                merge_ids = [v for v in merge_ids if v is not None]
+                name_set = {clean_text(v) for v in group.get("name", pd.Series(dtype=object)).tolist() if clean_text(v)}
+                address_set = {clean_text(v) for v in group.get("address", pd.Series(dtype=object)).tolist() if clean_text(v)}
+                can_merge = len(merge_ids) > 1 and len(name_set) <= 1 and len(address_set) <= 1
+                if can_merge:
+                    merge_key = "merge_" + "_".join(str(v) for v in merge_ids)
+                    if st.button(
+                        "Merge records for this customer (combine purchases)",
+                        key=merge_key,
+                    ):
+                        if merge_customer_records(conn, merge_ids):
+                            st.success("Merged duplicate customer entries into a single record.")
+                            _safe_rerun()
+                        else:
+                            st.error("Could not merge these records. Please review and try again.")
+                elif len(merge_ids) > 1:
+                    st.caption("Name or address differs – review entries before merging or deleting.")
 
                 for _, record in group.iterrows():
                     cid = int(record.get("id"))
