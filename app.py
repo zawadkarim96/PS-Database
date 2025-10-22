@@ -1101,10 +1101,33 @@ def _bootstrap_streamlit_app() -> None:
 def recalc_customer_duplicate_flag(conn, phone):
     if not phone or str(phone).strip() == "":
         return
-    cur = conn.execute("SELECT customer_id FROM customers WHERE phone = ?", (str(phone).strip(),))
-    ids = [int(row[0]) for row in cur.fetchall()]
-    dup = 1 if len(ids) > 1 else 0
-    conn.executemany("UPDATE customers SET dup_flag=? WHERE customer_id=?", [(dup, cid) for cid in ids])
+    cur = conn.execute(
+        "SELECT customer_id, purchase_date FROM customers WHERE phone = ?",
+        (str(phone).strip(),),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return
+
+    grouped: dict[Optional[str], list[int]] = {}
+    for cid, purchase_date in rows:
+        try:
+            cid_int = int(cid)
+        except (TypeError, ValueError):
+            continue
+        key = clean_text(purchase_date) or None
+        grouped.setdefault(key, []).append(cid_int)
+
+    updates: list[tuple[int, int]] = []
+    for cid_list in grouped.values():
+        dup_flag = 1 if len(cid_list) > 1 else 0
+        updates.extend((dup_flag, cid) for cid in cid_list)
+
+    if updates:
+        conn.executemany(
+            "UPDATE customers SET dup_flag=? WHERE customer_id=?",
+            updates,
+        )
 
 
 def init_ui():
@@ -1462,10 +1485,6 @@ def customers_page(conn):
             submitted = st.form_submit_button("Save")
             if submitted and name.strip():
                 cur = conn.cursor()
-                dupc = 0
-                if phone and phone.strip():
-                    cur.execute("SELECT 1 FROM customers WHERE phone=? LIMIT 1", (phone.strip(),))
-                    dupc = 1 if cur.fetchone() else 0
                 name_val = clean_text(name)
                 phone_val = clean_text(phone)
                 address_val = clean_text(address)
@@ -1475,7 +1494,7 @@ def customers_page(conn):
                 purchase_str = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
                 do_serial = clean_text(do_code)
                 cur.execute(
-                    "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag) VALUES (?, ?, ?, ?, ?, ?, 0)",
                     (
                         name_val,
                         phone_val,
@@ -1483,14 +1502,11 @@ def customers_page(conn):
                         purchase_str,
                         product_label,
                         do_serial,
-                        dupc,
                     ),
                 )
                 cid = cur.lastrowid
                 conn.commit()
-                # If a product name is provided, create product and warranty
                 if product_name.strip():
-                    # check for existing product by name+model
                     cur.execute(
                         "SELECT product_id FROM products WHERE name=? AND IFNULL(model,'')=IFNULL(?, '') LIMIT 1",
                         (clean_text(product_name), clean_text(product_model)),
@@ -1508,7 +1524,6 @@ def customers_page(conn):
                             ),
                         )
                         pid = cur.lastrowid
-                    # create warranty 1-year from purchase date
                     issue = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
                     expiry = (
                         (purchase_date + timedelta(days=365)).strftime("%Y-%m-%d")
@@ -1564,196 +1579,321 @@ def customers_page(conn):
                     conn.commit()
                 st.success("Customer saved")
                 _safe_rerun()
-
     sort_dir = st.radio("Sort by created date", ["Newest first", "Oldest first"], horizontal=True)
     order = "DESC" if sort_dir == "Newest first" else "ASC"
     q = st.text_input("Search (name/phone/address/product/DO)")
-    df = df_query(conn, f"""
+    df_raw = df_query(conn, f"""
         SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, attachment_path, created_at, dup_flag
         FROM customers
         WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR address LIKE '%'||?||'%' OR product_info LIKE '%'||?||'%' OR delivery_order_code LIKE '%'||?||'%')
         ORDER BY datetime(created_at) {order}
     """, (q, q, q, q, q, q))
-    df = fmt_dates(df, ["created_at", "purchase_date"])
-    if "dup_flag" in df.columns:
-        df = df.assign(duplicate=df["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x)==1 else ""))
-    if not df.empty:
-        df = df.assign(
-            scrap=df.apply(
-                lambda row: "🗂 scrap"
-                if any(
-                    clean_text(row.get(col)) is None
-                    for col in REQUIRED_CUSTOMER_FIELDS
-                    if col in row
-                )
-                else "",
-                axis=1,
-            )
-        )
-    display_df = df.drop(columns=["id", "dup_flag", "attachment_path"], errors="ignore")
-    display_df = display_df.rename(
-        columns={
-            "name": "Name",
-            "phone": "Phone",
-            "address": "Address",
-            "purchase_date": "Purchase date",
-            "product_info": "Product",
-            "delivery_order_code": "DO code",
-            "duplicate": "Duplicate",
-            "scrap": "Scrap",
-            "created_at": "Created",
-        }
-    )
-    st.dataframe(display_df)
-    if not df.empty and 'dup_flag' in df.columns:
-        st.info("🔁 = duplicate phone detected")
-    if not df.empty:
-        st.caption("🗂 scrap = missing mandatory details. Fix these from the Scraps page.")
-
-    st.markdown("### Edit customer details")
-    if df.empty:
-        st.info("No customers to edit yet.")
+    user = st.session_state.user or {}
+    is_admin = user.get("role") == "admin"
+    st.markdown("### Quick edit or delete")
+    if df_raw.empty:
+        st.info("No customers found for the current filters.")
     else:
-        records = df.to_dict("records")
-        option_ids = [int(row["id"]) for row in records]
-        labels = {}
-        for row in records:
-            cid = int(row["id"])
-            label_name = clean_text(row.get("name")) or "(no name)"
-            label_phone = clean_text(row.get("phone")) or "-"
-            labels[cid] = f"{label_name} – {label_phone}"
-        selected_customer_id = st.selectbox(
-            "Select customer", option_ids, format_func=lambda cid: labels.get(int(cid), str(cid))
-        )
-        selected_row = next(r for r in records if int(r["id"]) == int(selected_customer_id))
-        attachment_path = selected_row.get("attachment_path")
-        resolved_attachment = resolve_upload_path(attachment_path)
-        if resolved_attachment and resolved_attachment.exists():
-            st.download_button(
-                "Download current PDF",
-                data=resolved_attachment.read_bytes(),
-                file_name=resolved_attachment.name,
-                key=f"cust_pdf_dl_{selected_customer_id}",
-            )
+        original_map: dict[int, dict] = {}
+        for record in df_raw.to_dict("records"):
+            cid = int_or_none(record.get("id"))
+            if cid is not None:
+                original_map[cid] = record
+        editor_df = df_raw.copy()
+        editor_df["purchase_date"] = pd.to_datetime(editor_df["purchase_date"], errors="coerce")
+        editor_df["created_at"] = pd.to_datetime(editor_df["created_at"], errors="coerce")
+        if "dup_flag" in editor_df.columns:
+            editor_df["duplicate"] = editor_df["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int_or_none(x) == 1 else "")
         else:
-            st.caption("No customer PDF attached yet.")
-
-        user = st.session_state.user or {}
-        is_admin = user.get("role") == "admin"
-
-        with st.form(f"edit_customer_{selected_customer_id}"):
-            name_edit = st.text_input("Name", value=clean_text(selected_row.get("name")) or "")
-            phone_edit = st.text_input("Phone", value=clean_text(selected_row.get("phone")) or "")
-            address_edit = st.text_area("Address", value=clean_text(selected_row.get("address")) or "")
-            purchase_edit = st.text_input(
-                "Purchase date (DD-MM-YYYY)", value=clean_text(selected_row.get("purchase_date")) or ""
+            editor_df["duplicate"] = ""
+        editor_df["Action"] = "Keep"
+        column_order = [
+            col
+            for col in [
+                "id",
+                "name",
+                "phone",
+                "address",
+                "purchase_date",
+                "product_info",
+                "delivery_order_code",
+                "duplicate",
+                "created_at",
+                "Action",
+            ]
+            if col in editor_df.columns
+        ]
+        editor_df = editor_df[column_order]
+        editor_state = st.data_editor(
+            editor_df,
+            hide_index=True,
+            num_rows="fixed",
+            use_container_width=True,
+            column_config={
+                "id": st.column_config.Column("ID", disabled=True),
+                "name": st.column_config.TextColumn("Name"),
+                "phone": st.column_config.TextColumn("Phone"),
+                "address": st.column_config.TextColumn("Address"),
+                "purchase_date": st.column_config.DateColumn("Purchase date", format="DD-MM-YYYY", required=False),
+                "product_info": st.column_config.TextColumn("Product"),
+                "delivery_order_code": st.column_config.TextColumn("DO code"),
+                "duplicate": st.column_config.Column("Duplicate", disabled=True),
+                "created_at": st.column_config.DatetimeColumn("Created", format="DD-MM-YYYY HH:mm", disabled=True),
+                "Action": st.column_config.SelectboxColumn("Action", options=["Keep", "Delete"], required=True),
+            },
+        )
+        if not is_admin:
+            st.caption("Set Action to “Delete” requires admin access; non-admin changes will be ignored.")
+        if st.button("Apply table updates", type="primary"):
+            editor_result = editor_state if isinstance(editor_state, pd.DataFrame) else pd.DataFrame(editor_state)
+            if editor_result.empty:
+                st.info("No rows to update.")
+            else:
+                phones_to_recalc: set[str] = set()
+                updates = deletes = 0
+                errors: list[str] = []
+                made_updates = False
+                for row in editor_result.to_dict("records"):
+                    cid = int_or_none(row.get("id"))
+                    if cid is None or cid not in original_map:
+                        continue
+                    action = str(row.get("Action") or "Keep").strip().lower()
+                    if action == "delete":
+                        if is_admin:
+                            delete_customer_record(conn, cid)
+                            deletes += 1
+                        else:
+                            errors.append(f"Only admins can delete customers (ID #{cid}).")
+                        continue
+                    new_name = clean_text(row.get("name"))
+                    new_phone = clean_text(row.get("phone"))
+                    new_address = clean_text(row.get("address"))
+                    purchase_str, _ = date_strings_from_input(row.get("purchase_date"))
+                    product_label = clean_text(row.get("product_info"))
+                    new_do = clean_text(row.get("delivery_order_code"))
+                    original_row = original_map[cid]
+                    old_name = clean_text(original_row.get("name"))
+                    old_phone = clean_text(original_row.get("phone"))
+                    old_address = clean_text(original_row.get("address"))
+                    old_purchase = clean_text(original_row.get("purchase_date"))
+                    old_product = clean_text(original_row.get("product_info"))
+                    old_do = clean_text(original_row.get("delivery_order_code"))
+                    if (
+                        new_name == old_name
+                        and new_phone == old_phone
+                        and new_address == old_address
+                        and purchase_str == old_purchase
+                        and product_label == old_product
+                        and new_do == old_do
+                    ):
+                        continue
+                    conn.execute(
+                        "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
+                        (
+                            new_name,
+                            new_phone,
+                            new_address,
+                            purchase_str,
+                            product_label,
+                            new_do,
+                            cid,
+                        ),
+                    )
+                    if new_do:
+                        conn.execute(
+                            """
+                            INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(do_number) DO UPDATE SET
+                                customer_id=excluded.customer_id,
+                                description=excluded.description
+                            """,
+                            (
+                                new_do,
+                                cid,
+                                None,
+                                product_label,
+                                None,
+                                None,
+                            ),
+                        )
+                    if old_do and old_do != new_do:
+                        conn.execute(
+                            "DELETE FROM delivery_orders WHERE do_number=? AND (customer_id IS NULL OR customer_id=?)",
+                            (old_do, cid),
+                        )
+                    conn.execute(
+                        "UPDATE import_history SET customer_name=?, phone=?, address=?, product_label=?, do_number=?, original_date=? WHERE customer_id=? AND deleted_at IS NULL",
+                        (
+                            new_name,
+                            new_phone,
+                            new_address,
+                            product_label,
+                            new_do,
+                            purchase_str,
+                            cid,
+                        ),
+                    )
+                    if old_phone and old_phone != new_phone:
+                        phones_to_recalc.add(old_phone)
+                    if new_phone:
+                        phones_to_recalc.add(new_phone)
+                    updates += 1
+                    made_updates = True
+                if made_updates:
+                    conn.commit()
+                if phones_to_recalc:
+                    for phone_value in phones_to_recalc:
+                        recalc_customer_duplicate_flag(conn, phone_value)
+                    conn.commit()
+                if errors:
+                    for err in errors:
+                        st.error(err)
+                if updates or deletes:
+                    st.success(f"Updated {updates} row(s) and deleted {deletes} row(s).")
+                    if not errors:
+                        _safe_rerun()
+                elif not errors:
+                    st.info("No changes detected.")
+    st.markdown("### Detailed editor & attachments")
+    with st.expander("Open detailed editor", expanded=False):
+        df_form = fmt_dates(df_raw.copy(), ["created_at", "purchase_date"])
+        if df_form.empty:
+            st.info("No customers to edit yet.")
+        else:
+            records_fmt = df_form.to_dict("records")
+            raw_map = {int(row["id"]): row for row in df_raw.to_dict("records") if int_or_none(row.get("id")) is not None}
+            option_ids = [int(row["id"]) for row in records_fmt]
+            labels = {}
+            for row in records_fmt:
+                cid = int(row["id"])
+                label_name = clean_text(row.get("name")) or "(no name)"
+                label_phone = clean_text(row.get("phone")) or "-"
+                labels[cid] = f"{label_name} – {label_phone}"
+            selected_customer_id = st.selectbox(
+                "Select customer",
+                option_ids,
+                format_func=lambda cid: labels.get(int(cid), str(cid)),
             )
-            product_edit = st.text_input("Product", value=clean_text(selected_row.get("product_info")) or "")
-            do_edit = st.text_input(
-                "Delivery order code", value=clean_text(selected_row.get("delivery_order_code")) or ""
-            )
-            new_pdf = st.file_uploader(
-                "Attach/replace customer PDF", type=["pdf"], key=f"edit_customer_pdf_{selected_customer_id}"
-            )
-            col1, col2 = st.columns(2)
-            save_customer = col1.form_submit_button("Save changes", type="primary")
-            delete_customer = col2.form_submit_button("Delete customer", disabled=not is_admin)
-
-        if save_customer:
-            old_phone = clean_text(selected_row.get("phone"))
-            new_name = clean_text(name_edit)
-            new_phone = clean_text(phone_edit)
-            new_address = clean_text(address_edit)
-            purchase_str, _ = date_strings_from_input(purchase_edit)
-            product_label = clean_text(product_edit)
-            new_do = clean_text(do_edit)
-            old_do = clean_text(selected_row.get("delivery_order_code"))
-            new_attachment_path = attachment_path
-            if new_pdf is not None:
-                saved = save_uploaded_file(new_pdf, CUSTOMER_DOCS_DIR, filename=f"customer_{selected_customer_id}.pdf")
-                if saved:
-                    try:
-                        stored_path = str(saved.relative_to(BASE_DIR))
-                    except ValueError:
-                        stored_path = str(saved)
-                    new_attachment_path = stored_path
-                    if attachment_path:
-                        old_path = resolve_upload_path(attachment_path)
-                        if old_path and old_path.exists() and old_path != saved:
-                            try:
-                                old_path.unlink()
-                            except Exception:
-                                pass
-
-            conn.execute(
-                "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, attachment_path=?, dup_flag=0 WHERE customer_id=?",
-                (
-                    new_name,
-                    new_phone,
-                    new_address,
-                    purchase_str,
-                    product_label,
-                    new_do,
-                    new_attachment_path,
-                    int(selected_customer_id),
-                ),
-            )
-
-            if new_do:
+            selected_raw = raw_map[int(selected_customer_id)]
+            selected_fmt = next(r for r in records_fmt if int(r["id"]) == int(selected_customer_id))
+            attachment_path = selected_raw.get("attachment_path")
+            resolved_attachment = resolve_upload_path(attachment_path)
+            if resolved_attachment and resolved_attachment.exists():
+                st.download_button(
+                    "Download current PDF",
+                    data=resolved_attachment.read_bytes(),
+                    file_name=resolved_attachment.name,
+                    key=f"cust_pdf_dl_{selected_customer_id}",
+                )
+            else:
+                st.caption("No customer PDF attached yet.")
+            is_admin = user.get("role") == "admin"
+            with st.form(f"edit_customer_{selected_customer_id}"):
+                name_edit = st.text_input("Name", value=clean_text(selected_raw.get("name")) or "")
+                phone_edit = st.text_input("Phone", value=clean_text(selected_raw.get("phone")) or "")
+                address_edit = st.text_area("Address", value=clean_text(selected_raw.get("address")) or "")
+                purchase_edit = st.text_input(
+                    "Purchase date (DD-MM-YYYY)", value=clean_text(selected_fmt.get("purchase_date")) or ""
+                )
+                product_edit = st.text_input("Product", value=clean_text(selected_raw.get("product_info")) or "")
+                do_edit = st.text_input(
+                    "Delivery order code", value=clean_text(selected_raw.get("delivery_order_code")) or ""
+                )
+                new_pdf = st.file_uploader(
+                    "Attach/replace customer PDF", type=["pdf"], key=f"edit_customer_pdf_{selected_customer_id}"
+                )
+                col1, col2 = st.columns(2)
+                save_customer = col1.form_submit_button("Save changes", type="primary")
+                delete_customer = col2.form_submit_button("Delete customer", disabled=not is_admin)
+            if save_customer:
+                old_phone = clean_text(selected_raw.get("phone"))
+                new_name = clean_text(name_edit)
+                new_phone = clean_text(phone_edit)
+                new_address = clean_text(address_edit)
+                purchase_str, _ = date_strings_from_input(purchase_edit)
+                product_label = clean_text(product_edit)
+                new_do = clean_text(do_edit)
+                old_do = clean_text(selected_raw.get("delivery_order_code"))
+                new_attachment_path = attachment_path
+                if new_pdf is not None:
+                    saved = save_uploaded_file(new_pdf, CUSTOMER_DOCS_DIR, filename=f"customer_{selected_customer_id}.pdf")
+                    if saved:
+                        try:
+                            stored_path = str(saved.relative_to(BASE_DIR))
+                        except ValueError:
+                            stored_path = str(saved)
+                        new_attachment_path = stored_path
+                        if attachment_path:
+                            old_path = resolve_upload_path(attachment_path)
+                            if old_path and old_path.exists() and old_path != saved:
+                                try:
+                                    old_path.unlink()
+                                except Exception:
+                                    pass
                 conn.execute(
-                    """
-                    INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(do_number) DO UPDATE SET
-                        customer_id=excluded.customer_id,
-                        description=excluded.description
-                    """,
+                    "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, attachment_path=?, dup_flag=0 WHERE customer_id=?",
                     (
-                        new_do,
-                        int(selected_customer_id),
-                        None,
+                        new_name,
+                        new_phone,
+                        new_address,
+                        purchase_str,
                         product_label,
-                        None,
-                        None,
+                        new_do,
+                        new_attachment_path,
+                        int(selected_customer_id),
                     ),
                 )
-            if old_do and old_do != new_do:
+                if new_do:
+                    conn.execute(
+                        """
+                        INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(do_number) DO UPDATE SET
+                            customer_id=excluded.customer_id,
+                            description=excluded.description
+                        """,
+                        (
+                            new_do,
+                            int(selected_customer_id),
+                            None,
+                            product_label,
+                            None,
+                            None,
+                        ),
+                    )
+                if old_do and old_do != new_do:
+                    conn.execute(
+                        "DELETE FROM delivery_orders WHERE do_number=? AND (customer_id IS NULL OR customer_id=?)",
+                        (old_do, int(selected_customer_id)),
+                    )
                 conn.execute(
-                    "DELETE FROM delivery_orders WHERE do_number=? AND (customer_id IS NULL OR customer_id=?)",
-                    (old_do, int(selected_customer_id)),
+                    "UPDATE import_history SET customer_name=?, phone=?, address=?, product_label=?, do_number=?, original_date=? WHERE customer_id=? AND deleted_at IS NULL",
+                    (
+                        new_name,
+                        new_phone,
+                        new_address,
+                        product_label,
+                        new_do,
+                        purchase_str,
+                        int(selected_customer_id),
+                    ),
                 )
-
-            conn.execute(
-                "UPDATE import_history SET customer_name=?, phone=?, address=?, product_label=?, do_number=?, original_date=? WHERE customer_id=? AND deleted_at IS NULL",
-                (
-                    new_name,
-                    new_phone,
-                    new_address,
-                    product_label,
-                    new_do,
-                    purchase_str,
-                    int(selected_customer_id),
-                ),
-            )
-
-            conn.commit()
-
-            if old_phone and old_phone != new_phone:
-                recalc_customer_duplicate_flag(conn, old_phone)
-            if new_phone:
-                recalc_customer_duplicate_flag(conn, new_phone)
-            conn.commit()
-            st.success("Customer updated.")
-            _safe_rerun()
-
-        if delete_customer:
-            if is_admin:
-                delete_customer_record(conn, int(selected_customer_id))
-                st.warning("Customer deleted.")
+                conn.commit()
+                if old_phone and old_phone != new_phone:
+                    recalc_customer_duplicate_flag(conn, old_phone)
+                if new_phone:
+                    recalc_customer_duplicate_flag(conn, new_phone)
+                conn.commit()
+                st.success("Customer updated.")
                 _safe_rerun()
-            else:
-                st.error("Only admins can delete customers.")
-
+            if delete_customer:
+                if is_admin:
+                    delete_customer_record(conn, int(selected_customer_id))
+                    st.warning("Customer deleted.")
+                    _safe_rerun()
+                else:
+                    st.error("Only admins can delete customers.")
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
         SELECT customer_id as id, name, phone, purchase_date, product_info, delivery_order_code, created_at
@@ -1762,60 +1902,6 @@ def customers_page(conn):
     """)
     recent_df = fmt_dates(recent_df, ["created_at", "purchase_date"])
     st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
-
-    if st.session_state.user and st.session_state.user.get("role") == "admin":
-        st.markdown("---")
-        st.markdown("**Delete Customers**")
-        all_cust = df_query(
-            conn,
-            f"SELECT customer_id, name FROM customers WHERE {customer_complete_clause()} ORDER BY name ASC",
-        )
-        if all_cust.empty:
-            st.info("No customers to delete.")
-        else:
-            ids = all_cust["customer_id"].astype(int).tolist()
-            name_map = {int(i): str(n) for i, n in zip(all_cust["customer_id"].astype(int), all_cust["name"].fillna("").astype(str))}
-
-            if "del_customers" not in st.session_state:
-                st.session_state.del_customers = []
-            else:
-                normalized_selection = []
-                for value in st.session_state.get("del_customers", []):
-                    try:
-                        value_int = int(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if value_int in ids:
-                        normalized_selection.append(value_int)
-                if normalized_selection != st.session_state.get("del_customers", []):
-                    st.session_state.del_customers = normalized_selection
-
-            def _toggle_delete_all(id_list: tuple[int, ...]) -> None:
-                if st.session_state.get("del_all_customers"):
-                    st.session_state.del_customers = list(id_list)
-                else:
-                    st.session_state.del_customers = []
-
-            st.checkbox(
-                "Select all customers",
-                key="del_all_customers",
-                on_change=_toggle_delete_all,
-                args=(tuple(ids),),
-            )
-            selected = st.multiselect(
-                "Customers to delete",
-                ids,
-                default=st.session_state.get("del_customers", []),
-                format_func=lambda i: name_map.get(int(i), str(i)),
-                key="del_customers",
-            )
-            if selected and st.button("Delete selected", type="primary"):
-                cur = conn.cursor()
-                cur.executemany("DELETE FROM customers WHERE customer_id=?", [(int(i),) for i in selected])
-                conn.commit()
-                st.success(f"Deleted {len(selected)} customers.")
-                _safe_rerun()
-
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
     sort_dir = st.radio("Sort by expiry date", ["Soonest first", "Latest first"], horizontal=True)
@@ -3200,258 +3286,236 @@ def import_page(conn):
 
 def duplicates_page(conn):
     st.subheader("⚠️ Possible Duplicates")
-    cust = df_query(
+    cust_raw = df_query(
         conn,
         "SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC",
     )
-    cust = fmt_dates(cust, ["created_at", "purchase_date"])
-    warr = df_query(conn, "SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.dup_flag FROM warranties w LEFT JOIN customers c ON c.customer_id = w.customer_id LEFT JOIN products p ON p.product_id = w.product_id ORDER BY date(w.issue_date) DESC")
-    warr = fmt_dates(warr, ["issue_date","expiry_date"])
-
+    warr = df_query(
+        conn,
+        "SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.dup_flag FROM warranties w LEFT JOIN customers c ON c.customer_id = w.customer_id LEFT JOIN products p ON p.product_id = w.product_id ORDER BY date(w.issue_date) DESC",
+    )
     duplicate_customers = pd.DataFrame()
-    if not cust.empty:
-        duplicate_customers = cust[cust["dup_flag"] == 1].copy()
-
+    if not cust_raw.empty:
+        duplicate_customers = cust_raw[cust_raw["dup_flag"] == 1].copy()
     if duplicate_customers.empty:
         st.success("No customer duplicates detected at the moment.")
     else:
-        duplicate_customers = duplicate_customers.assign(
-            duplicate=duplicate_customers["dup_flag"].apply(lambda x: "🔁 duplicate phone" if int(x) == 1 else ""),
-        )
-        st.markdown("**Customers (duplicate phone)**")
-        st.dataframe(
-            duplicate_customers.drop(columns=["id", "dup_flag"], errors="ignore"),
-            use_container_width=True,
-        )
-
-        def _format_purchase_row(row):
-            date_val = clean_text(row.get("purchase_date"))
-            product_val = clean_text(row.get("product_info"))
-            pieces = [part for part in (date_val, product_val) if part]
-            if pieces:
-                return " – ".join(pieces)
-            return None
-
         summary_rows = []
-        for phone_val, group in duplicate_customers.groupby("phone", dropna=False):
-            phone_label = clean_text(phone_val) or "(no phone)"
-            names = group.get("name") if "name" in group.columns else pd.Series(dtype=object)
-            addresses = group.get("address") if "address" in group.columns else pd.Series(dtype=object)
-            do_codes = group.get("delivery_order_code") if "delivery_order_code" in group.columns else pd.Series(dtype=object)
-            purchase_lines = []
-            for record in group.to_dict("records"):
-                formatted = _format_purchase_row(record)
-                if formatted:
-                    purchase_lines.append(formatted)
-            summary_rows.append(
-                {
-                    "Phone": phone_label,
-                    "Records": len(group.index),
-                    "Customers": dedupe_join([clean_text(v) for v in (names.tolist() if hasattr(names, "tolist") else [])]),
-                    "Addresses": dedupe_join([clean_text(v) for v in (addresses.tolist() if hasattr(addresses, "tolist") else [])]),
-                    "Delivery orders": dedupe_join([clean_text(v) for v in (do_codes.tolist() if hasattr(do_codes, "tolist") else [])]),
-                    "Purchase details": dedupe_join(purchase_lines),
-                }
-            )
-
-        if summary_rows:
-            st.markdown("#### Grouped view")
-            summary_df = pd.DataFrame(summary_rows)
-            st.dataframe(summary_df, use_container_width=True)
-            st.caption(
-                "Purchase details list each date alongside the model so you can keep multi-unit sales in a single customer record."
-            )
-
-        st.markdown("#### Quick merge duplicate groups")
-        st.caption(
-            "When names and addresses already match, use merge to combine purchase histories into a single record."
-        )
-        for phone_val, group in duplicate_customers.groupby("phone", dropna=False):
-            merge_ids = [int_or_none(v) for v in group.get("id", pd.Series(dtype=object)).tolist()]
-            merge_ids = [v for v in merge_ids if v is not None]
-            if len(merge_ids) < 2:
-                continue
-            name_set = {clean_text(v) for v in group.get("name", pd.Series(dtype=object)).tolist() if clean_text(v)}
-            address_set = {clean_text(v) for v in group.get("address", pd.Series(dtype=object)).tolist() if clean_text(v)}
-            if len(name_set) <= 1 and len(address_set) <= 1:
-                phone_label = clean_text(phone_val) or "(no phone)"
-                merge_key = "merge_" + "_".join(str(v) for v in merge_ids)
-                if st.button(
-                    f"Merge {len(merge_ids)} record(s) for phone {phone_label}",
-                    key=merge_key,
-                ):
-                    if merge_customer_records(conn, merge_ids):
-                        st.success("Merged duplicate customer entries into a single record.")
-                        _safe_rerun()
-                    else:
-                        st.error("Could not merge these records. Please review and try again.")
-
-        st.markdown("#### Manage duplicate entries")
-        st.caption(
-            "Select a duplicate entry to edit the details. Combine purchase information manually if needed by editing the product field."
-        )
-
-        user = st.session_state.user or {}
-        is_admin = user.get("role") == "admin"
-
-        records = duplicate_customers.copy()
-        records = records.sort_values(by=["phone", "created_at"], na_position="last")
-        option_ids = [
-            int(v)
-            for v in records.get("id", pd.Series(dtype=object)).dropna().astype(int).tolist()
-        ]
-
-        if not option_ids:
-            st.info("No duplicate entries to manage.")
-        else:
-            labels = {}
-            for _, row in records.iterrows():
-                cid = int(row.get("id"))
-                name_label = clean_text(row.get("name")) or "(no name)"
-                phone_label = clean_text(row.get("phone")) or "-"
-                created_label = clean_text(row.get("created_at"))
-                suffix = f" • {created_label}" if created_label else ""
-                labels[cid] = f"#{cid} – {name_label} ({phone_label}){suffix}"
-
-            selected_customer_id = st.selectbox(
-                "Select duplicate customer",
-                option_ids,
-                format_func=lambda cid: labels.get(int(cid), str(cid)),
-            )
-
-            selected_row = records[records["id"] == int(selected_customer_id)].iloc[0]
-            phone_val = clean_text(selected_row.get("phone"))
-            peer_group = duplicate_customers[
-                duplicate_customers.get("phone") == selected_row.get("phone")
-            ]
-            if not peer_group.empty:
-                peer_preview = peer_group[
-                    [
-                        "name",
-                        "address",
-                        "purchase_date",
-                        "product_info",
-                        "delivery_order_code",
-                        "created_at",
-                    ]
-                ].rename(
-                    columns={
-                        "name": "Name",
-                        "address": "Address",
-                        "purchase_date": "Purchase date",
-                        "product_info": "Product",
-                        "delivery_order_code": "DO code",
-                        "created_at": "Added",
+        if not duplicate_customers.empty:
+            grouped = duplicate_customers.groupby(["phone", "purchase_date", "product_info"], dropna=False)
+            for (phone_val, purchase_val, product_val), group in grouped:
+                summary_rows.append(
+                    {
+                        "Phone": clean_text(phone_val) or "(no phone)",
+                        "Purchase date": (
+                            parse_date_value(purchase_val).strftime(DATE_FMT)
+                            if parse_date_value(purchase_val) is not None
+                            else "-"
+                        ),
+                        "Product": clean_text(product_val) or "-",
+                        "Units": len(group.index),
+                        "Customers": dedupe_join([clean_text(v) for v in group.get("name", pd.Series(dtype=object)).tolist()]),
+                        "Delivery orders": dedupe_join([
+                            clean_text(v) for v in group.get("delivery_order_code", pd.Series(dtype=object)).tolist()
+                        ]),
                     }
                 )
-                st.caption(
-                    f"{len(peer_group.index)} record(s) share the phone number {phone_val or '(no phone)'}"
-                )
-                st.dataframe(peer_preview, use_container_width=True)
-
-            with st.form(f"dup_manage_{selected_customer_id}"):
-                name_default = clean_text(selected_row.get("name")) or ""
-                phone_default = clean_text(selected_row.get("phone")) or ""
-                address_default = clean_text(selected_row.get("address")) or ""
-                purchase_default = clean_text(selected_row.get("purchase_date")) or ""
-                product_default = clean_text(selected_row.get("product_info")) or ""
-                do_default = clean_text(selected_row.get("delivery_order_code")) or ""
-
-                name_input = st.text_input("Name", value=name_default)
-                phone_input = st.text_input("Phone", value=phone_default)
-                address_input = st.text_area("Address", value=address_default)
-                purchase_input = st.text_input("Purchase date (DD-MM-YYYY)", value=purchase_default)
-                product_input = st.text_input("Product", value=product_default)
-                do_input = st.text_input("Delivery order code", value=do_default)
-                col_a, col_b = st.columns(2)
-                save_btn = col_a.form_submit_button("Save changes", type="primary")
-                delete_btn = col_b.form_submit_button("Delete entry", disabled=not is_admin)
-
-            if save_btn:
-                new_name = clean_text(name_input)
-                new_phone = clean_text(phone_input)
-                new_address = clean_text(address_input)
-                new_product = clean_text(product_input)
-                new_do = clean_text(do_input)
-                purchase_str, _ = date_strings_from_input(purchase_input)
-
-                old_phone = clean_text(selected_row.get("phone"))
-                old_do = clean_text(selected_row.get("delivery_order_code"))
-
-                conn.execute(
-                    "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
-                    (
-                        new_name,
-                        new_phone,
-                        new_address,
-                        purchase_str,
-                        new_product,
-                        new_do,
-                        int(selected_customer_id),
-                    ),
-                )
-
-                if new_do:
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows)
+            sort_cols = [col for col in ["Phone", "Purchase date", "Product"] if col in summary_df.columns]
+            if sort_cols:
+                summary_df = summary_df.sort_values(by=sort_cols, na_position="last")
+            st.markdown("#### Same-day purchase groups")
+            st.dataframe(summary_df, use_container_width=True)
+            st.caption(
+                "Rows show duplicates sharing the same phone number, purchase date, and product. Adjust the entries below if they represent multi-unit sales."
+            )
+        editor_df = duplicate_customers.copy()
+        counts_map: dict[tuple[Optional[str], Optional[str], Optional[str]], int] = {}
+        for _, row in editor_df.iterrows():
+            key = (
+                clean_text(row.get("phone")),
+                clean_text(row.get("purchase_date")),
+                clean_text(row.get("product_info")),
+            )
+            counts_map[key] = counts_map.get(key, 0) + 1
+        editor_df["same_day_units"] = [
+            counts_map.get(
+                (
+                    clean_text(row.get("phone")),
+                    clean_text(row.get("purchase_date")),
+                    clean_text(row.get("product_info")),
+                ),
+                1,
+            )
+            for _, row in editor_df.iterrows()
+        ]
+        editor_df["duplicate"] = "🔁 duplicate phone"
+        editor_df["purchase_date"] = pd.to_datetime(editor_df["purchase_date"], errors="coerce")
+        editor_df["created_at"] = pd.to_datetime(editor_df["created_at"], errors="coerce")
+        editor_df["Action"] = "Keep"
+        column_order = [
+            col
+            for col in [
+                "id",
+                "name",
+                "phone",
+                "address",
+                "purchase_date",
+                "product_info",
+                "delivery_order_code",
+                "same_day_units",
+                "duplicate",
+                "created_at",
+                "Action",
+            ]
+            if col in editor_df.columns
+        ]
+        editor_df = editor_df[column_order]
+        st.markdown("#### Edit duplicate entries")
+        editor_state = st.data_editor(
+            editor_df,
+            hide_index=True,
+            num_rows="fixed",
+            use_container_width=True,
+            column_config={
+                "id": st.column_config.Column("ID", disabled=True),
+                "name": st.column_config.TextColumn("Name"),
+                "phone": st.column_config.TextColumn("Phone"),
+                "address": st.column_config.TextColumn("Address"),
+                "purchase_date": st.column_config.DateColumn("Purchase date", format="DD-MM-YYYY", required=False),
+                "product_info": st.column_config.TextColumn("Product"),
+                "delivery_order_code": st.column_config.TextColumn("DO code"),
+                "same_day_units": st.column_config.NumberColumn("Units (same day)", disabled=True, min_value=1, step=1),
+                "duplicate": st.column_config.Column("Duplicate", disabled=True),
+                "created_at": st.column_config.DatetimeColumn("Created", format="DD-MM-YYYY HH:mm", disabled=True),
+                "Action": st.column_config.SelectboxColumn("Action", options=["Keep", "Delete"], required=True),
+            },
+        )
+        user = st.session_state.user or {}
+        is_admin = user.get("role") == "admin"
+        if not is_admin:
+            st.caption("Deleting rows requires admin privileges; non-admin delete actions will be ignored.")
+        raw_map = {int(row["id"]): row for row in duplicate_customers.to_dict("records") if int_or_none(row.get("id")) is not None}
+        if st.button("Apply duplicate table updates", type="primary"):
+            editor_result = editor_state if isinstance(editor_state, pd.DataFrame) else pd.DataFrame(editor_state)
+            if editor_result.empty:
+                st.info("No rows to update.")
+            else:
+                phones_to_recalc: set[str] = set()
+                updates = deletes = 0
+                errors: list[str] = []
+                made_updates = False
+                for row in editor_result.to_dict("records"):
+                    cid = int_or_none(row.get("id"))
+                    if cid is None or cid not in raw_map:
+                        continue
+                    action = str(row.get("Action") or "Keep").strip().lower()
+                    if action == "delete":
+                        if is_admin:
+                            delete_customer_record(conn, cid)
+                            deletes += 1
+                        else:
+                            errors.append(f"Only admins can delete customers (ID #{cid}).")
+                        continue
+                    new_name = clean_text(row.get("name"))
+                    new_phone = clean_text(row.get("phone"))
+                    new_address = clean_text(row.get("address"))
+                    purchase_str, _ = date_strings_from_input(row.get("purchase_date"))
+                    product_label = clean_text(row.get("product_info"))
+                    new_do = clean_text(row.get("delivery_order_code"))
+                    original_row = raw_map[cid]
+                    old_name = clean_text(original_row.get("name"))
+                    old_phone = clean_text(original_row.get("phone"))
+                    old_address = clean_text(original_row.get("address"))
+                    old_purchase = clean_text(original_row.get("purchase_date"))
+                    old_product = clean_text(original_row.get("product_info"))
+                    old_do = clean_text(original_row.get("delivery_order_code"))
+                    if (
+                        new_name == old_name
+                        and new_phone == old_phone
+                        and new_address == old_address
+                        and purchase_str == old_purchase
+                        and product_label == old_product
+                        and new_do == old_do
+                    ):
+                        continue
                     conn.execute(
-                        """
-                        INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(do_number) DO UPDATE SET
-                            customer_id=excluded.customer_id,
-                            description=excluded.description
-                        """,
+                        "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
                         (
+                            new_name,
+                            new_phone,
+                            new_address,
+                            purchase_str,
+                            product_label,
                             new_do,
-                            int(selected_customer_id),
-                            None,
-                            new_product,
-                            None,
-                            None,
+                            cid,
                         ),
                     )
-                if old_do and old_do != new_do:
+                    if new_do:
+                        conn.execute(
+                            """
+                            INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(do_number) DO UPDATE SET
+                                customer_id=excluded.customer_id,
+                                description=excluded.description
+                            """,
+                            (
+                                new_do,
+                                cid,
+                                None,
+                                product_label,
+                                None,
+                                None,
+                            ),
+                        )
+                    if old_do and old_do != new_do:
+                        conn.execute(
+                            "DELETE FROM delivery_orders WHERE do_number=? AND (customer_id IS NULL OR customer_id=?)",
+                            (old_do, cid),
+                        )
                     conn.execute(
-                        "DELETE FROM delivery_orders WHERE do_number=? AND (customer_id IS NULL OR customer_id=?)",
-                        (old_do, int(selected_customer_id)),
+                        "UPDATE import_history SET customer_name=?, phone=?, address=?, product_label=?, do_number=?, original_date=? WHERE customer_id=? AND deleted_at IS NULL",
+                        (
+                            new_name,
+                            new_phone,
+                            new_address,
+                            product_label,
+                            new_do,
+                            purchase_str,
+                            cid,
+                        ),
                     )
-
-                conn.execute(
-                    "UPDATE import_history SET customer_name=?, phone=?, address=?, product_label=?, do_number=?, original_date=? WHERE customer_id=? AND deleted_at IS NULL",
-                    (
-                        new_name,
-                        new_phone,
-                        new_address,
-                        new_product,
-                        new_do,
-                        purchase_str,
-                        int(selected_customer_id),
-                    ),
-                )
-                conn.commit()
-
-                if old_phone and old_phone != new_phone:
-                    recalc_customer_duplicate_flag(conn, old_phone)
-                if new_phone:
-                    recalc_customer_duplicate_flag(conn, new_phone)
-                conn.commit()
-                st.success("Customer updated.")
-                _safe_rerun()
-
-            if delete_btn:
-                if is_admin:
-                    delete_customer_record(conn, int(selected_customer_id))
-                    st.warning("Duplicate entry deleted.")
-                    _safe_rerun()
-                else:
-                    st.error("Only admins can delete duplicate entries.")
+                    if old_phone and old_phone != new_phone:
+                        phones_to_recalc.add(old_phone)
+                    if new_phone:
+                        phones_to_recalc.add(new_phone)
+                    updates += 1
+                    made_updates = True
+                if made_updates:
+                    conn.commit()
+                if phones_to_recalc:
+                    for phone_value in phones_to_recalc:
+                        recalc_customer_duplicate_flag(conn, phone_value)
+                    conn.commit()
+                if errors:
+                    for err in errors:
+                        st.error(err)
+                if updates or deletes:
+                    st.success(f"Updated {updates} row(s) and deleted {deletes} row(s).")
+                    if not errors:
+                        _safe_rerun()
+                elif not errors:
+                    st.info("No changes detected.")
     if not warr.empty:
+        warr = fmt_dates(warr, ["issue_date", "expiry_date"])
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
         st.markdown("**Warranties (duplicate serial)**")
         st.dataframe(
             warr[warr["dup_flag"] == 1].drop(columns=["id", "dup_flag"], errors="ignore"),
             use_container_width=True,
         )
-
 def users_admin_page(conn):
     ensure_auth(role="admin")
     st.subheader("👤 Users (Admin)")
@@ -3521,14 +3585,26 @@ def _import_clean6(conn, df, tag="Import"):
         addr = str(addr) if pd.notna(addr) else None
         phone = str(phone) if pd.notna(phone) else None
         prod = str(prod) if pd.notna(prod) else None
+        purchase_dt = parse_date_value(d)
+        purchase_str = purchase_dt.strftime("%Y-%m-%d") if isinstance(purchase_dt, pd.Timestamp) else None
         # dup checks
-        def exists_phone(phone):
-            if not phone or str(phone).lower() == "nan":
+        def exists_phone(phone_value, purchase_value):
+            normalized_phone = clean_text(phone_value)
+            if not normalized_phone:
                 return False
-            cur.execute("SELECT 1 FROM customers WHERE phone = ? LIMIT 1", (str(phone),))
+            if purchase_value:
+                cur.execute(
+                    "SELECT 1 FROM customers WHERE phone = ? AND IFNULL(purchase_date, '') = ? LIMIT 1",
+                    (normalized_phone, purchase_value),
+                )
+            else:
+                cur.execute(
+                    "SELECT 1 FROM customers WHERE phone = ? AND (purchase_date IS NULL OR purchase_date = '') LIMIT 1",
+                    (normalized_phone,),
+                )
             return cur.fetchone() is not None
 
-        dupc = 1 if exists_phone(phone) else 0
+        dupc = 1 if exists_phone(phone, purchase_str) else 0
         cur.execute(
             "INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, ?)",
             (cust, phone, addr, dupc),
@@ -3537,7 +3613,9 @@ def _import_clean6(conn, df, tag="Import"):
         if dupc:
             d_c += 1
         if phone:
-            phones_to_recalc.add(phone)
+            normalized_phone = clean_text(phone)
+            if normalized_phone:
+                phones_to_recalc.add(normalized_phone)
 
         name, model = split_product_label(prod)
 
@@ -3560,7 +3638,7 @@ def _import_clean6(conn, df, tag="Import"):
             d_p += 1
 
         # we still record orders (hidden) to keep a timeline if needed
-        base_dt = parse_date_value(d) or pd.Timestamp.now().normalize()
+        base_dt = purchase_dt or pd.Timestamp.now().normalize()
         order_date = base_dt
         delivery_date = base_dt
         cur.execute(
@@ -3601,7 +3679,7 @@ def _import_clean6(conn, df, tag="Import"):
                     None,
                 ),
             )
-        purchase_date = base.strftime("%Y-%m-%d") if isinstance(base, pd.Timestamp) else None
+        purchase_date = purchase_str or (base.strftime("%Y-%m-%d") if isinstance(base, pd.Timestamp) else None)
         cur.execute(
             "UPDATE customers SET purchase_date=?, product_info=?, delivery_order_code=? WHERE customer_id=?",
             (
