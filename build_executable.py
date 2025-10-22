@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Helper script for packaging PS Mini CRM into a standalone executable.
+"""Helper script for packaging PS Service Software into a standalone executable.
 
 Running this script will:
 
 1. Create (or reuse) a dedicated virtual environment in ``.build-venv``.
 2. Install the application's runtime dependencies along with PyInstaller.
-3. Produce a platform-specific executable in ``dist/ps_mini_crm`` that can be
+3. Produce a platform-specific executable in ``dist/PS Service Software`` that can be
    distributed to staff members.
 
 The resulting bundle includes the Streamlit app, the Excel import template,
@@ -27,6 +27,7 @@ BUILD_VENV = ROOT_DIR / ".build-venv"
 REQUIREMENTS_FILE = ROOT_DIR / "requirements.txt"
 ENTRY_POINT = ROOT_DIR / "desktop_launcher.py"
 APP_DEST_DIR = "."
+APP_DISPLAY_NAME = "PS Service Software"
 
 
 class BuildError(RuntimeError):
@@ -88,7 +89,7 @@ def build_executable(python_path: Path) -> None:
         "--noconfirm",
         "--clean",
         "--name",
-        "ps_mini_crm",
+        APP_DISPLAY_NAME,
         "--add-data",
         add_data_args[0],
         "--add-data",
@@ -110,7 +111,10 @@ def main() -> None:
         print("Unable to build executable. Please review the output above for details.")
         sys.exit(1)
 
-    print("\nBuild complete! The packaged application is available in the dist/ folder.")
+    print(
+        "\nBuild complete! The packaged application is available in dist/"
+        f"{APP_DISPLAY_NAME}/"
+    )
 
 
 if __name__ == "__main__":
