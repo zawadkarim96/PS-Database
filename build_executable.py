@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Helper script for packaging PS Mini CRM into a standalone executable.
+"""Helper script for packaging PS Service Software into a standalone executable.
 
 Running this script will:
 
 1. Create (or reuse) a dedicated virtual environment in ``.build-venv``.
 2. Install the application's runtime dependencies along with PyInstaller.
-3. Produce a platform-specific executable in ``dist/ps_mini_crm`` that can be
+3. Produce a platform-specific executable in ``dist/PS Service Software`` that can be
    distributed to staff members.
 
 The resulting bundle includes the Streamlit app, the Excel import template,
@@ -16,6 +16,8 @@ desktop application.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import subprocess
 import sys
@@ -27,6 +29,10 @@ BUILD_VENV = ROOT_DIR / ".build-venv"
 REQUIREMENTS_FILE = ROOT_DIR / "requirements.txt"
 ENTRY_POINT = ROOT_DIR / "desktop_launcher.py"
 APP_DEST_DIR = "."
+APP_DISPLAY_NAME = "PS Service Software"
+ICON_BINARY = ROOT_DIR / "assets" / "ps_service_software.ico"
+ICON_BASE64 = ROOT_DIR / "assets" / "ps_service_software.ico.b64"
+BUILD_STAMP = BUILD_VENV / ".ps-build-requirements"
 
 
 class BuildError(RuntimeError):
@@ -58,8 +64,24 @@ def ensure_build_environment() -> Path:
     return python_path
 
 
+def _requirements_fingerprint() -> str:
+    """Return a hash used to determine if dependencies need to be reinstalled."""
+
+    contents = REQUIREMENTS_FILE.read_bytes()
+    return hashlib.sha256(contents).hexdigest()
+
+
 def install_dependencies(python_path: Path) -> None:
     """Install runtime dependencies and PyInstaller into the build venv."""
+
+    fingerprint = _requirements_fingerprint()
+    if BUILD_STAMP.exists() and BUILD_STAMP.read_text().strip() == fingerprint:
+        print("Build dependencies already prepared; skipping reinstall.")
+        try:
+            run_command([str(python_path), "-m", "PyInstaller", "--version"])
+            return
+        except BuildError:
+            print("PyInstaller missing; reinstalling ...")
 
     pip = [str(python_path), "-m", "pip", "--disable-pip-version-check"]
     print("Upgrading pip inside the build environment ...")
@@ -71,6 +93,29 @@ def install_dependencies(python_path: Path) -> None:
     print("Installing PyInstaller ...")
     run_command(pip + ["install", "pyinstaller"])
 
+    BUILD_STAMP.write_text(fingerprint)
+
+
+def _ensure_icon_file() -> Path:
+    """Return a filesystem path to the icon, decoding from base64 if required."""
+
+    if ICON_BINARY.exists():
+        return ICON_BINARY
+
+    if not ICON_BASE64.exists():  # pragma: no cover - configuration error
+        raise BuildError(
+            "Icon asset is missing. Expected assets/ps_service_software.ico or .ico.b64."
+        )
+
+    try:
+        icon_bytes = base64.b64decode(ICON_BASE64.read_text())
+    except Exception as exc:  # pragma: no cover - invalid base64 should never happen
+        raise BuildError("Unable to decode icon asset from base64 data.") from exc
+
+    icon_target = ROOT_DIR / "assets" / ".ps_service_software.ico"
+    icon_target.write_bytes(icon_bytes)
+    return icon_target
+
 
 def build_executable(python_path: Path) -> None:
     """Invoke PyInstaller with the required options to bundle the app."""
@@ -81,6 +126,8 @@ def build_executable(python_path: Path) -> None:
         f"{ROOT_DIR / 'import_template.xlsx'}{data_separator}{APP_DEST_DIR}",
     ]
 
+    icon_file = _ensure_icon_file()
+
     command = [
         str(python_path),
         "-m",
@@ -88,11 +135,13 @@ def build_executable(python_path: Path) -> None:
         "--noconfirm",
         "--clean",
         "--name",
-        "ps_mini_crm",
+        APP_DISPLAY_NAME,
         "--add-data",
         add_data_args[0],
         "--add-data",
         add_data_args[1],
+        "--icon",
+        str(icon_file),
         str(ENTRY_POINT),
     ]
 
@@ -110,7 +159,10 @@ def main() -> None:
         print("Unable to build executable. Please review the output above for details.")
         sys.exit(1)
 
-    print("\nBuild complete! The packaged application is available in the dist/ folder.")
+    print(
+        "\nBuild complete! The packaged application is available in dist/"
+        f"{APP_DISPLAY_NAME}/"
+    )
 
 
 if __name__ == "__main__":

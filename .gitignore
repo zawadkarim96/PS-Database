@@ -6,4 +6,6 @@ __pycache__/
 /build/
 /dist/
 /*.spec
+assets/ps_service_software.ico
+assets/.ps_service_software.ico
 
