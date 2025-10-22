@@ -264,6 +264,46 @@ def clean_text(value):
     return value or None
 
 
+def link_delivery_order_to_customer(
+    conn: sqlite3.Connection, do_number: Optional[str], customer_id: Optional[int]
+) -> None:
+    do_serial = clean_text(do_number)
+    if not do_serial:
+        return
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT customer_id FROM delivery_orders WHERE do_number = ?",
+        (do_serial,),
+    ).fetchone()
+    if row is None:
+        if customer_id is not None:
+            cur.execute(
+                "UPDATE customers SET delivery_order_code = ? WHERE customer_id = ?",
+                (do_serial, int(customer_id)),
+            )
+        return
+    previous_customer = int(row[0]) if row and row[0] is not None else None
+    if customer_id is not None:
+        cur.execute(
+            "UPDATE delivery_orders SET customer_id = ? WHERE do_number = ?",
+            (int(customer_id), do_serial),
+        )
+        cur.execute(
+            "UPDATE customers SET delivery_order_code = ? WHERE customer_id = ?",
+            (do_serial, int(customer_id)),
+        )
+    else:
+        cur.execute(
+            "UPDATE delivery_orders SET customer_id = NULL WHERE do_number = ?",
+            (do_serial,),
+        )
+    if previous_customer and previous_customer != (int(customer_id) if customer_id is not None else None):
+        cur.execute(
+            "UPDATE customers SET delivery_order_code = NULL WHERE customer_id = ? AND delivery_order_code = ?",
+            (previous_customer, do_serial),
+        )
+
+
 def _safe_rerun():
     try:
         st.rerun()
@@ -2064,6 +2104,11 @@ def delivery_orders_page(conn):
                         stored_path,
                     ),
                 )
+                link_delivery_order_to_customer(
+                    conn,
+                    serial,
+                    int(selected_customer) if selected_customer else None,
+                )
                 conn.commit()
                 st.success("Delivery Order saved.")
                 _safe_rerun()
@@ -2160,29 +2205,31 @@ def services_page(conn):
             format_func=lambda do: do_labels.get(do, str(do)),
         )
         default_customer = do_customer_map.get(selected_do)
-        choices = list(customer_options)
-        if default_customer and default_customer not in choices:
-            choices.append(default_customer)
-            if default_customer not in customer_labels:
-                customer_labels[default_customer] = (
-                    customer_label_map.get(default_customer)
-                    or label_by_id.get(default_customer)
-                    or f"Customer #{default_customer}"
-                )
         state_key = "service_customer_link"
         last_do_key = "service_customer_last_do"
-        if st.session_state.get(last_do_key) != selected_do:
+        linked_customer = default_customer
+        if default_customer is not None:
             st.session_state[last_do_key] = selected_do
-            if default_customer in choices:
-                st.session_state[state_key] = default_customer
-            else:
+            st.session_state[state_key] = default_customer
+            customer_label = (
+                customer_labels.get(default_customer)
+                or customer_label_map.get(default_customer)
+                or label_by_id.get(default_customer)
+                or do_customer_name_map.get(selected_do)
+                or f"Customer #{default_customer}"
+            )
+            st.text_input("Customer", value=customer_label, disabled=True)
+        else:
+            choices = list(customer_options)
+            if st.session_state.get(last_do_key) != selected_do:
+                st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
-        linked_customer = st.selectbox(
-            "Customer",
-            options=choices,
-            format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-            key=state_key,
-        )
+            linked_customer = st.selectbox(
+                "Customer",
+                options=choices,
+                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                key=state_key,
+            )
         service_date = st.date_input("Service date", value=datetime.now().date())
         description = st.text_area("Service description")
         remarks = st.text_area("Remarks / updates")
@@ -2198,13 +2245,14 @@ def services_page(conn):
         if not selected_do:
             st.error("Delivery Order is required for service records.")
         else:
-            selected_customer = linked_customer if linked_customer else do_customer_map.get(selected_do)
+            selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
+            selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO services (do_number, customer_id, service_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     selected_do,
-                    int(selected_customer) if selected_customer else None,
+                    selected_customer,
                     service_date.strftime("%Y-%m-%d") if service_date else None,
                     clean_text(description),
                     clean_text(remarks),
@@ -2212,11 +2260,7 @@ def services_page(conn):
                 ),
             )
             service_id = cur.lastrowid
-            if selected_customer:
-                conn.execute(
-                    "UPDATE delivery_orders SET customer_id=? WHERE do_number=?",
-                    (int(selected_customer), selected_do),
-                )
+            link_delivery_order_to_customer(conn, selected_do, selected_customer)
             saved_docs = attach_documents(
                 conn,
                 "service_documents",
@@ -2410,29 +2454,31 @@ def maintenance_page(conn):
             format_func=lambda do: do_labels.get(do, str(do)),
         )
         default_customer = do_customer_map.get(selected_do)
-        choices = list(customer_options)
-        if default_customer and default_customer not in choices:
-            choices.append(default_customer)
-            if default_customer not in customer_labels:
-                customer_labels[default_customer] = (
-                    customer_label_map.get(default_customer)
-                    or label_by_id.get(default_customer)
-                    or f"Customer #{default_customer}"
-                )
         state_key = "maintenance_customer_link"
         last_do_key = "maintenance_customer_last_do"
-        if st.session_state.get(last_do_key) != selected_do:
+        linked_customer = default_customer
+        if default_customer is not None:
             st.session_state[last_do_key] = selected_do
-            if default_customer in choices:
-                st.session_state[state_key] = default_customer
-            else:
+            st.session_state[state_key] = default_customer
+            customer_label = (
+                customer_labels.get(default_customer)
+                or customer_label_map.get(default_customer)
+                or label_by_id.get(default_customer)
+                or do_customer_name_map.get(selected_do)
+                or f"Customer #{default_customer}"
+            )
+            st.text_input("Customer", value=customer_label, disabled=True)
+        else:
+            choices = list(customer_options)
+            if st.session_state.get(last_do_key) != selected_do:
+                st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
-        linked_customer = st.selectbox(
-            "Customer",
-            options=choices,
-            format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
-            key=state_key,
-        )
+            linked_customer = st.selectbox(
+                "Customer",
+                options=choices,
+                format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
+                key=state_key,
+            )
         maintenance_date = st.date_input("Maintenance date", value=datetime.now().date())
         description = st.text_area("Maintenance description")
         remarks = st.text_area("Remarks / updates")
@@ -2448,13 +2494,14 @@ def maintenance_page(conn):
         if not selected_do:
             st.error("Delivery Order is required for maintenance records.")
         else:
-            selected_customer = linked_customer if linked_customer else do_customer_map.get(selected_do)
+            selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
+            selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
             cur.execute(
                 "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     selected_do,
-                    int(selected_customer) if selected_customer else None,
+                    selected_customer,
                     maintenance_date.strftime("%Y-%m-%d") if maintenance_date else None,
                     clean_text(description),
                     clean_text(remarks),
@@ -2462,11 +2509,7 @@ def maintenance_page(conn):
                 ),
             )
             maintenance_id = cur.lastrowid
-            if selected_customer:
-                conn.execute(
-                    "UPDATE delivery_orders SET customer_id=? WHERE do_number=?",
-                    (int(selected_customer), selected_do),
-                )
+            link_delivery_order_to_customer(conn, selected_do, selected_customer)
             saved_docs = attach_documents(
                 conn,
                 "maintenance_documents",
