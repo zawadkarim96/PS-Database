@@ -20,8 +20,8 @@ if errorlevel 1 goto :error
 python -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto :error
 
-REM Launch the Streamlit app.
-streamlit run app.py
+REM Launch the desktop app shell.
+python desktop_launcher.py
 if errorlevel 1 goto :error
 
 goto :eof

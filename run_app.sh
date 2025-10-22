@@ -38,4 +38,4 @@ fi
 python -m pip install --disable-pip-version-check --upgrade pip >/dev/null
 python -m pip install --disable-pip-version-check -r requirements.txt
 
-exec streamlit run app.py
+exec python desktop_launcher.py
