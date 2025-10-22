@@ -1299,37 +1299,83 @@ def dashboard(conn):
             st.dataframe(today_table, use_container_width=True)
 
     if is_admin:
-        excel_bytes = export_database_to_excel(conn)
-        st.download_button(
-            "⬇️ Download full database (Excel)",
-            excel_bytes,
-            file_name="ps_crm.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        if "show_deleted_panel" not in st.session_state:
+            st.session_state.show_deleted_panel = False
 
-        deleted_df = df_query(
-            conn,
-            """
-            SELECT import_id, imported_at, customer_name, phone, product_label, original_date, do_number, deleted_at
-            FROM import_history
-            WHERE deleted_at IS NOT NULL
-            ORDER BY datetime(deleted_at) DESC
-            """,
+        excel_bytes = export_database_to_excel(conn)
+        admin_action_cols = st.columns([0.78, 0.22])
+        with admin_action_cols[0]:
+            st.download_button(
+                "⬇️ Download full database (Excel)",
+                excel_bytes,
+                file_name="ps_crm.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        toggle_label = (
+            "🗑️ Deleted data"
+            if not st.session_state.get("show_deleted_panel")
+            else "Hide deleted data"
         )
-        if not deleted_df.empty:
-            deleted_bytes = io.BytesIO()
-            with pd.ExcelWriter(deleted_bytes, engine="openpyxl") as writer:
-                deleted_df.to_excel(writer, index=False, sheet_name="deleted_imports")
-            deleted_bytes.seek(0)
-            _, small_col = st.columns([3, 1])
-            with small_col:
-                st.caption("Deleted data export")
+        with admin_action_cols[1]:
+            if st.button(
+                toggle_label,
+                key="toggle_deleted_panel",
+                help="Admins can review deleted import records here.",
+            ):
+                st.session_state.show_deleted_panel = not st.session_state.get(
+                    "show_deleted_panel", False
+                )
+
+        if st.session_state.get("show_deleted_panel"):
+            deleted_df = df_query(
+                conn,
+                """
+                SELECT import_id, imported_at, customer_name, phone, product_label, original_date, do_number, deleted_at
+                FROM import_history
+                WHERE deleted_at IS NOT NULL
+                ORDER BY datetime(deleted_at) DESC
+                """,
+            )
+
+            if deleted_df.empty:
+                st.info("No deleted import entries found.")
+            else:
+                formatted_deleted = fmt_dates(
+                    deleted_df,
+                    ["imported_at", "original_date", "deleted_at"],
+                )
+                deleted_bytes = io.BytesIO()
+                with pd.ExcelWriter(deleted_bytes, engine="openpyxl") as writer:
+                    formatted_deleted.to_excel(
+                        writer, index=False, sheet_name="deleted_imports"
+                    )
+                deleted_bytes.seek(0)
+
+                st.markdown("#### Deleted import history")
+                st.caption(
+                    "Only administrators can access this view. Download the Excel file for a full audit trail."
+                )
                 st.download_button(
-                    "Deleted imports",
+                    "Download deleted imports",
                     deleted_bytes.getvalue(),
                     file_name="deleted_imports.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="deleted_imports_dl",
+                )
+                preview_cols = [
+                    "import_id",
+                    "imported_at",
+                    "customer_name",
+                    "phone",
+                    "product_label",
+                    "do_number",
+                    "original_date",
+                    "deleted_at",
+                ]
+                st.dataframe(
+                    formatted_deleted[preview_cols],
+                    use_container_width=True,
                 )
 
     st.markdown("---")
