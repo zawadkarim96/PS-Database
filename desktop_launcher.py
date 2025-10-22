@@ -1,32 +1,46 @@
 #!/usr/bin/env python3
 """Desktop-friendly launcher for the PS Mini CRM Streamlit application.
 
-This module is designed to be used in two contexts:
+This module powers the "double-click" experience for staff members. It is used
+both when the project is executed directly from source (``python
+desktop_launcher.py``) and when a PyInstaller bundle produced by
+``build_executable.py`` is launched. The launcher performs a few key tasks:
 
-* Direct execution with ``python desktop_launcher.py`` for a locally cloned
-  repository.
-* As the entry point when the project is packaged into a standalone
-  executable via PyInstaller (see ``build_executable.py``).
+* Ensure all mutable files (database, uploads, import templates) live in a
+  writable per-user directory rather than alongside the executable.
+* Start the Streamlit runtime in-process without opening an external browser
+  window.
+* Host the application inside a lightweight native window via ``pywebview`` so
+  the login page appears like a traditional desktop dialog.
 
-In both scenarios the launcher ensures that user data such as the SQLite
-database, uploaded documents, and import templates live in a writable
-location outside of the read-only application bundle. On first launch the
-template Excel file is copied into that storage directory so staff members
-always have access to it.
+Users who prefer the browser experience can continue to rely on ``run_app.py``
+or ``streamlit run app.py``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import socket
 import sys
+import threading
+import time
 from pathlib import Path
 
+import webbrowser
 from streamlit.web import bootstrap
+
+try:  # ``pywebview`` provides the native desktop window.
+    import webview
+except ImportError:  # pragma: no cover - dependency is optional at runtime
+    webview = None
 
 
 APP_SCRIPT_NAME = "app.py"
 IMPORT_TEMPLATE_NAME = "import_template.xlsx"
+HOST_ADDRESS = "127.0.0.1"
+SERVER_STARTUP_TIMEOUT = 30.0  # seconds
 
 
 def resource_path(relative_name: str) -> Path:
@@ -67,12 +81,72 @@ def main() -> None:
     ensure_template_file(storage_dir)
 
     os.environ.setdefault("APP_STORAGE_DIR", str(storage_dir))
+    # Streamlit tries to launch the system browser unless this environment
+    # variable is set. We want everything contained inside the desktop window.
+    os.environ.setdefault("BROWSER", "none")
 
     app_script = resource_path(APP_SCRIPT_NAME)
 
-    # ``bootstrap.run`` starts the Streamlit runtime and blocks until exit.
-    flag_options = {"server.headless": False}
-    bootstrap.run(str(app_script), "", [], flag_options)
+    port = _reserve_port()
+    flag_options = {
+        "server.headless": True,
+        "server.address": HOST_ADDRESS,
+        "server.port": port,
+    }
+
+    streamlit_thread = threading.Thread(
+        target=bootstrap.run,
+        args=(str(app_script), "", [], flag_options),
+        name="streamlit-runtime",
+        daemon=True,
+    )
+    streamlit_thread.start()
+
+    if not _wait_for_server(port, timeout=SERVER_STARTUP_TIMEOUT):
+        raise RuntimeError(
+            "Timed out waiting for the Streamlit server to start. Please try again."
+        )
+
+    app_url = f"http://{HOST_ADDRESS}:{port}"
+
+    if webview is None:
+        webbrowser.open(app_url)
+        streamlit_thread.join()
+        return
+
+    try:
+        webview.create_window("PS Mini CRM", app_url, width=1100, height=760)
+        webview.start(debug=False)
+    except Exception:  # pragma: no cover - GUI availability depends on platform
+        # Fallback to the default browser so the app remains accessible even if
+        # ``pywebview`` cannot initialize (e.g. missing GTK/WebKit bindings).
+        webbrowser.open(app_url)
+        streamlit_thread.join()
+
+
+def _reserve_port() -> int:
+    """Ask the OS for a free TCP port and return it."""
+
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind((HOST_ADDRESS, 0))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return sock.getsockname()[1]
+
+
+def _wait_for_server(port: int, *, timeout: float) -> bool:
+    """Poll until the Streamlit server is accepting connections."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            try:
+                sock.settimeout(0.5)
+                sock.connect((HOST_ADDRESS, port))
+            except OSError:
+                time.sleep(0.2)
+            else:
+                return True
+    return False
 
 
 if __name__ == "__main__":
