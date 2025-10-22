@@ -7,7 +7,8 @@ Running this script will create (or reuse) a local virtual environment in
 pywebview-powered desktop shell. Subsequent runs reuse the cached
 environment unless the requirements file changes. It is intended to provide a
 one-click/one-command way to get to the login page without touching pip
-manually or dealing with a browser window.
+manually or dealing with a browser window. On Windows the launcher prefers
+``pythonw.exe`` so the login dialog opens without a console window.
 """
 
 from __future__ import annotations
@@ -82,11 +83,25 @@ def install_dependencies(venv_python: Path) -> None:
     SETUP_STAMP.write_text(fingerprint)
 
 
+def _select_launch_interpreter(venv_python: Path) -> Path:
+    """Return the interpreter that should host the desktop app."""
+
+    if os.name != "nt":
+        return venv_python
+
+    pythonw = venv_python.with_name("pythonw.exe")
+    if pythonw.exists():
+        return pythonw
+
+    return venv_python
+
+
 def launch_desktop_app(venv_python: Path) -> None:
     """Launch the desktop experience using the virtual environment's Python."""
 
     print("Starting the PS Service Software desktop app ...")
-    command = [str(venv_python), str(DESKTOP_LAUNCHER)]
+    interpreter = _select_launch_interpreter(venv_python)
+    command = [str(interpreter), str(DESKTOP_LAUNCHER)]
     run_command(command, cwd=ROOT_DIR)
 
 

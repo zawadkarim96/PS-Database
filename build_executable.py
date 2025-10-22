@@ -134,6 +134,7 @@ def build_executable(python_path: Path) -> None:
         "PyInstaller",
         "--noconfirm",
         "--clean",
+        "--noconsole",
         "--name",
         APP_DISPLAY_NAME,
         "--add-data",
