@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import sqlite3
 import hashlib
 import zipfile
@@ -495,6 +496,7 @@ def merge_customer_records(conn, customer_ids) -> bool:
     address_values = [v for v in address_values if v]
     phone_values = [clean_text(v) for v in df.get("phone", pd.Series(dtype=object)).tolist()]
     phone_values = [v for v in phone_values if v]
+    phones_to_recalc: set[str] = set(phone_values)
 
     base_name = clean_text(base_row.get("name")) or (name_values[0] if name_values else None)
     base_address = clean_text(base_row.get("address")) or (address_values[0] if address_values else None)
@@ -562,7 +564,10 @@ def merge_customer_records(conn, customer_ids) -> bool:
         conn.execute("DELETE FROM customers WHERE customer_id=?", (cid,))
 
     if base_phone:
-        recalc_customer_duplicate_flag(conn, base_phone)
+        phones_to_recalc.add(base_phone)
+    if phones_to_recalc:
+        for phone in phones_to_recalc:
+            recalc_customer_duplicate_flag(conn, phone)
     conn.commit()
     return True
 
@@ -3284,6 +3289,136 @@ def import_page(conn):
     st.markdown("---")
     manage_import_history(conn)
 
+def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
+    if customers_df is None or customers_df.empty:
+        return
+
+    if "id" not in customers_df.columns:
+        return
+
+    work_df = customers_df.copy()
+    work_df["id"] = work_df["id"].apply(int_or_none)
+    work_df = work_df[work_df["id"].notna()]
+    if work_df.empty:
+        return
+
+    work_df["id"] = work_df["id"].astype(int)
+
+    def build_label(row):
+        name_val = clean_text(row.get("name")) or "(no name)"
+        phone_val = clean_text(row.get("phone")) or "(no phone)"
+        address_val = clean_text(row.get("address")) or "-"
+        product_val = clean_text(row.get("product_info")) or "-"
+        do_val = clean_text(row.get("delivery_order_code")) or "-"
+        date_dt = parse_date_value(row.get("purchase_date"))
+        if date_dt is not None:
+            date_label = date_dt.strftime(DATE_FMT)
+        else:
+            date_label = clean_text(row.get("purchase_date")) or "-"
+        return f"#{row['id']} – {name_val} | Phone: {phone_val} | Date: {date_label} | Product: {product_val} | DO: {do_val}"
+
+    work_df["_label"] = work_df.apply(build_label, axis=1)
+    work_df["_search_blob"] = work_df.apply(
+        lambda row: " ".join(
+            filter(
+                None,
+                [
+                    clean_text(row.get("name")),
+                    clean_text(row.get("phone")),
+                    clean_text(row.get("address")),
+                    clean_text(row.get("product_info")),
+                    clean_text(row.get("delivery_order_code")),
+                ],
+            )
+        ),
+        axis=1,
+    )
+    work_df["_search_blob"] = work_df["_search_blob"].fillna("").str.lower()
+
+    label_map = {row["id"]: row["_label"] for row in work_df.to_dict("records")}
+
+    st.divider()
+    st.markdown("#### Manual customer merge")
+    st.caption(
+        "Select multiple customer records that refer to the same person even if the phone number or purchase date differs. "
+        "The earliest record will be kept and enriched with the combined details."
+    )
+
+    filter_value = st.text_input(
+        "Filter customers by name, phone, address, product, or DO (optional)",
+        key="manual_merge_filter",
+    ).strip()
+
+    filtered_df = work_df
+    if filter_value:
+        escaped = re.escape(filter_value.lower())
+        mask = filtered_df["_search_blob"].str.contains(escaped, regex=True, na=False)
+        filtered_df = filtered_df[mask]
+
+    options = filtered_df["id"].tolist()
+    if not options:
+        st.info("No customer records match the current filter.")
+        return
+
+    with st.form("manual_merge_form"):
+        selected_ids = st.multiselect(
+            "Select customer records to merge",
+            options=options,
+            format_func=lambda cid: label_map.get(cid, f"#{cid}"),
+        )
+
+        preview_df = work_df[work_df["id"].isin(selected_ids)]
+        if not preview_df.empty:
+            preview_df = preview_df.copy()
+            preview_df["purchase_date"] = pd.to_datetime(preview_df["purchase_date"], errors="coerce")
+            preview_df["purchase_date"] = preview_df["purchase_date"].dt.strftime(DATE_FMT)
+            preview_df["purchase_date"] = preview_df["purchase_date"].fillna("-")
+            preview_cols = [
+                col
+                for col in [
+                    "id",
+                    "name",
+                    "phone",
+                    "address",
+                    "purchase_date",
+                    "product_info",
+                    "delivery_order_code",
+                    "created_at",
+                ]
+                if col in preview_df.columns
+            ]
+            st.dataframe(
+                preview_df[preview_cols]
+                .rename(
+                    columns={
+                        "id": "ID",
+                        "name": "Name",
+                        "phone": "Phone",
+                        "address": "Address",
+                        "purchase_date": "Purchase date",
+                        "product_info": "Product",
+                        "delivery_order_code": "DO code",
+                        "created_at": "Created",
+                    }
+                )
+                .sort_values("ID"),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        submitted = st.form_submit_button("Merge selected customers", type="primary")
+
+    if submitted:
+        if len(selected_ids) < 2:
+            st.warning("Select at least two customers to merge.")
+            return
+        if merge_customer_records(conn, selected_ids):
+            st.success(f"Merged {len(selected_ids)} customer records.")
+            _safe_rerun()
+        else:
+            st.error("Could not merge the selected customers. Please try again.")
+
+
 def duplicates_page(conn):
     st.subheader("⚠️ Possible Duplicates")
     cust_raw = df_query(
@@ -3527,6 +3662,8 @@ def duplicates_page(conn):
                             _safe_rerun()
                     elif not errors:
                         st.info("No changes detected.")
+    manual_merge_section(conn, cust_raw)
+
     if not warr.empty:
         warr = fmt_dates(warr, ["issue_date", "expiry_date"])
         warr = warr.assign(duplicate=warr["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
