@@ -28,6 +28,8 @@ import threading
 import time
 from pathlib import Path
 
+from storage_paths import get_storage_dir
+
 from streamlit.web import bootstrap
 
 try:  # ``pywebview`` provides the native desktop window.
@@ -54,21 +56,6 @@ def resource_path(relative_name: str) -> Path:
     return Path(__file__).resolve().parent / relative_name
 
 
-def determine_storage_dir() -> Path:
-    """Choose a writable directory for app data based on the host platform."""
-
-    if sys.platform.startswith("win"):
-        base_dir = Path(os.getenv("APPDATA", Path.home()))
-    elif sys.platform == "darwin":
-        base_dir = Path.home() / "Library" / "Application Support"
-    else:
-        base_dir = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-
-    storage_dir = base_dir / "ps-mini-crm"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    return storage_dir
-
-
 def ensure_template_file(storage_dir: Path) -> None:
     """Copy the Excel import template into the storage directory if needed."""
 
@@ -80,7 +67,7 @@ def ensure_template_file(storage_dir: Path) -> None:
 
 
 def main() -> None:
-    storage_dir = determine_storage_dir()
+    storage_dir = get_storage_dir()
     ensure_template_file(storage_dir)
 
     os.environ.setdefault("APP_STORAGE_DIR", str(storage_dir))

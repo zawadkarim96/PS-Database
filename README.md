@@ -8,7 +8,7 @@
 - v7.8: Customer summary groups unnamed customers under "(blank)" so their contact info is still accessible.
 
 ## Run Without Touching the Command Line
-These launchers create a dedicated virtual environment, install dependencies from `requirements.txt`, and then open the Streamlit app inside the native desktop shell (no browser required). After the first setup run the cached environment is reused automatically, so relaunching is instant. You only need Python 3.9+ installed.
+These launchers create a dedicated virtual environment, install dependencies from `requirements.txt`, and then open the Streamlit app inside the native desktop shell (no browser required). After the first setup run the cached environment is reused automatically, so relaunching is instant. You only need Python 3.9+ installed. You can still run `streamlit run app.py` for the traditional browser experience—both approaches share the exact same database and uploads.
 
 ### Any Platform (single command or double-click)
 Run `python run_app.py` from the repository root, or double-click the file in your file explorer. The script prepares the environment and launches the app inside a pywebview dialog titled **PS Service Software**.
@@ -31,7 +31,7 @@ If your staff does not have Python installed, you can package the project into a
 3. Share the contents of `dist/PS Service Software/` with your staff. Windows users can double-click `PS Service Software.exe` (complete with the PS Service Software icon); macOS and Linux users can run the executable from Finder/File Explorer or the terminal.
 
 ### Where user data lives
-When launched from the packaged app, databases, uploads, and the Excel import template are stored in a writable folder per operating system:
+Regardless of whether you launch from source, the packaged desktop app, or `streamlit run app.py`, databases, uploads, and the Excel import template are stored in a writable folder per operating system:
 
 - **Windows:** `%APPDATA%\ps-mini-crm`
 - **macOS:** `~/Library/Application Support/ps-mini-crm`
