@@ -33,6 +33,53 @@ def test_customer_creation_and_duplicate_flag(db_conn, app_module):
     assert flags == [1, 1]
 
 
+def test_merge_customer_records_combines_data_and_recalculates_duplicates(db_conn, app_module):
+    cur = db_conn.cursor()
+    cur.execute(
+        "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag)"
+        " VALUES (?, ?, ?, ?, ?, ?, 0)",
+        ("Primary", "111", "Addr 1", "2024-01-01", "AC Unit", "DO-A"),
+    )
+    keep_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag)"
+        " VALUES (?, ?, ?, ?, ?, ?, 0)",
+        ("Secondary", "222", "Addr 2", "2024-02-01", "Heater", "DO-B"),
+    )
+    merge_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, 0)",
+        ("Other", "222", "Addr 3"),
+    )
+    other_id = cur.lastrowid
+    db_conn.commit()
+
+    app_module.recalc_customer_duplicate_flag(db_conn, "222")
+
+    merged = app_module.merge_customer_records(db_conn, [keep_id, merge_id])
+    assert merged is True
+
+    remaining_ids = [row[0] for row in db_conn.execute("SELECT customer_id FROM customers ORDER BY customer_id").fetchall()]
+    assert keep_id in remaining_ids and merge_id not in remaining_ids
+
+    row = db_conn.execute(
+        "SELECT phone, address, purchase_date, product_info, delivery_order_code, dup_flag FROM customers WHERE customer_id=?",
+        (keep_id,),
+    ).fetchone()
+    assert row[0] == "111"
+    assert row[1] == "Addr 1"
+    assert row[2] == "2024-01-01"
+    assert "AC Unit" in row[3] and "Heater" in row[3]
+    assert "DO-A" in row[4] and "DO-B" in row[4]
+    assert row[5] == 0
+
+    other_dup_flag = db_conn.execute(
+        "SELECT dup_flag FROM customers WHERE customer_id=?",
+        (other_id,),
+    ).fetchone()[0]
+    assert other_dup_flag == 0
+
+
 def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
     cur = db_conn.cursor()
     cur.execute(
