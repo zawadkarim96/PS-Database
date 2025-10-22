@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop-friendly launcher for the PS Mini CRM Streamlit application.
+"""Desktop-friendly launcher for the PS Service Software Streamlit application.
 
 This module powers the "double-click" experience for staff members. It is used
 both when the project is executed directly from source (``python
@@ -13,8 +13,8 @@ desktop_launcher.py``) and when a PyInstaller bundle produced by
 * Host the application inside a lightweight native window via ``pywebview`` so
   the login page appears like a traditional desktop dialog.
 
-Users who prefer the browser experience can continue to rely on ``run_app.py``
-or ``streamlit run app.py``.
+Users who prefer the browser experience can continue to rely on
+``streamlit run app.py``.
 """
 
 from __future__ import annotations
@@ -28,19 +28,22 @@ import threading
 import time
 from pathlib import Path
 
-import webbrowser
 from streamlit.web import bootstrap
 
 try:  # ``pywebview`` provides the native desktop window.
     import webview
-except ImportError:  # pragma: no cover - dependency is optional at runtime
-    webview = None
+except ImportError as exc:  # pragma: no cover - dependency should be present
+    raise RuntimeError(
+        "pywebview is required for the desktop launcher. "
+        "Please reinstall the application dependencies."
+    ) from exc
 
 
 APP_SCRIPT_NAME = "app.py"
 IMPORT_TEMPLATE_NAME = "import_template.xlsx"
 HOST_ADDRESS = "127.0.0.1"
 SERVER_STARTUP_TIMEOUT = 30.0  # seconds
+WINDOW_TITLE = "PS Service Software"
 
 
 def resource_path(relative_name: str) -> Path:
@@ -109,19 +112,14 @@ def main() -> None:
 
     app_url = f"http://{HOST_ADDRESS}:{port}"
 
-    if webview is None:
-        webbrowser.open(app_url)
-        streamlit_thread.join()
-        return
-
     try:
-        webview.create_window("PS Mini CRM", app_url, width=1100, height=760)
+        webview.create_window(WINDOW_TITLE, app_url, width=1100, height=760)
         webview.start(debug=False)
-    except Exception:  # pragma: no cover - GUI availability depends on platform
-        # Fallback to the default browser so the app remains accessible even if
-        # ``pywebview`` cannot initialize (e.g. missing GTK/WebKit bindings).
-        webbrowser.open(app_url)
-        streamlit_thread.join()
+    except Exception as exc:  # pragma: no cover - GUI availability depends on platform
+        raise RuntimeError(
+            "Unable to initialize the desktop window. "
+            "Please ensure your system supports pywebview."
+        ) from exc
 
 
 def _reserve_port() -> int:
@@ -151,3 +149,4 @@ def _wait_for_server(port: int, *, timeout: float) -> bool:
 
 if __name__ == "__main__":
     main()
+

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Convenience launcher for the PS Mini CRM Streamlit app.
+"""Convenience launcher for the PS Service Software desktop app.
 
 Running this script will create (or reuse) a local virtual environment in
 ```.venv``` next to the repository, install the dependencies declared in
-``requirements.txt``, and finally launch the Streamlit app.  It is intended to
-provide a one-click/one-command way to get to the login page without touching
-pip manually.
+``requirements.txt``, and finally launch the Streamlit app inside the
+pywebview-powered desktop shell. Subsequent runs reuse the cached
+environment unless the requirements file changes. It is intended to provide a
+one-click/one-command way to get to the login page without touching pip
+manually or dealing with a browser window.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -18,7 +21,8 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 VENV_DIR = ROOT_DIR / ".venv"
 REQUIREMENTS = ROOT_DIR / "requirements.txt"
-APP_FILE = ROOT_DIR / "app.py"
+SETUP_STAMP = VENV_DIR / ".ps-requirements"
+DESKTOP_LAUNCHER = ROOT_DIR / "desktop_launcher.py"
 
 
 class LauncherError(RuntimeError):
@@ -52,9 +56,22 @@ def ensure_virtual_environment() -> Path:
     return python_path
 
 
+def _requirements_fingerprint() -> str:
+    """Return a hash that represents the current dependency lock."""
+
+    contents = REQUIREMENTS.read_bytes()
+    return hashlib.sha256(contents).hexdigest()
+
+
 def install_dependencies(venv_python: Path) -> None:
     """Install or update required dependencies inside the virtual environment."""
 
+    fingerprint = _requirements_fingerprint()
+    if SETUP_STAMP.exists() and SETUP_STAMP.read_text().strip() == fingerprint:
+        print("Dependencies already installed. Skipping setup.")
+        return
+
+    print("Preparing virtual environment dependencies ...")
     pip_base = [str(venv_python), "-m", "pip", "--disable-pip-version-check"]
     print("Ensuring pip is up to date ...")
     run_command(pip_base + ["install", "--upgrade", "pip"])
@@ -62,12 +79,14 @@ def install_dependencies(venv_python: Path) -> None:
     print("Installing project requirements ...")
     run_command(pip_base + ["install", "-r", str(REQUIREMENTS)])
 
+    SETUP_STAMP.write_text(fingerprint)
 
-def launch_streamlit(venv_python: Path) -> None:
-    """Launch the Streamlit application using the virtual environment's Python."""
 
-    print("Starting the PS Mini CRM app ...")
-    command = [str(venv_python), "-m", "streamlit", "run", str(APP_FILE)]
+def launch_desktop_app(venv_python: Path) -> None:
+    """Launch the desktop experience using the virtual environment's Python."""
+
+    print("Starting the PS Service Software desktop app ...")
+    command = [str(venv_python), str(DESKTOP_LAUNCHER)]
     run_command(command, cwd=ROOT_DIR)
 
 
@@ -75,7 +94,7 @@ def main() -> None:
     try:
         venv_python = ensure_virtual_environment()
         install_dependencies(venv_python)
-        launch_streamlit(venv_python)
+        launch_desktop_app(venv_python)
     except LauncherError as exc:
         print(f"\nERROR: {exc}\n")
         print("Please ensure Python 3.9+ is installed and try again.")
