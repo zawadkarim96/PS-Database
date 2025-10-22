@@ -15,9 +15,23 @@ import pandas as pd
 
 import streamlit as st
 
+try:
+    from storage_paths import get_storage_dir
+except ModuleNotFoundError:  # pragma: no cover - defensive for bundled test imports
+    import importlib.util
+
+    _storage_module_path = Path(__file__).resolve().parent / "storage_paths.py"
+    spec = importlib.util.spec_from_file_location("storage_paths", _storage_module_path)
+    module = importlib.util.module_from_spec(spec)
+    loader = spec.loader
+    if loader is None:  # pragma: no cover - should not happen
+        raise
+    loader.exec_module(module)
+    get_storage_dir = module.get_storage_dir
+
 # ---------- Config ----------
 load_dotenv()
-DEFAULT_BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_BASE_DIR = get_storage_dir()
 BASE_DIR = Path(os.getenv("APP_STORAGE_DIR", DEFAULT_BASE_DIR))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
