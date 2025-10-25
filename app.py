@@ -1229,6 +1229,10 @@ def ensure_auth(role=None):
 # ---------- Pages ----------
 def dashboard(conn):
     st.subheader("📊 Dashboard")
+    st.markdown(
+        "<div style='text-align: right; font-size: 0.6rem; color: #888;'>by ZAD</div>",
+        unsafe_allow_html=True,
+    )
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
 
