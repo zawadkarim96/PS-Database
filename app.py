@@ -49,6 +49,9 @@ REQUIRED_CUSTOMER_FIELDS = {
     "address": "Address",
 }
 
+SERVICE_STATUS_OPTIONS = ["In progress", "Completed", "Haven't started"]
+DEFAULT_SERVICE_STATUS = SERVICE_STATUS_OPTIONS[0]
+
 
 def customer_complete_clause(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS customers (
     purchase_date TEXT,
     product_info TEXT,
     delivery_order_code TEXT,
+    sales_person TEXT,
     attachment_path TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     dup_flag INTEGER DEFAULT 0
@@ -140,6 +144,7 @@ CREATE TABLE IF NOT EXISTS services (
     customer_id INTEGER,
     service_date TEXT,
     description TEXT,
+    status TEXT DEFAULT 'In progress',
     remarks TEXT,
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(do_number) REFERENCES delivery_orders(do_number) ON DELETE SET NULL,
@@ -151,6 +156,7 @@ CREATE TABLE IF NOT EXISTS maintenance_records (
     customer_id INTEGER,
     maintenance_date TEXT,
     description TEXT,
+    status TEXT DEFAULT 'In progress',
     remarks TEXT,
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(do_number) REFERENCES delivery_orders(do_number) ON DELETE SET NULL,
@@ -240,6 +246,9 @@ def ensure_schema_upgrades(conn):
     add_column("customers", "product_info", "TEXT")
     add_column("customers", "delivery_order_code", "TEXT")
     add_column("customers", "attachment_path", "TEXT")
+    add_column("customers", "sales_person", "TEXT")
+    add_column("services", "status", "TEXT DEFAULT 'In progress'")
+    add_column("maintenance_records", "status", "TEXT DEFAULT 'In progress'")
 
 def df_query(conn, q, params=()):
     return pd.read_sql_query(q, conn, params=params)
@@ -262,6 +271,39 @@ def clean_text(value):
         pass
     value = str(value).strip()
     return value or None
+
+
+def status_input_widget(prefix: str, default_status: Optional[str] = None) -> str:
+    lookup = {opt.lower(): opt for opt in SERVICE_STATUS_OPTIONS}
+    default_choice = DEFAULT_SERVICE_STATUS
+    custom_default = "Haven't started"
+    default_clean = clean_text(default_status)
+    if default_clean:
+        normalized = default_clean.lower()
+        if normalized in lookup and lookup[normalized] != "Haven't started":
+            default_choice = lookup[normalized]
+        elif normalized == "haven't started":
+            default_choice = lookup[normalized]
+            custom_default = lookup[normalized]
+        else:
+            default_choice = "Haven't started"
+            custom_default = default_clean
+
+    choice = st.selectbox(
+        "Status",
+        SERVICE_STATUS_OPTIONS,
+        index=SERVICE_STATUS_OPTIONS.index(default_choice),
+        key=f"{prefix}_status_choice",
+    )
+    if choice == "Haven't started":
+        custom_value = st.text_input(
+            "Custom status label",
+            value=custom_default or "Haven't started",
+            key=f"{prefix}_status_custom",
+            help="Customize the saved status when a record hasn't started yet.",
+        )
+        return clean_text(custom_value) or "Haven't started"
+    return choice
 
 
 def link_delivery_order_to_customer(
@@ -523,7 +565,7 @@ def merge_customer_records(conn, customer_ids) -> bool:
     placeholders = ",".join(["?"] * len(ids))
     query = dedent(
         f"""
-        SELECT customer_id, name, phone, address, purchase_date, product_info, delivery_order_code, created_at
+        SELECT customer_id, name, phone, address, purchase_date, product_info, delivery_order_code, sales_person, created_at
         FROM customers
         WHERE customer_id IN ({placeholders})
         """
@@ -560,11 +602,13 @@ def merge_customer_records(conn, customer_ids) -> bool:
     product_lines = []
     fallback_products = []
     purchase_dates = []
+    sales_people = []
 
     for record in df.to_dict("records"):
         date_raw = clean_text(record.get("purchase_date"))
         product_raw = clean_text(record.get("product_info"))
         do_raw = clean_text(record.get("delivery_order_code"))
+        sales_raw = clean_text(record.get("sales_person"))
         if do_raw:
             do_codes.append(do_raw)
         if product_raw:
@@ -581,15 +625,18 @@ def merge_customer_records(conn, customer_ids) -> bool:
             product_lines.append(product_raw)
         elif date_label:
             product_lines.append(date_label)
+        if sales_raw:
+            sales_people.append(sales_raw)
 
     earliest_purchase = min(purchase_dates).strftime("%Y-%m-%d") if purchase_dates else None
     combined_products = dedupe_join(product_lines or fallback_products)
     combined_do_codes = dedupe_join(do_codes)
+    combined_sales = dedupe_join(sales_people)
 
     conn.execute(
         """
         UPDATE customers
-        SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0
+        SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, dup_flag=0
         WHERE customer_id=?
         """,
         (
@@ -599,6 +646,7 @@ def merge_customer_records(conn, customer_ids) -> bool:
             earliest_purchase,
             clean_text(combined_products),
             clean_text(combined_do_codes),
+            clean_text(combined_sales),
             base_id,
         ),
     )
@@ -726,6 +774,7 @@ def _build_customers_export(conn) -> pd.DataFrame:
                purchase_date,
                product_info,
                delivery_order_code,
+               sales_person,
                created_at
         FROM customers
         ORDER BY datetime(created_at) DESC, customer_id DESC
@@ -743,6 +792,7 @@ def _build_customers_export(conn) -> pd.DataFrame:
             "purchase_date": "Purchase date",
             "product_info": "Product info",
             "delivery_order_code": "Delivery order",
+            "sales_person": "Sales person",
             "created_at": "Created at",
         }
     )
@@ -817,6 +867,7 @@ def _build_services_export(conn) -> pd.DataFrame:
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                s.service_date,
                s.description,
+               s.status,
                s.remarks,
                s.updated_at
         FROM services s
@@ -828,6 +879,8 @@ def _build_services_export(conn) -> pd.DataFrame:
     )
     df = df_query(conn, query)
     df = fmt_dates(df, ["service_date", "updated_at"])
+    if "status" in df.columns:
+        df["status"] = df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
     return df.rename(
         columns={
             "service_id": "Service ID",
@@ -835,6 +888,7 @@ def _build_services_export(conn) -> pd.DataFrame:
             "customer": "Customer",
             "service_date": "Service date",
             "description": "Description",
+            "status": "Status",
             "remarks": "Remarks",
             "updated_at": "Updated at",
         }
@@ -849,6 +903,7 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                m.maintenance_date,
                m.description,
+               m.status,
                m.remarks,
                m.updated_at
         FROM maintenance_records m
@@ -860,6 +915,8 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
     )
     df = df_query(conn, query)
     df = fmt_dates(df, ["maintenance_date", "updated_at"])
+    if "status" in df.columns:
+        df["status"] = df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
     return df.rename(
         columns={
             "maintenance_id": "Maintenance ID",
@@ -867,6 +924,7 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
             "customer": "Customer",
             "maintenance_date": "Maintenance date",
             "description": "Description",
+            "status": "Status",
             "remarks": "Remarks",
             "updated_at": "Updated at",
         }
@@ -1589,6 +1647,7 @@ def customers_page(conn):
             product_model = st.text_input("Model")
             product_serial = st.text_input("Serial")
             do_code = st.text_input("Delivery order code")
+            sales_person_input = st.text_input("Sales person")
             customer_pdf = st.file_uploader("Attach customer PDF", type=["pdf"], key="new_customer_pdf")
             do_pdf = st.file_uploader("Attach Delivery Order (PDF)", type=["pdf"], key="new_customer_do_pdf")
             submitted = st.form_submit_button("Save")
@@ -1603,7 +1662,7 @@ def customers_page(conn):
                 purchase_str = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
                 do_serial = clean_text(do_code)
                 cur.execute(
-                    "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag) VALUES (?, ?, ?, ?, ?, ?, 0)",
+                    "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, sales_person, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
                     (
                         name_val,
                         phone_val,
@@ -1611,6 +1670,7 @@ def customers_page(conn):
                         purchase_str,
                         product_label,
                         do_serial,
+                        clean_text(sales_person_input),
                     ),
                 )
                 cid = cur.lastrowid
@@ -1666,7 +1726,7 @@ def customers_page(conn):
                                 cid,
                                 None,
                                 clean_text(product_name) or None,
-                                None,
+                                clean_text(sales_person_input),
                                 stored_path,
                             ),
                         )
@@ -1692,11 +1752,11 @@ def customers_page(conn):
     order = "DESC" if sort_dir == "Newest first" else "ASC"
     q = st.text_input("Search (name/phone/address/product/DO)")
     df_raw = df_query(conn, f"""
-        SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, attachment_path, created_at, dup_flag
+        SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, sales_person, attachment_path, created_at, dup_flag
         FROM customers
-        WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR address LIKE '%'||?||'%' OR product_info LIKE '%'||?||'%' OR delivery_order_code LIKE '%'||?||'%')
+        WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR address LIKE '%'||?||'%' OR product_info LIKE '%'||?||'%' OR delivery_order_code LIKE '%'||?||'%' OR sales_person LIKE '%'||?||'%')
         ORDER BY datetime(created_at) {order}
-    """, (q, q, q, q, q, q))
+    """, (q, q, q, q, q, q, q))
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
     st.markdown("### Quick edit or delete")
@@ -1726,6 +1786,7 @@ def customers_page(conn):
                 "purchase_date",
                 "product_info",
                 "delivery_order_code",
+                "sales_person",
                 "duplicate",
                 "created_at",
                 "Action",
@@ -1746,6 +1807,7 @@ def customers_page(conn):
                 "purchase_date": st.column_config.DateColumn("Purchase date", format="DD-MM-YYYY", required=False),
                 "product_info": st.column_config.TextColumn("Product"),
                 "delivery_order_code": st.column_config.TextColumn("DO code"),
+                "sales_person": st.column_config.TextColumn("Sales person"),
                 "duplicate": st.column_config.Column("Duplicate", disabled=True),
                 "created_at": st.column_config.DatetimeColumn("Created", format="DD-MM-YYYY HH:mm", disabled=True),
                 "Action": st.column_config.SelectboxColumn("Action", options=["Keep", "Delete"], required=True),
@@ -1780,6 +1842,7 @@ def customers_page(conn):
                     purchase_str, _ = date_strings_from_input(row.get("purchase_date"))
                     product_label = clean_text(row.get("product_info"))
                     new_do = clean_text(row.get("delivery_order_code"))
+                    new_sales_person = clean_text(row.get("sales_person"))
                     original_row = original_map[cid]
                     old_name = clean_text(original_row.get("name"))
                     old_phone = clean_text(original_row.get("phone"))
@@ -1787,6 +1850,7 @@ def customers_page(conn):
                     old_purchase = clean_text(original_row.get("purchase_date"))
                     old_product = clean_text(original_row.get("product_info"))
                     old_do = clean_text(original_row.get("delivery_order_code"))
+                    old_sales_person = clean_text(original_row.get("sales_person"))
                     if (
                         new_name == old_name
                         and new_phone == old_phone
@@ -1794,10 +1858,11 @@ def customers_page(conn):
                         and purchase_str == old_purchase
                         and product_label == old_product
                         and new_do == old_do
+                        and new_sales_person == old_sales_person
                     ):
                         continue
                     conn.execute(
-                        "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
+                        "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, dup_flag=0 WHERE customer_id=?",
                         (
                             new_name,
                             new_phone,
@@ -1805,6 +1870,7 @@ def customers_page(conn):
                             purchase_str,
                             product_label,
                             new_do,
+                            new_sales_person,
                             cid,
                         ),
                     )
@@ -1815,14 +1881,15 @@ def customers_page(conn):
                             VALUES (?, ?, ?, ?, ?, ?)
                             ON CONFLICT(do_number) DO UPDATE SET
                                 customer_id=excluded.customer_id,
-                                description=excluded.description
+                                description=excluded.description,
+                                sales_person=excluded.sales_person
                             """,
                             (
                                 new_do,
                                 cid,
                                 None,
                                 product_label,
-                                None,
+                                new_sales_person,
                                 None,
                             ),
                         )
@@ -1909,6 +1976,9 @@ def customers_page(conn):
                 do_edit = st.text_input(
                     "Delivery order code", value=clean_text(selected_raw.get("delivery_order_code")) or ""
                 )
+                sales_person_edit = st.text_input(
+                    "Sales person", value=clean_text(selected_raw.get("sales_person")) or ""
+                )
                 new_pdf = st.file_uploader(
                     "Attach/replace customer PDF", type=["pdf"], key=f"edit_customer_pdf_{selected_customer_id}"
                 )
@@ -1924,6 +1994,7 @@ def customers_page(conn):
                 product_label = clean_text(product_edit)
                 new_do = clean_text(do_edit)
                 old_do = clean_text(selected_raw.get("delivery_order_code"))
+                new_sales_person = clean_text(sales_person_edit)
                 new_attachment_path = attachment_path
                 if new_pdf is not None:
                     saved = save_uploaded_file(new_pdf, CUSTOMER_DOCS_DIR, filename=f"customer_{selected_customer_id}.pdf")
@@ -1941,7 +2012,7 @@ def customers_page(conn):
                                 except Exception:
                                     pass
                 conn.execute(
-                    "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, attachment_path=?, dup_flag=0 WHERE customer_id=?",
+                    "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, attachment_path=?, dup_flag=0 WHERE customer_id=?",
                     (
                         new_name,
                         new_phone,
@@ -1949,6 +2020,7 @@ def customers_page(conn):
                         purchase_str,
                         product_label,
                         new_do,
+                        new_sales_person,
                         new_attachment_path,
                         int(selected_customer_id),
                     ),
@@ -1960,14 +2032,15 @@ def customers_page(conn):
                         VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT(do_number) DO UPDATE SET
                             customer_id=excluded.customer_id,
-                            description=excluded.description
+                            description=excluded.description,
+                            sales_person=excluded.sales_person
                         """,
                         (
                             new_do,
                             int(selected_customer_id),
                             None,
                             product_label,
-                            None,
+                            new_sales_person,
                             None,
                         ),
                     )
@@ -2005,7 +2078,7 @@ def customers_page(conn):
                     st.error("Only admins can delete customers.")
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
-        SELECT customer_id as id, name, phone, purchase_date, product_info, delivery_order_code, created_at
+        SELECT customer_id as id, name, phone, purchase_date, product_info, delivery_order_code, sales_person, created_at
         FROM customers
         ORDER BY datetime(created_at) DESC LIMIT 200
     """)
@@ -2062,110 +2135,9 @@ def warranties_page(conn):
         st.dataframe(soon60, use_container_width=True)
 
 
-def delivery_orders_page(conn):
-    st.subheader("🚚 Delivery Orders")
-    customer_options, customer_labels, _, _ = fetch_customer_choices(conn)
-
-    with st.form("delivery_order_form"):
-        do_number = st.text_input("Delivery Order Serial *")
-        selected_customer_index = 0
-        selected_customer = st.selectbox(
-            "Customer",
-            options=customer_options,
-            index=selected_customer_index,
-            format_func=lambda cid: customer_labels.get(cid, str(cid)),
-        )
-        description = st.text_area("Description")
-        sales_person = st.text_input("Sales person")
-        uploaded_pdf = st.file_uploader("Upload Delivery Order (PDF)", type=["pdf"])
-        submit = st.form_submit_button("Save Delivery Order", type="primary")
-
-    if submit:
-        serial = clean_text(do_number)
-        if not serial:
-            st.error("Delivery Order serial is required.")
-        else:
-            cur = conn.execute("SELECT 1 FROM delivery_orders WHERE do_number = ?", (serial,))
-            if cur.fetchone():
-                st.error("A Delivery Order with this serial already exists.")
-            else:
-                stored_path = None
-                if uploaded_pdf is not None:
-                    saved = save_uploaded_file(uploaded_pdf, DELIVERY_ORDER_DIR, filename=f"{serial}.pdf")
-                    if saved:
-                        try:
-                            stored_path = str(saved.relative_to(BASE_DIR))
-                        except ValueError:
-                            stored_path = str(saved)
-                conn.execute(
-                    "INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        serial,
-                        int(selected_customer) if selected_customer else None,
-                        None,
-                        clean_text(description),
-                        clean_text(sales_person),
-                        stored_path,
-                    ),
-                )
-                link_delivery_order_to_customer(
-                    conn,
-                    serial,
-                    int(selected_customer) if selected_customer else None,
-                )
-                conn.commit()
-                st.success("Delivery Order saved.")
-                _safe_rerun()
-
-    do_df = df_query(
-        conn,
-        """
-        SELECT d.do_number, c.name AS customer, d.description, d.sales_person, d.created_at, d.file_path, d.order_id
-        FROM delivery_orders d
-        LEFT JOIN customers c ON c.customer_id = d.customer_id
-        ORDER BY datetime(d.created_at) DESC
-        """,
-    )
-    if not do_df.empty:
-        display = do_df.copy()
-        display = fmt_dates(display, ["created_at"])
-        display.rename(
-            columns={
-                "do_number": "DO Serial",
-                "customer": "Customer",
-                "description": "Description",
-                "sales_person": "Sales person",
-                "created_at": "Created",
-            },
-            inplace=True,
-        )
-        st.markdown("### Recorded Delivery Orders")
-        st.dataframe(
-            display.drop(columns=["file_path", "order_id"], errors="ignore"),
-            use_container_width=True,
-        )
-
-        downloadable = do_df.to_dict("records")
-        with st.expander("Delivery Order files", expanded=False):
-            has_files = False
-            for record in downloadable:
-                path = resolve_upload_path(record.get("file_path"))
-                if path and path.exists():
-                    has_files = True
-                    st.download_button(
-                        f"Download {record['do_number']}",
-                        data=path.read_bytes(),
-                        file_name=path.name,
-                        key=f"do_dl_{record['do_number']}",
-                    )
-            if not has_files:
-                st.info("No Delivery Order files uploaded yet.")
-    else:
-        st.info("No Delivery Orders recorded yet.")
-
-
-def services_page(conn):
-    st.subheader("🛠️ Service Records")
+def _render_service_section(conn, *, show_heading: bool = True):
+    if show_heading:
+        st.subheader("🛠️ Service Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
     customer_options, customer_labels, _, label_by_id = fetch_customer_choices(conn)
     do_df = df_query(
@@ -2236,6 +2208,7 @@ def services_page(conn):
             )
         service_date = st.date_input("Service date", value=datetime.now().date())
         description = st.text_area("Service description")
+        status_value = status_input_widget("service_new", DEFAULT_SERVICE_STATUS)
         remarks = st.text_area("Remarks / updates")
         service_files = st.file_uploader(
             "Attach service documents (PDF)",
@@ -2253,12 +2226,13 @@ def services_page(conn):
             selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO services (do_number, customer_id, service_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO services (do_number, customer_id, service_date, description, status, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     selected_do,
                     selected_customer,
                     service_date.strftime("%Y-%m-%d") if service_date else None,
                     clean_text(description),
+                    status_value,
                     clean_text(remarks),
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
@@ -2288,6 +2262,7 @@ def services_page(conn):
                s.do_number,
                s.service_date,
                s.description,
+               s.status,
                s.remarks,
                s.updated_at,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
@@ -2305,11 +2280,14 @@ def services_page(conn):
         service_df = fmt_dates(service_df, ["service_date"])
         service_df["Last update"] = pd.to_datetime(service_df.get("updated_at"), errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
         service_df.loc[service_df["Last update"].isna(), "Last update"] = None
+        if "status" in service_df.columns:
+            service_df["status"] = service_df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
         display = service_df.rename(
             columns={
                 "do_number": "DO Serial",
                 "service_date": "Service date",
                 "description": "Description",
+                "status": "Status",
                 "remarks": "Remarks",
                 "customer": "Customer",
                 "doc_count": "Documents",
@@ -2322,7 +2300,7 @@ def services_page(conn):
         )
 
         records = service_df.to_dict("records")
-        st.markdown("#### Update remarks")
+        st.markdown("#### Update status & remarks")
         options = [int(r["service_id"]) for r in records]
         def service_label(record):
             do_ref = clean_text(record.get("do_number")) or "(no DO)"
@@ -2342,18 +2320,25 @@ def services_page(conn):
             format_func=lambda rid: labels.get(rid, str(rid)),
         )
         selected_record = next(r for r in records if int(r["service_id"]) == int(selected_service_id))
+        new_status = status_input_widget(
+            f"service_edit_{selected_service_id}", selected_record.get("status")
+        )
         new_remarks = st.text_area(
             "Remarks",
             value=clean_text(selected_record.get("remarks")) or "",
             key=f"service_edit_{selected_service_id}",
         )
-        if st.button("Save remarks", key="save_service_remarks"):
+        if st.button("Save updates", key="save_service_updates"):
             conn.execute(
-                "UPDATE services SET remarks = ?, updated_at = datetime('now') WHERE service_id = ?",
-                (clean_text(new_remarks), int(selected_service_id)),
+                "UPDATE services SET status = ?, remarks = ?, updated_at = datetime('now') WHERE service_id = ?",
+                (
+                    new_status,
+                    clean_text(new_remarks),
+                    int(selected_service_id),
+                ),
             )
             conn.commit()
-            st.success("Service remarks updated.")
+            st.success("Service record updated.")
             _safe_rerun()
 
         attachments_df = df_query(
@@ -2413,8 +2398,9 @@ def services_page(conn):
         st.info("No service records yet. Log one using the form above.")
 
 
-def maintenance_page(conn):
-    st.subheader("🔧 Maintenance Records")
+def _render_maintenance_section(conn, *, show_heading: bool = True):
+    if show_heading:
+        st.subheader("🔧 Maintenance Records")
     _, customer_label_map = build_customer_groups(conn, only_complete=False)
     customer_options, customer_labels, _, label_by_id = fetch_customer_choices(conn)
     do_df = df_query(
@@ -2485,6 +2471,7 @@ def maintenance_page(conn):
             )
         maintenance_date = st.date_input("Maintenance date", value=datetime.now().date())
         description = st.text_area("Maintenance description")
+        status_value = status_input_widget("maintenance_new", DEFAULT_SERVICE_STATUS)
         remarks = st.text_area("Remarks / updates")
         maintenance_files = st.file_uploader(
             "Attach maintenance documents (PDF)",
@@ -2502,12 +2489,13 @@ def maintenance_page(conn):
             selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, status, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     selected_do,
                     selected_customer,
                     maintenance_date.strftime("%Y-%m-%d") if maintenance_date else None,
                     clean_text(description),
+                    status_value,
                     clean_text(remarks),
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
@@ -2537,6 +2525,7 @@ def maintenance_page(conn):
                m.do_number,
                m.maintenance_date,
                m.description,
+               m.status,
                m.remarks,
                m.updated_at,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
@@ -2554,11 +2543,14 @@ def maintenance_page(conn):
         maintenance_df = fmt_dates(maintenance_df, ["maintenance_date"])
         maintenance_df["Last update"] = pd.to_datetime(maintenance_df.get("updated_at"), errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
         maintenance_df.loc[maintenance_df["Last update"].isna(), "Last update"] = None
+        if "status" in maintenance_df.columns:
+            maintenance_df["status"] = maintenance_df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
         display = maintenance_df.rename(
             columns={
                 "do_number": "DO Serial",
                 "maintenance_date": "Maintenance date",
                 "description": "Description",
+                "status": "Status",
                 "remarks": "Remarks",
                 "customer": "Customer",
                 "doc_count": "Documents",
@@ -2571,7 +2563,7 @@ def maintenance_page(conn):
         )
 
         records = maintenance_df.to_dict("records")
-        st.markdown("#### Update remarks")
+        st.markdown("#### Update status & remarks")
         options = [int(r["maintenance_id"]) for r in records]
         def maintenance_label(record):
             do_ref = clean_text(record.get("do_number")) or "(no DO)"
@@ -2591,18 +2583,26 @@ def maintenance_page(conn):
             format_func=lambda rid: labels.get(rid, str(rid)),
         )
         selected_record = next(r for r in records if int(r["maintenance_id"]) == int(selected_maintenance_id))
+        new_status = status_input_widget(
+            f"maintenance_edit_{selected_maintenance_id}",
+            selected_record.get("status"),
+        )
         new_remarks = st.text_area(
             "Remarks",
             value=clean_text(selected_record.get("remarks")) or "",
             key=f"maintenance_edit_{selected_maintenance_id}",
         )
-        if st.button("Save maintenance remarks", key="save_maintenance_remarks"):
+        if st.button("Save maintenance updates", key="save_maintenance_updates"):
             conn.execute(
-                "UPDATE maintenance_records SET remarks = ?, updated_at = datetime('now') WHERE maintenance_id = ?",
-                (clean_text(new_remarks), int(selected_maintenance_id)),
+                "UPDATE maintenance_records SET status = ?, remarks = ?, updated_at = datetime('now') WHERE maintenance_id = ?",
+                (
+                    new_status,
+                    clean_text(new_remarks),
+                    int(selected_maintenance_id),
+                ),
             )
             conn.commit()
-            st.success("Maintenance remarks updated.")
+            st.success("Maintenance record updated.")
             _safe_rerun()
 
         attachments_df = df_query(
@@ -2660,6 +2660,15 @@ def maintenance_page(conn):
                 st.info("Select at least one PDF to upload.")
     else:
         st.info("No maintenance records yet. Log one using the form above.")
+
+
+def service_maintenance_page(conn):
+    st.subheader("🛠️ Service & Maintenance")
+    service_tab, maintenance_tab = st.tabs(["Service", "Maintenance"])
+    with service_tab:
+        _render_service_section(conn, show_heading=False)
+    with maintenance_tab:
+        _render_maintenance_section(conn, show_heading=False)
 
 
 def customer_summary_page(conn):
@@ -4268,12 +4277,10 @@ def main():
                 "Import",
                 "Duplicates",
                 "Users (Admin)",
-                "Delivery Orders",
-                "Service",
-                "Maintenance",
+                "Service & Maintenance",
             ]
         else:
-            pages = ["Dashboard", "Warranties", "Delivery Orders", "Import", "Service", "Maintenance"]
+            pages = ["Dashboard", "Warranties", "Import", "Service & Maintenance"]
         if st.session_state.page not in pages:
             st.session_state.page = pages[0]
         current_index = pages.index(st.session_state.page)
@@ -4298,12 +4305,8 @@ def main():
         duplicates_page(conn)
     elif page == "Users (Admin)":
         users_admin_page(conn)
-    elif page == "Delivery Orders":
-        delivery_orders_page(conn)
-    elif page == "Service":
-        services_page(conn)
-    elif page == "Maintenance":
-        maintenance_page(conn)
+    elif page == "Service & Maintenance":
+        service_maintenance_page(conn)
 
 if _streamlit_runtime_active():
     main()
