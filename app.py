@@ -4,7 +4,7 @@ import re
 import sqlite3
 import hashlib
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -333,6 +333,88 @@ def format_period_label(
             return start_clean
         return f"{start_clean}{joiner}{end_clean}"
     return start_clean or end_clean
+
+
+def get_status_choice(prefix: str, fallback: str = DEFAULT_SERVICE_STATUS) -> str:
+    choice = st.session_state.get(f"{prefix}_status_choice", fallback)
+    if isinstance(choice, str) and choice in SERVICE_STATUS_OPTIONS:
+        return choice
+    return fallback
+
+
+def ensure_date(value) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime().date()
+    except Exception:
+        pass
+    try:
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    except Exception:
+        parsed = None
+    if parsed is None or pd.isna(parsed):
+        return None
+    if isinstance(parsed, pd.DatetimeIndex) and len(parsed) > 0:
+        parsed = parsed[0]
+    if isinstance(parsed, datetime):
+        return parsed.date()
+    try:
+        return parsed.to_pydatetime().date()
+    except Exception:
+        return None
+
+
+def determine_period_dates(
+    status_choice: str, raw_value
+) -> tuple[Optional[date], Optional[date], Optional[date]]:
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    if status_choice == "Completed":
+        raw_items: list[Optional[date]]
+        if isinstance(raw_value, (list, tuple)):
+            raw_items = [ensure_date(v) for v in raw_value]
+        else:
+            raw_items = [ensure_date(raw_value)]
+        clean_items = [item for item in raw_items if item is not None]
+        if clean_items:
+            start_date = clean_items[0]
+            end_date = clean_items[-1]
+            if end_date is None:
+                end_date = start_date
+            if start_date and end_date and end_date < start_date:
+                start_date, end_date = end_date, start_date
+    else:
+        if isinstance(raw_value, (list, tuple)):
+            raw_value = raw_value[0] if raw_value else None
+        start_date = ensure_date(raw_value)
+        end_date = None
+    primary_date = start_date or end_date
+    return primary_date, start_date, end_date
+
+
+def determine_period_strings(
+    status_choice: str, raw_value
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    primary_date, start_date, end_date = determine_period_dates(status_choice, raw_value)
+
+    def _to_str(value: Optional[date]) -> Optional[str]:
+        return value.strftime("%Y-%m-%d") if value else None
+
+    return _to_str(primary_date), _to_str(start_date), _to_str(end_date)
+
+
+def is_pending_status(status: Optional[str]) -> bool:
+    text = clean_text(status)
+    if not text:
+        return True
+    normalized = text.lower()
+    return normalized not in {"completed", "in progress"}
 
 
 def status_input_widget(prefix: str, default_status: Optional[str] = None) -> str:
@@ -1653,56 +1735,212 @@ def show_expiry_notifications(conn):
     if not st.session_state.get("just_logged_in"):
         return
 
+    scheduled_services = df_query(
+        conn,
+        """
+        SELECT s.service_id,
+               s.do_number,
+               COALESCE(s.service_start_date, s.service_date) AS start_date,
+               s.status,
+               s.description,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+        FROM services s
+        LEFT JOIN customers c ON c.customer_id = s.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = s.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        WHERE COALESCE(s.service_start_date, s.service_date) IS NOT NULL
+          AND date(COALESCE(s.service_start_date, s.service_date)) = date('now')
+        ORDER BY datetime(COALESCE(s.service_start_date, s.service_date)) ASC, s.service_id ASC
+        """,
+    )
+    scheduled_maintenance = df_query(
+        conn,
+        """
+        SELECT m.maintenance_id,
+               m.do_number,
+               COALESCE(m.maintenance_start_date, m.maintenance_date) AS start_date,
+               m.status,
+               m.description,
+               COALESCE(c.name, cdo.name, '(unknown)') AS customer
+        FROM maintenance_records m
+        LEFT JOIN customers c ON c.customer_id = m.customer_id
+        LEFT JOIN delivery_orders d ON d.do_number = m.do_number
+        LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
+        WHERE COALESCE(m.maintenance_start_date, m.maintenance_date) IS NOT NULL
+          AND date(COALESCE(m.maintenance_start_date, m.maintenance_date)) = date('now')
+        ORDER BY datetime(COALESCE(m.maintenance_start_date, m.maintenance_date)) ASC, m.maintenance_id ASC
+        """,
+    )
+
+    if not scheduled_services.empty:
+        scheduled_services = scheduled_services[
+            scheduled_services["status"].apply(is_pending_status)
+        ]
+    if not scheduled_maintenance.empty:
+        scheduled_maintenance = scheduled_maintenance[
+            scheduled_maintenance["status"].apply(is_pending_status)
+        ]
+
+    scheduled_services = fmt_dates(scheduled_services, ["start_date"])
+    scheduled_maintenance = fmt_dates(scheduled_maintenance, ["start_date"])
+
+    upcoming_sections: list[pd.DataFrame] = []
+    upcoming_messages: list[str] = []
+
+    if not scheduled_services.empty:
+        service_records = scheduled_services.to_dict("records")
+        for record in service_records:
+            do_ref = clean_text(record.get("do_number"))
+            if not do_ref:
+                try:
+                    service_identifier = int(record.get("service_id"))
+                    do_ref = f"Service #{service_identifier}"
+                except Exception:
+                    do_ref = "Service"
+            customer_ref = clean_text(record.get("customer")) or "(unknown)"
+            start_label = clean_text(record.get("start_date")) or datetime.now().strftime(DATE_FMT)
+            upcoming_messages.append(
+                f"Service {do_ref} for {customer_ref} starts today ({start_label})."
+            )
+        service_display = scheduled_services.copy()
+        service_display = service_display.rename(
+            columns={
+                "do_number": "DO Serial",
+                "start_date": "Start date",
+                "status": "Status",
+                "description": "Description",
+                "customer": "Customer",
+            }
+        )
+        service_display.insert(0, "Type", "Service")
+        service_display = service_display.drop(columns=["service_id"], errors="ignore")
+        upcoming_sections.append(
+            service_display[[
+                "Type",
+                "DO Serial",
+                "Customer",
+                "Start date",
+                "Status",
+                "Description",
+            ]]
+        )
+
+    if not scheduled_maintenance.empty:
+        maintenance_records = scheduled_maintenance.to_dict("records")
+        for record in maintenance_records:
+            do_ref = clean_text(record.get("do_number"))
+            if not do_ref:
+                try:
+                    maintenance_identifier = int(record.get("maintenance_id"))
+                    do_ref = f"Maintenance #{maintenance_identifier}"
+                except Exception:
+                    do_ref = "Maintenance"
+            customer_ref = clean_text(record.get("customer")) or "(unknown)"
+            start_label = clean_text(record.get("start_date")) or datetime.now().strftime(DATE_FMT)
+            upcoming_messages.append(
+                f"Maintenance {do_ref} for {customer_ref} starts today ({start_label})."
+            )
+        maintenance_display = scheduled_maintenance.copy()
+        maintenance_display = maintenance_display.rename(
+            columns={
+                "do_number": "DO Serial",
+                "start_date": "Start date",
+                "status": "Status",
+                "description": "Description",
+                "customer": "Customer",
+            }
+        )
+        maintenance_display.insert(0, "Type", "Maintenance")
+        maintenance_display = maintenance_display.drop(columns=["maintenance_id"], errors="ignore")
+        upcoming_sections.append(
+            maintenance_display[[
+                "Type",
+                "DO Serial",
+                "Customer",
+                "Start date",
+                "Status",
+                "Description",
+            ]]
+        )
+
+    upcoming_df = (
+        pd.concat(upcoming_sections, ignore_index=True)
+        if upcoming_sections
+        else pd.DataFrame()
+    )
+
     total_expired = int(
         df_query(
             conn,
             "SELECT COUNT(*) c FROM warranties WHERE date(expiry_date) < date('now')",
         ).iloc[0]["c"]
     )
-    if total_expired == 0:
-        st.session_state.just_logged_in = False
-        return
-    month_expired = int(
-        df_query(
+    month_expired = 0
+    formatted = pd.DataFrame()
+    if total_expired > 0:
+        month_expired = int(
+            df_query(
+                conn,
+                """
+                SELECT COUNT(*) c
+                FROM warranties
+                WHERE date(expiry_date) < date('now')
+                  AND strftime('%Y-%m', expiry_date) = strftime('%Y-%m', 'now')
+                """,
+            ).iloc[0]["c"]
+        )
+        expired_recent = df_query(
             conn,
             """
-            SELECT COUNT(*) c
-            FROM warranties
-            WHERE date(expiry_date) < date('now')
-              AND strftime('%Y-%m', expiry_date) = strftime('%Y-%m', 'now')
+            SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            LEFT JOIN products p ON p.product_id = w.product_id
+            WHERE date(w.expiry_date) < date('now')
+            ORDER BY date(w.expiry_date) DESC
+            LIMIT 12
             """,
-        ).iloc[0]["c"]
-    )
-    expired_recent = df_query(
-        conn,
-        """
-        SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
-        FROM warranties w
-        LEFT JOIN customers c ON c.customer_id = w.customer_id
-        LEFT JOIN products p ON p.product_id = w.product_id
-        WHERE date(w.expiry_date) < date('now')
-        ORDER BY date(w.expiry_date) DESC
-        LIMIT 12
-        """,
-    )
-    formatted = format_warranty_table(expired_recent)
+        )
+        formatted = format_warranty_table(expired_recent)
+
+    show_upcoming = not upcoming_df.empty
+    show_expired = total_expired > 0
+
+    if not show_upcoming and not show_expired:
+        st.session_state.just_logged_in = False
+        return
+
     try:
-        with st.modal("Expired warranties alert"):
-            st.markdown("### Warranties needing attention")
-            st.write(
-                f"Total expired: **{total_expired}**, expired this month: **{month_expired}**."
-            )
-            if formatted is None or formatted.empty:
-                st.info("No expired warranties found.")
-            else:
-                st.dataframe(formatted, use_container_width=True)
+        with st.modal("Daily alerts"):
+            if show_upcoming:
+                st.markdown("### Work starting today")
+                st.dataframe(upcoming_df, use_container_width=True)
+            if show_expired:
+                st.markdown("### Warranties needing attention")
+                st.write(
+                    f"Total expired: **{total_expired}**, expired this month: **{month_expired}**."
+                )
+                if formatted is None or formatted.empty:
+                    st.info("No expired warranties found.")
+                else:
+                    st.dataframe(formatted, use_container_width=True)
     except Exception:
-        if total_expired > 0:
+        if show_upcoming:
+            st.warning(
+                f"{len(upcoming_df)} scheduled service/maintenance task(s) start today."
+            )
+        if show_expired:
             st.warning(
                 f"{total_expired} warranties are past expiry. {month_expired} expired this month."
             )
+
     try:
-        if total_expired > 0:
+        for message in upcoming_messages:
+            st.toast(message)
+    except Exception:
+        pass
+    try:
+        if show_expired:
             st.toast(f"{total_expired} warranties require attention.")
     except Exception:
         pass
@@ -2323,14 +2561,31 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                 key=state_key,
             )
-        today = datetime.now().date()
-        service_period_value = st.date_input(
-            "Service period",
-            value=(today, today),
-            help="Select the start and end dates for the service visit.",
-        )
-        description = st.text_area("Service description")
         status_value = status_input_widget("service_new", DEFAULT_SERVICE_STATUS)
+        status_choice = get_status_choice("service_new")
+        today = datetime.now().date()
+        if status_choice == "Completed":
+            service_period_value = st.date_input(
+                "Service period",
+                value=(today, today),
+                help="Select the start and end dates for the completed service.",
+                key="service_new_period_completed",
+            )
+        elif status_choice == "In progress":
+            service_period_value = st.date_input(
+                "Service start date",
+                value=today,
+                help="Choose when this service work began.",
+                key="service_new_period_start",
+            )
+        else:
+            service_period_value = st.date_input(
+                "Planned start date",
+                value=today,
+                help="Select when this service is scheduled to begin.",
+                key="service_new_period_planned",
+            )
+        description = st.text_area("Service description")
         remarks = st.text_area("Remarks / updates")
         service_product_count = st.number_input(
             "Products sold during service",
@@ -2391,78 +2646,72 @@ def _render_service_section(conn, *, show_heading: bool = True):
             selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
             selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
-            if isinstance(service_period_value, (list, tuple)):
-                if len(service_period_value) >= 1:
-                    service_start_date = service_period_value[0]
-                    service_end_date = (
-                        service_period_value[-1]
-                        if len(service_period_value) > 1
-                        else service_period_value[0]
-                    )
-                else:
-                    service_start_date = service_end_date = None
-            else:
-                service_start_date = service_end_date = service_period_value
-            if service_start_date and service_end_date and service_end_date < service_start_date:
-                service_start_date, service_end_date = service_end_date, service_start_date
-            service_start_str = (
-                service_start_date.strftime("%Y-%m-%d") if service_start_date else None
-            )
-            service_end_str = (
-                service_end_date.strftime("%Y-%m-%d") if service_end_date else None
-            )
-            service_date_str = service_start_str or service_end_str
-            _cleaned_service_products, service_product_labels = normalize_product_entries(
-                service_product_entries
-            )
-            service_product_label = (
-                "\n".join(service_product_labels) if service_product_labels else None
-            )
-            cur.execute(
-                """
-                INSERT INTO services (
-                    do_number,
-                    customer_id,
-                    service_date,
-                    service_start_date,
-                    service_end_date,
-                    description,
-                    status,
-                    remarks,
-                    service_product_info,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    selected_do,
-                    selected_customer,
-                    service_date_str,
-                    service_start_str,
-                    service_end_str,
-                    clean_text(description),
-                    status_value,
-                    clean_text(remarks),
-                    service_product_label,
-                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                ),
-            )
-            service_id = cur.lastrowid
-            link_delivery_order_to_customer(conn, selected_do, selected_customer)
-            saved_docs = attach_documents(
-                conn,
-                "service_documents",
-                "service_id",
-                service_id,
-                service_files,
-                SERVICE_DOCS_DIR,
-                f"service_{service_id}",
-            )
-            conn.commit()
-            message = "Service record saved."
-            if saved_docs:
-                message = f"{message} Attached {saved_docs} document(s)."
-            st.success(message)
-            _safe_rerun()
+            (
+                service_date_str,
+                service_start_str,
+                service_end_str,
+            ) = determine_period_strings(status_choice, service_period_value)
+            valid_entry = True
+            if status_choice == "Completed" and (
+                not service_start_str or not service_end_str
+            ):
+                st.error("Start and end dates are required for completed services.")
+                valid_entry = False
+            if status_choice != "Completed" and not service_start_str:
+                st.error("Select a start date for this service entry.")
+                valid_entry = False
+            if valid_entry:
+                _cleaned_service_products, service_product_labels = normalize_product_entries(
+                    service_product_entries
+                )
+                service_product_label = (
+                    "\n".join(service_product_labels) if service_product_labels else None
+                )
+                cur.execute(
+                    """
+                    INSERT INTO services (
+                        do_number,
+                        customer_id,
+                        service_date,
+                        service_start_date,
+                        service_end_date,
+                        description,
+                        status,
+                        remarks,
+                        service_product_info,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        selected_do,
+                        selected_customer,
+                        service_date_str,
+                        service_start_str,
+                        service_end_str,
+                        clean_text(description),
+                        status_value,
+                        clean_text(remarks),
+                        service_product_label,
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+                service_id = cur.lastrowid
+                link_delivery_order_to_customer(conn, selected_do, selected_customer)
+                saved_docs = attach_documents(
+                    conn,
+                    "service_documents",
+                    "service_id",
+                    service_id,
+                    service_files,
+                    SERVICE_DOCS_DIR,
+                    f"service_{service_id}",
+                )
+                conn.commit()
+                message = "Service record saved."
+                if saved_docs:
+                    message = f"{message} Attached {saved_docs} document(s)."
+                st.success(message)
+                _safe_rerun()
 
     service_df = df_query(
         conn,
@@ -2547,23 +2796,79 @@ def _render_service_section(conn, *, show_heading: bool = True):
         new_status = status_input_widget(
             f"service_edit_{selected_service_id}", selected_record.get("status")
         )
+        edit_status_choice = get_status_choice(f"service_edit_{selected_service_id}")
+        existing_start = ensure_date(selected_record.get("service_start_date")) or ensure_date(
+            selected_record.get("service_date")
+        )
+        existing_end = ensure_date(selected_record.get("service_end_date")) or existing_start
+        today = datetime.now().date()
+        default_start = existing_start or today
+        default_end = existing_end or default_start
+        if edit_status_choice == "Completed":
+            edit_period_value = st.date_input(
+                "Service period",
+                value=(default_start, default_end),
+                key=f"service_edit_{selected_service_id}_period_completed",
+                help="Update the start and end dates for this service.",
+            )
+        elif edit_status_choice == "In progress":
+            edit_period_value = st.date_input(
+                "Service start date",
+                value=default_start,
+                key=f"service_edit_{selected_service_id}_period_start",
+                help="Adjust when this service began.",
+            )
+        else:
+            edit_period_value = st.date_input(
+                "Planned start date",
+                value=default_start,
+                key=f"service_edit_{selected_service_id}_period_planned",
+                help="Adjust when this service is scheduled to begin.",
+            )
         new_remarks = st.text_area(
             "Remarks",
             value=clean_text(selected_record.get("remarks")) or "",
             key=f"service_edit_{selected_service_id}",
         )
         if st.button("Save updates", key="save_service_updates"):
-            conn.execute(
-                "UPDATE services SET status = ?, remarks = ?, updated_at = datetime('now') WHERE service_id = ?",
-                (
-                    new_status,
-                    clean_text(new_remarks),
-                    int(selected_service_id),
-                ),
-            )
-            conn.commit()
-            st.success("Service record updated.")
-            _safe_rerun()
+            (
+                service_date_str,
+                service_start_str,
+                service_end_str,
+            ) = determine_period_strings(edit_status_choice, edit_period_value)
+            valid_update = True
+            if edit_status_choice == "Completed" and (
+                not service_start_str or not service_end_str
+            ):
+                st.error("Provide both start and end dates for completed services.")
+                valid_update = False
+            if edit_status_choice != "Completed" and not service_start_str:
+                st.error("Select a start date for this service entry.")
+                valid_update = False
+            if valid_update:
+                conn.execute(
+                    """
+                    UPDATE services
+                    SET status = ?,
+                        remarks = ?,
+                        service_date = ?,
+                        service_start_date = ?,
+                        service_end_date = ?,
+                        updated_at = datetime('now')
+                    WHERE service_id = ?
+                    """,
+                    (
+                        new_status,
+                        clean_text(new_remarks),
+                        service_date_str,
+                        service_start_str,
+                        service_end_str,
+                        int(selected_service_id),
+                    ),
+                )
+                conn.commit()
+                st.success("Service record updated.")
+                _safe_rerun()
 
         attachments_df = df_query(
             conn,
@@ -2693,14 +2998,31 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                 key=state_key,
             )
-        today = datetime.now().date()
-        maintenance_period_value = st.date_input(
-            "Maintenance period",
-            value=(today, today),
-            help="Select when this maintenance work started and finished.",
-        )
-        description = st.text_area("Maintenance description")
         status_value = status_input_widget("maintenance_new", DEFAULT_SERVICE_STATUS)
+        maintenance_status_choice = get_status_choice("maintenance_new")
+        today = datetime.now().date()
+        if maintenance_status_choice == "Completed":
+            maintenance_period_value = st.date_input(
+                "Maintenance period",
+                value=(today, today),
+                help="Select the start and end dates for the maintenance work.",
+                key="maintenance_new_period_completed",
+            )
+        elif maintenance_status_choice == "In progress":
+            maintenance_period_value = st.date_input(
+                "Maintenance start date",
+                value=today,
+                help="Choose when this maintenance began.",
+                key="maintenance_new_period_start",
+            )
+        else:
+            maintenance_period_value = st.date_input(
+                "Planned start date",
+                value=today,
+                help="Select when this maintenance is scheduled to begin.",
+                key="maintenance_new_period_planned",
+            )
+        description = st.text_area("Maintenance description")
         remarks = st.text_area("Remarks / updates")
         maintenance_product_count = st.number_input(
             "Products sold during maintenance",
@@ -2761,91 +3083,79 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
             selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
-            if isinstance(maintenance_period_value, (list, tuple)):
-                if len(maintenance_period_value) >= 1:
-                    maintenance_start_date = maintenance_period_value[0]
-                    maintenance_end_date = (
-                        maintenance_period_value[-1]
-                        if len(maintenance_period_value) > 1
-                        else maintenance_period_value[0]
-                    )
-                else:
-                    maintenance_start_date = maintenance_end_date = None
-            else:
-                maintenance_start_date = maintenance_end_date = maintenance_period_value
-            if (
-                maintenance_start_date
-                and maintenance_end_date
-                and maintenance_end_date < maintenance_start_date
+            (
+                maintenance_date_str,
+                maintenance_start_str,
+                maintenance_end_str,
+            ) = determine_period_strings(
+                maintenance_status_choice, maintenance_period_value
+            )
+            valid_entry = True
+            if maintenance_status_choice == "Completed" and (
+                not maintenance_start_str or not maintenance_end_str
             ):
-                maintenance_start_date, maintenance_end_date = (
-                    maintenance_end_date,
-                    maintenance_start_date,
+                st.error("Start and end dates are required for completed maintenance work.")
+                valid_entry = False
+            if (
+                maintenance_status_choice != "Completed"
+                and not maintenance_start_str
+            ):
+                st.error("Select a start date for this maintenance entry.")
+                valid_entry = False
+            if valid_entry:
+                _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
+                    maintenance_product_entries
                 )
-            maintenance_start_str = (
-                maintenance_start_date.strftime("%Y-%m-%d")
-                if maintenance_start_date
-                else None
-            )
-            maintenance_end_str = (
-                maintenance_end_date.strftime("%Y-%m-%d")
-                if maintenance_end_date
-                else None
-            )
-            maintenance_date_str = maintenance_start_str or maintenance_end_str
-            _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
-                maintenance_product_entries
-            )
-            maintenance_product_label = (
-                "\n".join(maintenance_product_labels)
-                if maintenance_product_labels
-                else None
-            )
-            cur.execute(
-                """
-                INSERT INTO maintenance_records (
-                    do_number,
-                    customer_id,
-                    maintenance_date,
-                    maintenance_start_date,
-                    maintenance_end_date,
-                    description,
-                    status,
-                    remarks,
-                    maintenance_product_info,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    selected_do,
-                    selected_customer,
-                    maintenance_date_str,
-                    maintenance_start_str,
-                    maintenance_end_str,
-                    clean_text(description),
-                    status_value,
-                    clean_text(remarks),
-                    maintenance_product_label,
-                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                ),
-            )
-            maintenance_id = cur.lastrowid
-            link_delivery_order_to_customer(conn, selected_do, selected_customer)
-            saved_docs = attach_documents(
-                conn,
-                "maintenance_documents",
-                "maintenance_id",
-                maintenance_id,
-                maintenance_files,
-                MAINTENANCE_DOCS_DIR,
-                f"maintenance_{maintenance_id}",
-            )
-            conn.commit()
-            message = "Maintenance record saved."
-            if saved_docs:
-                message = f"{message} Attached {saved_docs} document(s)."
-            st.success(message)
-            _safe_rerun()
+                maintenance_product_label = (
+                    "\n".join(maintenance_product_labels)
+                    if maintenance_product_labels
+                    else None
+                )
+                cur.execute(
+                    """
+                    INSERT INTO maintenance_records (
+                        do_number,
+                        customer_id,
+                        maintenance_date,
+                        maintenance_start_date,
+                        maintenance_end_date,
+                        description,
+                        status,
+                        remarks,
+                        maintenance_product_info,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        selected_do,
+                        selected_customer,
+                        maintenance_date_str,
+                        maintenance_start_str,
+                        maintenance_end_str,
+                        clean_text(description),
+                        status_value,
+                        clean_text(remarks),
+                        maintenance_product_label,
+                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+                maintenance_id = cur.lastrowid
+                link_delivery_order_to_customer(conn, selected_do, selected_customer)
+                saved_docs = attach_documents(
+                    conn,
+                    "maintenance_documents",
+                    "maintenance_id",
+                    maintenance_id,
+                    maintenance_files,
+                    MAINTENANCE_DOCS_DIR,
+                    f"maintenance_{maintenance_id}",
+                )
+                conn.commit()
+                message = "Maintenance record saved."
+                if saved_docs:
+                    message = f"{message} Attached {saved_docs} document(s)."
+                st.success(message)
+                _safe_rerun()
 
     maintenance_df = df_query(
         conn,
@@ -2934,23 +3244,85 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             f"maintenance_edit_{selected_maintenance_id}",
             selected_record.get("status"),
         )
+        maintenance_edit_choice = get_status_choice(
+            f"maintenance_edit_{selected_maintenance_id}"
+        )
+        existing_start = ensure_date(selected_record.get("maintenance_start_date")) or ensure_date(
+            selected_record.get("maintenance_date")
+        )
+        existing_end = ensure_date(selected_record.get("maintenance_end_date")) or existing_start
+        today = datetime.now().date()
+        default_start = existing_start or today
+        default_end = existing_end or default_start
+        if maintenance_edit_choice == "Completed":
+            maintenance_period_edit = st.date_input(
+                "Maintenance period",
+                value=(default_start, default_end),
+                key=f"maintenance_edit_{selected_maintenance_id}_period_completed",
+                help="Update the start and end dates for this maintenance record.",
+            )
+        elif maintenance_edit_choice == "In progress":
+            maintenance_period_edit = st.date_input(
+                "Maintenance start date",
+                value=default_start,
+                key=f"maintenance_edit_{selected_maintenance_id}_period_start",
+                help="Adjust when this maintenance began.",
+            )
+        else:
+            maintenance_period_edit = st.date_input(
+                "Planned start date",
+                value=default_start,
+                key=f"maintenance_edit_{selected_maintenance_id}_period_planned",
+                help="Adjust when this maintenance is scheduled to begin.",
+            )
         new_remarks = st.text_area(
             "Remarks",
             value=clean_text(selected_record.get("remarks")) or "",
             key=f"maintenance_edit_{selected_maintenance_id}",
         )
         if st.button("Save maintenance updates", key="save_maintenance_updates"):
-            conn.execute(
-                "UPDATE maintenance_records SET status = ?, remarks = ?, updated_at = datetime('now') WHERE maintenance_id = ?",
-                (
-                    new_status,
-                    clean_text(new_remarks),
-                    int(selected_maintenance_id),
-                ),
+            (
+                maintenance_date_str,
+                maintenance_start_str,
+                maintenance_end_str,
+            ) = determine_period_strings(
+                maintenance_edit_choice, maintenance_period_edit
             )
-            conn.commit()
-            st.success("Maintenance record updated.")
-            _safe_rerun()
+            valid_update = True
+            if maintenance_edit_choice == "Completed" and (
+                not maintenance_start_str or not maintenance_end_str
+            ):
+                st.error(
+                    "Provide both start and end dates for completed maintenance records."
+                )
+                valid_update = False
+            if maintenance_edit_choice != "Completed" and not maintenance_start_str:
+                st.error("Select a start date for this maintenance entry.")
+                valid_update = False
+            if valid_update:
+                conn.execute(
+                    """
+                    UPDATE maintenance_records
+                    SET status = ?,
+                        remarks = ?,
+                        maintenance_date = ?,
+                        maintenance_start_date = ?,
+                        maintenance_end_date = ?,
+                        updated_at = datetime('now')
+                    WHERE maintenance_id = ?
+                    """,
+                    (
+                        new_status,
+                        clean_text(new_remarks),
+                        maintenance_date_str,
+                        maintenance_start_str,
+                        maintenance_end_str,
+                        int(selected_maintenance_id),
+                    ),
+                )
+                conn.commit()
+                st.success("Maintenance record updated.")
+                _safe_rerun()
 
         attachments_df = df_query(
             conn,
