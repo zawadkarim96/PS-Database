@@ -36,12 +36,14 @@ BASE_DIR = Path(os.getenv("APP_STORAGE_DIR", DEFAULT_BASE_DIR))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
 DATE_FMT = "%d-%m-%Y"
+CURRENCY_SYMBOL = os.getenv("APP_CURRENCY_SYMBOL", "₹")
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 DELIVERY_ORDER_DIR = UPLOADS_DIR / "delivery_orders"
 SERVICE_DOCS_DIR = UPLOADS_DIR / "service_documents"
 MAINTENANCE_DOCS_DIR = UPLOADS_DIR / "maintenance_documents"
 CUSTOMER_DOCS_DIR = UPLOADS_DIR / "customer_documents"
+SERVICE_BILL_DIR = UPLOADS_DIR / "service_bills"
 
 REQUIRED_CUSTOMER_FIELDS = {
     "name": "Name",
@@ -51,6 +53,7 @@ REQUIRED_CUSTOMER_FIELDS = {
 
 SERVICE_STATUS_OPTIONS = ["In progress", "Completed", "Haven't started"]
 DEFAULT_SERVICE_STATUS = SERVICE_STATUS_OPTIONS[0]
+GENERATOR_CONDITION_OPTIONS = ["Mint", "Good", "Bad"]
 
 
 def customer_complete_clause(alias: str = "") -> str:
@@ -149,6 +152,10 @@ CREATE TABLE IF NOT EXISTS services (
     status TEXT DEFAULT 'In progress',
     remarks TEXT,
     service_product_info TEXT,
+    condition_status TEXT,
+    condition_remarks TEXT,
+    bill_amount REAL,
+    bill_document_path TEXT,
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(do_number) REFERENCES delivery_orders(do_number) ON DELETE SET NULL,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
@@ -184,6 +191,18 @@ CREATE TABLE IF NOT EXISTS maintenance_documents (
     uploaded_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(maintenance_id) REFERENCES maintenance_records(maintenance_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS customer_notes (
+    note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL,
+    note TEXT,
+    remind_on TEXT,
+    is_done INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_customer_notes_customer ON customer_notes(customer_id);
+CREATE INDEX IF NOT EXISTS idx_customer_notes_remind ON customer_notes(remind_on, is_done);
 CREATE TABLE IF NOT EXISTS import_history (
     import_id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER,
@@ -257,10 +276,34 @@ def ensure_schema_upgrades(conn):
     add_column("services", "service_start_date", "TEXT")
     add_column("services", "service_end_date", "TEXT")
     add_column("services", "service_product_info", "TEXT")
+    add_column("services", "condition_status", "TEXT")
+    add_column("services", "condition_remarks", "TEXT")
+    add_column("services", "bill_amount", "REAL")
+    add_column("services", "bill_document_path", "TEXT")
     add_column("maintenance_records", "status", "TEXT DEFAULT 'In progress'")
     add_column("maintenance_records", "maintenance_start_date", "TEXT")
     add_column("maintenance_records", "maintenance_end_date", "TEXT")
     add_column("maintenance_records", "maintenance_product_info", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_notes (
+            note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            note TEXT,
+            remind_on TEXT,
+            is_done INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_notes_customer ON customer_notes(customer_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_notes_remind ON customer_notes(remind_on, is_done)"
+    )
 
 def df_query(conn, q, params=()):
     return pd.read_sql_query(q, conn, params=params)
@@ -283,6 +326,49 @@ def clean_text(value):
         pass
     value = str(value).strip()
     return value or None
+
+
+def to_iso_date(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        value = stripped
+    if isinstance(value, datetime):
+        return value.date().strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    try:
+        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    except Exception:
+        return None
+    if pd.isna(parsed):
+        return None
+    if isinstance(parsed, pd.DatetimeIndex):
+        if len(parsed) == 0:
+            return None
+        parsed = parsed[0]
+    return pd.Timestamp(parsed).normalize().strftime("%Y-%m-%d")
+
+
+def format_money(value) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    symbol = CURRENCY_SYMBOL.strip()
+    if symbol:
+        return f"{symbol} {amount:,.2f}"
+    return f"{amount:,.2f}"
 
 
 def normalize_product_entries(
@@ -536,6 +622,7 @@ def ensure_upload_dirs():
         SERVICE_DOCS_DIR,
         MAINTENANCE_DOCS_DIR,
         CUSTOMER_DOCS_DIR,
+        SERVICE_BILL_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -1016,6 +1103,10 @@ def _build_services_export(conn) -> pd.DataFrame:
                s.description,
                s.status,
                s.remarks,
+               s.condition_status,
+               s.condition_remarks,
+               s.bill_amount,
+               s.bill_document_path,
                s.updated_at
         FROM services s
         LEFT JOIN customers c ON c.customer_id = s.customer_id
@@ -1040,6 +1131,10 @@ def _build_services_export(conn) -> pd.DataFrame:
             "description": "Description",
             "status": "Status",
             "remarks": "Remarks",
+            "condition_status": "Condition",
+            "condition_remarks": "Condition notes",
+            "bill_amount": "Bill amount",
+            "bill_document_path": "Bill document",
             "updated_at": "Updated at",
         }
     )
@@ -1787,6 +1882,41 @@ def show_expiry_notifications(conn):
     upcoming_sections: list[pd.DataFrame] = []
     upcoming_messages: list[str] = []
 
+    due_notes = df_query(
+        conn,
+        """
+        SELECT n.note_id,
+               n.note,
+               n.remind_on,
+               c.name AS customer
+        FROM customer_notes n
+        JOIN customers c ON c.customer_id = n.customer_id
+        WHERE n.is_done = 0
+          AND n.remind_on IS NOT NULL
+          AND date(n.remind_on) <= date('now')
+        ORDER BY date(n.remind_on) ASC, datetime(n.created_at) ASC
+        """,
+    )
+    due_notes = fmt_dates(due_notes, ["remind_on"])
+    notes_display = pd.DataFrame()
+    if not due_notes.empty:
+        notes_display = due_notes.rename(
+            columns={
+                "customer": "Customer",
+                "note": "Remark",
+                "remind_on": "Due date",
+            }
+        )[
+            ["Customer", "Remark", "Due date"]
+        ]
+        for record in due_notes.to_dict("records"):
+            customer_ref = clean_text(record.get("customer")) or "(unknown)"
+            note_text = clean_text(record.get("note")) or "Follow-up due"
+            due_label = clean_text(record.get("remind_on")) or datetime.now().strftime(DATE_FMT)
+            upcoming_messages.append(
+                f"Reminder: follow up with {customer_ref} – {note_text} (due {due_label})."
+            )
+
     if not scheduled_services.empty:
         service_records = scheduled_services.to_dict("records")
         for record in service_records:
@@ -1905,8 +2035,9 @@ def show_expiry_notifications(conn):
 
     show_upcoming = not upcoming_df.empty
     show_expired = total_expired > 0
+    show_notes = not notes_display.empty
 
-    if not show_upcoming and not show_expired:
+    if not show_upcoming and not show_expired and not show_notes:
         st.session_state.just_logged_in = False
         return
 
@@ -1915,6 +2046,9 @@ def show_expiry_notifications(conn):
             if show_upcoming:
                 st.markdown("### Work starting today")
                 st.dataframe(upcoming_df, use_container_width=True)
+            if show_notes:
+                st.markdown("### Customer follow-ups due")
+                st.dataframe(notes_display, use_container_width=True)
             if show_expired:
                 st.markdown("### Warranties needing attention")
                 st.write(
@@ -2431,6 +2565,167 @@ def customers_page(conn):
                     _safe_rerun()
                 else:
                     st.error("Only admins can delete customers.")
+            st.markdown("#### Follow-ups & reminders")
+            with st.form(f"customer_note_add_{selected_customer_id}"):
+                new_note_text = st.text_area(
+                    "Add a remark", placeholder="e.g. Call back next week with pricing update"
+                )
+                enable_follow_up = st.checkbox(
+                    "Schedule follow-up reminder",
+                    value=False,
+                    key=f"customer_note_followup_{selected_customer_id}",
+                )
+                default_date = datetime.now().date()
+                reminder_date = st.date_input(
+                    "Reminder date",
+                    value=default_date,
+                    key=f"customer_note_reminder_{selected_customer_id}",
+                    disabled=not enable_follow_up,
+                )
+                add_note = st.form_submit_button("Add remark", type="primary")
+            if add_note:
+                note_value = clean_text(new_note_text)
+                if not note_value:
+                    st.error("Remark text is required.")
+                else:
+                    reminder_value = to_iso_date(reminder_date) if enable_follow_up else None
+                    conn.execute(
+                        "INSERT INTO customer_notes (customer_id, note, remind_on) VALUES (?, ?, ?)",
+                        (int(selected_customer_id), note_value, reminder_value),
+                    )
+                    conn.commit()
+                    st.success("Remark added.")
+                    _safe_rerun()
+
+            notes_df = df_query(
+                conn,
+                """
+                SELECT note_id, note, remind_on, is_done, created_at, updated_at
+                FROM customer_notes
+                WHERE customer_id = ?
+                ORDER BY datetime(COALESCE(remind_on, created_at)) DESC, note_id DESC
+                """,
+                (int(selected_customer_id),),
+            )
+            if notes_df.empty:
+                st.caption("No saved remarks yet.")
+            else:
+                notes_original = {
+                    int(row["note_id"]): row for row in notes_df.to_dict("records") if int_or_none(row.get("note_id")) is not None
+                }
+                editor_df = notes_df.copy()
+                editor_df["remind_on"] = pd.to_datetime(editor_df["remind_on"], errors="coerce")
+                editor_df["created_at"] = pd.to_datetime(editor_df["created_at"], errors="coerce")
+                editor_df["updated_at"] = pd.to_datetime(editor_df["updated_at"], errors="coerce")
+                editor_df["Done"] = editor_df.get("is_done", 0).fillna(0).astype(int).apply(lambda v: bool(v))
+                editor_df["Action"] = "Keep"
+                column_order = [
+                    col
+                    for col in [
+                        "note_id",
+                        "note",
+                        "remind_on",
+                        "Done",
+                        "created_at",
+                        "updated_at",
+                        "Action",
+                    ]
+                    if col in editor_df.columns
+                ]
+                editor_view = editor_df[column_order]
+                note_editor_state = st.data_editor(
+                    editor_view,
+                    hide_index=True,
+                    num_rows="fixed",
+                    use_container_width=True,
+                    column_config={
+                        "note_id": st.column_config.Column("ID", disabled=True),
+                        "note": st.column_config.TextColumn("Remark"),
+                        "remind_on": st.column_config.DateColumn(
+                            "Reminder date", format="DD-MM-YYYY", required=False
+                        ),
+                        "Done": st.column_config.CheckboxColumn("Completed"),
+                        "created_at": st.column_config.DatetimeColumn(
+                            "Created", format="DD-MM-YYYY HH:mm", disabled=True
+                        ),
+                        "updated_at": st.column_config.DatetimeColumn(
+                            "Updated", format="DD-MM-YYYY HH:mm", disabled=True
+                        ),
+                        "Action": st.column_config.SelectboxColumn(
+                            "Action", options=["Keep", "Delete"], required=True
+                        ),
+                    },
+                    key=f"customer_notes_editor_{selected_customer_id}",
+                )
+                if st.button(
+                    "Apply note updates",
+                    key=f"apply_customer_notes_{selected_customer_id}",
+                ):
+                    note_result = (
+                        note_editor_state
+                        if isinstance(note_editor_state, pd.DataFrame)
+                        else pd.DataFrame(note_editor_state)
+                    )
+                    if note_result.empty:
+                        st.info("No notes to update.")
+                    else:
+                        changes = False
+                        errors: list[str] = []
+                        for row in note_result.to_dict("records"):
+                            note_id = int_or_none(row.get("note_id"))
+                            if note_id is None or note_id not in notes_original:
+                                continue
+                            action = str(row.get("Action") or "Keep").strip().lower()
+                            if action == "delete":
+                                conn.execute(
+                                    "DELETE FROM customer_notes WHERE note_id = ? AND customer_id = ?",
+                                    (note_id, int(selected_customer_id)),
+                                )
+                                changes = True
+                                continue
+                            new_note_text = clean_text(row.get("note"))
+                            if not new_note_text:
+                                errors.append(f"Remark #{note_id} cannot be empty.")
+                                continue
+                            reminder_iso = to_iso_date(row.get("remind_on"))
+                            completed_flag = bool(row.get("Done"))
+                            original = notes_original[note_id]
+                            original_note = clean_text(original.get("note"))
+                            original_reminder = to_iso_date(original.get("remind_on"))
+                            original_done = bool(int_or_none(original.get("is_done")) or 0)
+                            if (
+                                new_note_text == original_note
+                                and reminder_iso == original_reminder
+                                and completed_flag == original_done
+                            ):
+                                continue
+                            conn.execute(
+                                """
+                                UPDATE customer_notes
+                                SET note = ?, remind_on = ?, is_done = ?, updated_at = datetime('now')
+                                WHERE note_id = ? AND customer_id = ?
+                                """,
+                                (
+                                    new_note_text,
+                                    reminder_iso,
+                                    1 if completed_flag else 0,
+                                    note_id,
+                                    int(selected_customer_id),
+                                ),
+                            )
+                            changes = True
+                        if errors:
+                            for err in errors:
+                                st.error(err)
+                        if changes and not errors:
+                            conn.commit()
+                            st.success("Notes updated.")
+                            _safe_rerun()
+                        elif not changes and not errors:
+                            st.info("No changes detected.")
+                        elif changes:
+                            conn.commit()
+                            st.warning("Some changes were saved, but please review the errors above.")
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
         SELECT customer_id as id, name, phone, purchase_date, product_info, delivery_order_code, sales_person, created_at
@@ -2438,6 +2733,7 @@ def customers_page(conn):
         ORDER BY datetime(created_at) DESC LIMIT 200
     """)
     recent_df = fmt_dates(recent_df, ["created_at", "purchase_date"])
+    recent_df = recent_df.rename(columns={"sales_person": "Sales person"})
     st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
@@ -2587,6 +2883,29 @@ def _render_service_section(conn, *, show_heading: bool = True):
             )
         description = st.text_area("Service description")
         remarks = st.text_area("Remarks / updates")
+        cond_cols = st.columns(2)
+        with cond_cols[0]:
+            condition_option = st.selectbox(
+                "Generator condition after work",
+                ["Not recorded"] + GENERATOR_CONDITION_OPTIONS,
+                index=0,
+                key="service_new_condition",
+                help="Capture the condition of the generator once the work is completed.",
+            )
+        with cond_cols[1]:
+            bill_amount_input = st.number_input(
+                "Bill amount",
+                min_value=0.0,
+                step=100.0,
+                format="%.2f",
+                key="service_new_bill_amount",
+                help="Track how much the customer was billed for this service.",
+            )
+        condition_notes = st.text_area(
+            "Condition remarks",
+            key="service_new_condition_notes",
+            help="Add any notes about the generator condition once the job is done.",
+        )
         service_product_count = st.number_input(
             "Products sold during service",
             min_value=0,
@@ -2630,12 +2949,18 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     "serial": product_serial,
                     "quantity": int(product_quantity),
                 }
-            )
+        )
         service_files = st.file_uploader(
             "Attach service documents (PDF)",
             type=["pdf"],
             accept_multiple_files=True,
             key="service_new_docs",
+        )
+        bill_file = st.file_uploader(
+            "Upload bill / invoice (PDF)",
+            type=["pdf"],
+            key="service_new_bill_file",
+            help="Store the supporting invoice for this service.",
         )
         submit = st.form_submit_button("Log service", type="primary")
 
@@ -2667,6 +2992,16 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 service_product_label = (
                     "\n".join(service_product_labels) if service_product_labels else None
                 )
+                condition_value = (
+                    condition_option if condition_option in GENERATOR_CONDITION_OPTIONS else None
+                )
+                condition_notes_value = clean_text(condition_notes)
+                bill_amount_value = None
+                try:
+                    if bill_amount_input is not None and float(bill_amount_input) > 0:
+                        bill_amount_value = round(float(bill_amount_input), 2)
+                except Exception:
+                    bill_amount_value = None
                 cur.execute(
                     """
                     INSERT INTO services (
@@ -2679,8 +3014,12 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         status,
                         remarks,
                         service_product_info,
+                        condition_status,
+                        condition_remarks,
+                        bill_amount,
+                        bill_document_path,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         selected_do,
@@ -2692,6 +3031,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         status_value,
                         clean_text(remarks),
                         service_product_label,
+                        condition_value,
+                        condition_notes_value,
+                        bill_amount_value,
+                        None,
                         datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     ),
                 )
@@ -2706,10 +3049,31 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     SERVICE_DOCS_DIR,
                     f"service_{service_id}",
                 )
+                bill_saved = False
+                if bill_file is not None:
+                    saved_bill = save_uploaded_file(
+                        bill_file,
+                        SERVICE_BILL_DIR,
+                        filename=f"service_{service_id}_bill.pdf",
+                    )
+                    if saved_bill:
+                        try:
+                            stored_path = str(saved_bill.relative_to(BASE_DIR))
+                        except ValueError:
+                            stored_path = str(saved_bill)
+                        conn.execute(
+                            "UPDATE services SET bill_document_path = ? WHERE service_id = ?",
+                            (stored_path, int(service_id)),
+                        )
+                        bill_saved = True
                 conn.commit()
                 message = "Service record saved."
                 if saved_docs:
                     message = f"{message} Attached {saved_docs} document(s)."
+                if bill_amount_value is not None:
+                    message = f"{message} Recorded bill amount {format_money(bill_amount_value)}."
+                if bill_saved:
+                    message = f"{message} Invoice uploaded."
                 st.success(message)
                 _safe_rerun()
 
@@ -2725,6 +3089,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
                s.description,
                s.status,
                s.remarks,
+               s.condition_status,
+               s.condition_remarks,
+               s.bill_amount,
+               s.bill_document_path,
                s.updated_at,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                COUNT(sd.document_id) AS doc_count
@@ -2749,6 +3117,16 @@ def _render_service_section(conn, *, show_heading: bool = True):
         service_df.loc[service_df["Last update"].isna(), "Last update"] = None
         if "status" in service_df.columns:
             service_df["status"] = service_df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
+        if "condition_status" in service_df.columns:
+            service_df["condition_status"] = service_df["condition_status"].apply(
+                lambda x: clean_text(x) or "Not recorded"
+            )
+        if "bill_amount" in service_df.columns:
+            service_df["bill_amount_display"] = service_df["bill_amount"].apply(format_money)
+        if "bill_document_path" in service_df.columns:
+            service_df["bill_document_display"] = service_df["bill_document_path"].apply(
+                lambda x: "📄" if clean_text(x) else ""
+            )
         display = service_df.rename(
             columns={
                 "do_number": "DO Serial",
@@ -2760,10 +3138,15 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 "description": "Description",
                 "status": "Status",
                 "remarks": "Remarks",
+                "condition_status": "Condition",
+                "condition_remarks": "Condition notes",
+                "bill_amount_display": "Bill amount",
+                "bill_document_display": "Bill document",
                 "customer": "Customer",
                 "doc_count": "Documents",
             }
         )
+        display = display.drop(columns=["bill_document_path"], errors="ignore")
         st.markdown("### Service history")
         st.dataframe(
             display.drop(columns=["updated_at", "service_id"], errors="ignore"),
@@ -2830,6 +3213,62 @@ def _render_service_section(conn, *, show_heading: bool = True):
             value=clean_text(selected_record.get("remarks")) or "",
             key=f"service_edit_{selected_service_id}",
         )
+        condition_cols = st.columns(2)
+        existing_condition = clean_text(selected_record.get("condition_status"))
+        condition_options = ["Not recorded"] + GENERATOR_CONDITION_OPTIONS
+        default_condition = (
+            existing_condition if existing_condition in GENERATOR_CONDITION_OPTIONS else "Not recorded"
+        )
+        with condition_cols[0]:
+            condition_choice_edit = st.selectbox(
+                "Generator condition",
+                condition_options,
+                index=condition_options.index(default_condition),
+                key=f"service_edit_condition_{selected_service_id}",
+            )
+        existing_bill_amount = selected_record.get("bill_amount")
+        try:
+            bill_amount_default = float(existing_bill_amount) if existing_bill_amount is not None else 0.0
+        except (TypeError, ValueError):
+            bill_amount_default = 0.0
+        with condition_cols[1]:
+            bill_amount_edit = st.number_input(
+                "Bill amount",
+                value=float(bill_amount_default),
+                min_value=0.0,
+                step=100.0,
+                format="%.2f",
+                key=f"service_edit_bill_amount_{selected_service_id}",
+            )
+        condition_notes_edit = st.text_area(
+            "Condition remarks",
+            value=clean_text(selected_record.get("condition_remarks")) or "",
+            key=f"service_edit_condition_notes_{selected_service_id}",
+        )
+        existing_bill_path = clean_text(selected_record.get("bill_document_path"))
+        resolved_bill_path = resolve_upload_path(existing_bill_path)
+        bill_col1, bill_col2 = st.columns([1, 1])
+        with bill_col1:
+            bill_file_edit = st.file_uploader(
+                "Replace bill / invoice (PDF)",
+                type=["pdf"],
+                key=f"service_edit_bill_upload_{selected_service_id}",
+            )
+        with bill_col2:
+            clear_bill = st.checkbox(
+                "Remove existing bill",
+                value=False,
+                key=f"service_edit_bill_clear_{selected_service_id}",
+            )
+        if resolved_bill_path and resolved_bill_path.exists():
+            st.download_button(
+                "Download current bill",
+                data=resolved_bill_path.read_bytes(),
+                file_name=resolved_bill_path.name,
+                key=f"service_bill_download_{selected_service_id}",
+            )
+        elif existing_bill_path:
+            st.caption("Bill file not found. Upload a fresh copy to replace it.")
         if st.button("Save updates", key="save_service_updates"):
             (
                 service_date_str,
@@ -2846,6 +3285,51 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 st.error("Select a start date for this service entry.")
                 valid_update = False
             if valid_update:
+                condition_update_value = (
+                    condition_choice_edit
+                    if condition_choice_edit in GENERATOR_CONDITION_OPTIONS
+                    else None
+                )
+                condition_notes_update = clean_text(condition_notes_edit)
+                bill_amount_update = None
+                try:
+                    if bill_amount_edit is not None and float(bill_amount_edit) > 0:
+                        bill_amount_update = round(float(bill_amount_edit), 2)
+                except Exception:
+                    bill_amount_update = None
+                current_bill_path = clean_text(selected_record.get("bill_document_path"))
+                bill_path_value = current_bill_path
+                replaced_bill = False
+                removed_bill = False
+                if bill_file_edit is not None:
+                    saved_bill = save_uploaded_file(
+                        bill_file_edit,
+                        SERVICE_BILL_DIR,
+                        filename=f"service_{selected_service_id}_bill.pdf",
+                    )
+                    if saved_bill:
+                        try:
+                            stored_path = str(saved_bill.relative_to(BASE_DIR))
+                        except ValueError:
+                            stored_path = str(saved_bill)
+                        bill_path_value = stored_path
+                        replaced_bill = True
+                        if current_bill_path:
+                            old_path = resolve_upload_path(current_bill_path)
+                            if old_path and old_path.exists() and old_path != saved_bill:
+                                try:
+                                    old_path.unlink()
+                                except Exception:
+                                    pass
+                elif clear_bill and current_bill_path:
+                    old_path = resolve_upload_path(current_bill_path)
+                    if old_path and old_path.exists():
+                        try:
+                            old_path.unlink()
+                        except Exception:
+                            pass
+                    bill_path_value = None
+                    removed_bill = True
                 conn.execute(
                     """
                     UPDATE services
@@ -2854,6 +3338,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         service_date = ?,
                         service_start_date = ?,
                         service_end_date = ?,
+                        condition_status = ?,
+                        condition_remarks = ?,
+                        bill_amount = ?,
+                        bill_document_path = ?,
                         updated_at = datetime('now')
                     WHERE service_id = ?
                     """,
@@ -2863,11 +3351,22 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         service_date_str,
                         service_start_str,
                         service_end_str,
+                        condition_update_value,
+                        condition_notes_update,
+                        bill_amount_update,
+                        bill_path_value,
                         int(selected_service_id),
                     ),
                 )
                 conn.commit()
-                st.success("Service record updated.")
+                message_bits = ["Service record updated."]
+                if bill_amount_update is not None:
+                    message_bits.append(f"Bill amount {format_money(bill_amount_update)}")
+                if replaced_bill:
+                    message_bits.append("Invoice replaced")
+                elif removed_bill:
+                    message_bits.append("Invoice removed")
+                st.success(". ".join(message_bits))
                 _safe_rerun()
 
         attachments_df = df_query(
