@@ -143,9 +143,12 @@ CREATE TABLE IF NOT EXISTS services (
     do_number TEXT,
     customer_id INTEGER,
     service_date TEXT,
+    service_start_date TEXT,
+    service_end_date TEXT,
     description TEXT,
     status TEXT DEFAULT 'In progress',
     remarks TEXT,
+    service_product_info TEXT,
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(do_number) REFERENCES delivery_orders(do_number) ON DELETE SET NULL,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
@@ -155,9 +158,12 @@ CREATE TABLE IF NOT EXISTS maintenance_records (
     do_number TEXT,
     customer_id INTEGER,
     maintenance_date TEXT,
+    maintenance_start_date TEXT,
+    maintenance_end_date TEXT,
     description TEXT,
     status TEXT DEFAULT 'In progress',
     remarks TEXT,
+    maintenance_product_info TEXT,
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(do_number) REFERENCES delivery_orders(do_number) ON DELETE SET NULL,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL
@@ -248,7 +254,13 @@ def ensure_schema_upgrades(conn):
     add_column("customers", "attachment_path", "TEXT")
     add_column("customers", "sales_person", "TEXT")
     add_column("services", "status", "TEXT DEFAULT 'In progress'")
+    add_column("services", "service_start_date", "TEXT")
+    add_column("services", "service_end_date", "TEXT")
+    add_column("services", "service_product_info", "TEXT")
     add_column("maintenance_records", "status", "TEXT DEFAULT 'In progress'")
+    add_column("maintenance_records", "maintenance_start_date", "TEXT")
+    add_column("maintenance_records", "maintenance_end_date", "TEXT")
+    add_column("maintenance_records", "maintenance_product_info", "TEXT")
 
 def df_query(conn, q, params=()):
     return pd.read_sql_query(q, conn, params=params)
@@ -271,6 +283,56 @@ def clean_text(value):
         pass
     value = str(value).strip()
     return value or None
+
+
+def normalize_product_entries(
+    entries: Iterable[dict[str, object]]
+) -> tuple[list[dict[str, object]], list[str]]:
+    cleaned: list[dict[str, object]] = []
+    labels: list[str] = []
+    for entry in entries:
+        name_clean = clean_text(entry.get("name")) if isinstance(entry, dict) else None
+        model_clean = clean_text(entry.get("model")) if isinstance(entry, dict) else None
+        serial_clean = clean_text(entry.get("serial")) if isinstance(entry, dict) else None
+        quantity_raw = entry.get("quantity") if isinstance(entry, dict) else None
+        try:
+            qty_val = int(quantity_raw or 1)
+        except Exception:
+            qty_val = 1
+        qty_val = max(qty_val, 1)
+        if not any([name_clean, model_clean, serial_clean]):
+            continue
+        cleaned.append(
+            {
+                "name": name_clean,
+                "model": model_clean,
+                "serial": serial_clean,
+                "quantity": qty_val,
+            }
+        )
+        label_parts = [val for val in [name_clean, model_clean] if val]
+        label = " - ".join(label_parts)
+        if qty_val > 1:
+            label = f"{label} ×{qty_val}" if label else f"×{qty_val}"
+        if serial_clean:
+            label = f"{label} (Serial: {serial_clean})" if label else f"Serial: {serial_clean}"
+        if label:
+            labels.append(label)
+    return cleaned, labels
+
+
+def format_period_label(
+    start: Optional[str], end: Optional[str], *, joiner: str = " → "
+) -> Optional[str]:
+    start_clean = clean_text(start)
+    end_clean = clean_text(end)
+    if not start_clean and not end_clean:
+        return None
+    if start_clean and end_clean:
+        if start_clean == end_clean:
+            return start_clean
+        return f"{start_clean}{joiner}{end_clean}"
+    return start_clean or end_clean
 
 
 def status_input_widget(prefix: str, default_status: Optional[str] = None) -> str:
@@ -866,6 +928,9 @@ def _build_services_export(conn) -> pd.DataFrame:
                s.do_number,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                s.service_date,
+               s.service_start_date,
+               s.service_end_date,
+               s.service_product_info,
                s.description,
                s.status,
                s.remarks,
@@ -878,7 +943,7 @@ def _build_services_export(conn) -> pd.DataFrame:
         """
     )
     df = df_query(conn, query)
-    df = fmt_dates(df, ["service_date", "updated_at"])
+    df = fmt_dates(df, ["service_date", "service_start_date", "service_end_date", "updated_at"])
     if "status" in df.columns:
         df["status"] = df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
     return df.rename(
@@ -887,6 +952,9 @@ def _build_services_export(conn) -> pd.DataFrame:
             "do_number": "DO number",
             "customer": "Customer",
             "service_date": "Service date",
+            "service_start_date": "Service start date",
+            "service_end_date": "Service end date",
+            "service_product_info": "Products sold",
             "description": "Description",
             "status": "Status",
             "remarks": "Remarks",
@@ -902,6 +970,9 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
                m.do_number,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                m.maintenance_date,
+               m.maintenance_start_date,
+               m.maintenance_end_date,
+               m.maintenance_product_info,
                m.description,
                m.status,
                m.remarks,
@@ -914,7 +985,7 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
         """
     )
     df = df_query(conn, query)
-    df = fmt_dates(df, ["maintenance_date", "updated_at"])
+    df = fmt_dates(df, ["maintenance_date", "maintenance_start_date", "maintenance_end_date", "updated_at"])
     if "status" in df.columns:
         df["status"] = df["status"].apply(lambda x: clean_text(x) or DEFAULT_SERVICE_STATUS)
     return df.rename(
@@ -923,6 +994,9 @@ def _build_maintenance_export(conn) -> pd.DataFrame:
             "do_number": "DO number",
             "customer": "Customer",
             "maintenance_date": "Maintenance date",
+            "maintenance_start_date": "Maintenance start date",
+            "maintenance_end_date": "Maintenance end date",
+            "maintenance_product_info": "Products sold",
             "description": "Description",
             "status": "Status",
             "remarks": "Remarks",
@@ -1643,9 +1717,50 @@ def customers_page(conn):
             phone = st.text_input("Phone")
             address = st.text_area("Address")
             purchase_date = st.date_input("Purchase/Issue date", value=datetime.now().date())
-            product_name = st.text_input("Product")
-            product_model = st.text_input("Model")
-            product_serial = st.text_input("Serial")
+            product_count = st.number_input(
+                "Number of products",
+                min_value=1,
+                max_value=20,
+                value=1,
+                step=1,
+                key="new_customer_product_count",
+                help="Add additional rows when a customer has purchased multiple products.",
+            )
+            product_entries: list[dict[str, object]] = []
+            for idx in range(int(product_count)):
+                cols = st.columns((2, 2, 2, 1))
+                with cols[0]:
+                    product_name = st.text_input(
+                        f"Product {idx + 1} details",
+                        key=f"new_customer_product_name_{idx}",
+                    )
+                with cols[1]:
+                    product_model = st.text_input(
+                        f"Model {idx + 1}",
+                        key=f"new_customer_product_model_{idx}",
+                    )
+                with cols[2]:
+                    product_serial = st.text_input(
+                        f"Serial {idx + 1}",
+                        key=f"new_customer_product_serial_{idx}",
+                    )
+                with cols[3]:
+                    product_quantity = st.number_input(
+                        f"Qty {idx + 1}",
+                        min_value=1,
+                        max_value=999,
+                        value=1,
+                        step=1,
+                        key=f"new_customer_product_quantity_{idx}",
+                    )
+                product_entries.append(
+                    {
+                        "name": product_name,
+                        "model": product_model,
+                        "serial": product_serial,
+                        "quantity": int(product_quantity),
+                    }
+                )
             do_code = st.text_input("Delivery order code")
             sales_person_input = st.text_input("Sales person")
             customer_pdf = st.file_uploader("Attach customer PDF", type=["pdf"], key="new_customer_pdf")
@@ -1656,9 +1771,8 @@ def customers_page(conn):
                 name_val = clean_text(name)
                 phone_val = clean_text(phone)
                 address_val = clean_text(address)
-                product_label = " - ".join(
-                    [val for val in [clean_text(product_name), clean_text(product_model)] if val]
-                ) or clean_text(product_name)
+                cleaned_products, product_labels = normalize_product_entries(product_entries)
+                product_label = "\n".join(product_labels) if product_labels else None
                 purchase_str = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
                 do_serial = clean_text(do_code)
                 cur.execute(
@@ -1675,34 +1789,37 @@ def customers_page(conn):
                 )
                 cid = cur.lastrowid
                 conn.commit()
-                if product_name.strip():
-                    cur.execute(
-                        "SELECT product_id FROM products WHERE name=? AND IFNULL(model,'')=IFNULL(?, '') LIMIT 1",
-                        (clean_text(product_name), clean_text(product_model)),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        pid = row[0]
-                    else:
+                if cleaned_products:
+                    for prod in cleaned_products:
+                        if not prod.get("name"):
+                            continue
                         cur.execute(
-                            "INSERT INTO products (name, model, serial) VALUES (?, ?, ?)",
-                            (
-                                clean_text(product_name),
-                                clean_text(product_model),
-                                clean_text(product_serial),
-                            ),
+                            "SELECT product_id FROM products WHERE name=? AND IFNULL(model,'')=IFNULL(?, '') LIMIT 1",
+                            (prod.get("name"), prod.get("model")),
                         )
-                        pid = cur.lastrowid
-                    issue = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
-                    expiry = (
-                        (purchase_date + timedelta(days=365)).strftime("%Y-%m-%d")
-                        if purchase_date
-                        else None
-                    )
-                    cur.execute(
-                        "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status) VALUES (?, ?, ?, ?, ?, 'active')",
-                        (cid, pid, clean_text(product_serial), issue, expiry),
-                    )
+                        row = cur.fetchone()
+                        if row:
+                            pid = row[0]
+                        else:
+                            cur.execute(
+                                "INSERT INTO products (name, model, serial) VALUES (?, ?, ?)",
+                                (
+                                    prod.get("name"),
+                                    prod.get("model"),
+                                    prod.get("serial"),
+                                ),
+                            )
+                            pid = cur.lastrowid
+                        issue = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
+                        expiry = (
+                            (purchase_date + timedelta(days=365)).strftime("%Y-%m-%d")
+                            if purchase_date
+                            else None
+                        )
+                        cur.execute(
+                            "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status) VALUES (?, ?, ?, ?, ?, 'active')",
+                            (cid, pid, prod.get("serial"), issue, expiry),
+                        )
                     conn.commit()
                 if do_serial:
                     cur = conn.cursor()
@@ -1725,7 +1842,7 @@ def customers_page(conn):
                                 do_serial,
                                 cid,
                                 None,
-                                clean_text(product_name) or None,
+                                cleaned_products[0].get("name") if cleaned_products else None,
                                 clean_text(sales_person_input),
                                 stored_path,
                             ),
@@ -2206,10 +2323,59 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                 key=state_key,
             )
-        service_date = st.date_input("Service date", value=datetime.now().date())
+        today = datetime.now().date()
+        service_period_value = st.date_input(
+            "Service period",
+            value=(today, today),
+            help="Select the start and end dates for the service visit.",
+        )
         description = st.text_area("Service description")
         status_value = status_input_widget("service_new", DEFAULT_SERVICE_STATUS)
         remarks = st.text_area("Remarks / updates")
+        service_product_count = st.number_input(
+            "Products sold during service",
+            min_value=0,
+            max_value=20,
+            value=0,
+            step=1,
+            key="service_additional_product_count",
+            help="Capture any new items sold while this service was in progress.",
+        )
+        service_product_entries: list[dict[str, object]] = []
+        for idx in range(int(service_product_count)):
+            cols = st.columns((2, 2, 2, 1))
+            with cols[0]:
+                product_name = st.text_input(
+                    f"Product {idx + 1} details",
+                    key=f"service_product_name_{idx}",
+                )
+            with cols[1]:
+                product_model = st.text_input(
+                    f"Model {idx + 1}",
+                    key=f"service_product_model_{idx}",
+                )
+            with cols[2]:
+                product_serial = st.text_input(
+                    f"Serial {idx + 1}",
+                    key=f"service_product_serial_{idx}",
+                )
+            with cols[3]:
+                product_quantity = st.number_input(
+                    f"Qty {idx + 1}",
+                    min_value=1,
+                    max_value=999,
+                    value=1,
+                    step=1,
+                    key=f"service_product_quantity_{idx}",
+                )
+            service_product_entries.append(
+                {
+                    "name": product_name,
+                    "model": product_model,
+                    "serial": product_serial,
+                    "quantity": int(product_quantity),
+                }
+            )
         service_files = st.file_uploader(
             "Attach service documents (PDF)",
             type=["pdf"],
@@ -2225,15 +2391,58 @@ def _render_service_section(conn, *, show_heading: bool = True):
             selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
             selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
+            if isinstance(service_period_value, (list, tuple)):
+                if len(service_period_value) >= 1:
+                    service_start_date = service_period_value[0]
+                    service_end_date = (
+                        service_period_value[-1]
+                        if len(service_period_value) > 1
+                        else service_period_value[0]
+                    )
+                else:
+                    service_start_date = service_end_date = None
+            else:
+                service_start_date = service_end_date = service_period_value
+            if service_start_date and service_end_date and service_end_date < service_start_date:
+                service_start_date, service_end_date = service_end_date, service_start_date
+            service_start_str = (
+                service_start_date.strftime("%Y-%m-%d") if service_start_date else None
+            )
+            service_end_str = (
+                service_end_date.strftime("%Y-%m-%d") if service_end_date else None
+            )
+            service_date_str = service_start_str or service_end_str
+            _cleaned_service_products, service_product_labels = normalize_product_entries(
+                service_product_entries
+            )
+            service_product_label = (
+                "\n".join(service_product_labels) if service_product_labels else None
+            )
             cur.execute(
-                "INSERT INTO services (do_number, customer_id, service_date, description, status, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO services (
+                    do_number,
+                    customer_id,
+                    service_date,
+                    service_start_date,
+                    service_end_date,
+                    description,
+                    status,
+                    remarks,
+                    service_product_info,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     selected_do,
                     selected_customer,
-                    service_date.strftime("%Y-%m-%d") if service_date else None,
+                    service_date_str,
+                    service_start_str,
+                    service_end_str,
                     clean_text(description),
                     status_value,
                     clean_text(remarks),
+                    service_product_label,
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
@@ -2261,6 +2470,9 @@ def _render_service_section(conn, *, show_heading: bool = True):
         SELECT s.service_id,
                s.do_number,
                s.service_date,
+               s.service_start_date,
+               s.service_end_date,
+               s.service_product_info,
                s.description,
                s.status,
                s.remarks,
@@ -2273,11 +2485,17 @@ def _render_service_section(conn, *, show_heading: bool = True):
         LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
         LEFT JOIN service_documents sd ON sd.service_id = s.service_id
         GROUP BY s.service_id
-        ORDER BY datetime(s.service_date) DESC, s.service_id DESC
+        ORDER BY datetime(COALESCE(s.service_start_date, s.service_date)) DESC, s.service_id DESC
         """,
     )
     if not service_df.empty:
-        service_df = fmt_dates(service_df, ["service_date"])
+        service_df = fmt_dates(service_df, ["service_date", "service_start_date", "service_end_date"])
+        service_df["service_period"] = service_df.apply(
+            lambda row: format_period_label(
+                row.get("service_start_date"), row.get("service_end_date")
+            ),
+            axis=1,
+        )
         service_df["Last update"] = pd.to_datetime(service_df.get("updated_at"), errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
         service_df.loc[service_df["Last update"].isna(), "Last update"] = None
         if "status" in service_df.columns:
@@ -2286,6 +2504,10 @@ def _render_service_section(conn, *, show_heading: bool = True):
             columns={
                 "do_number": "DO Serial",
                 "service_date": "Service date",
+                "service_start_date": "Service start date",
+                "service_end_date": "Service end date",
+                "service_period": "Service period",
+                "service_product_info": "Products sold",
                 "description": "Description",
                 "status": "Status",
                 "remarks": "Remarks",
@@ -2304,7 +2526,9 @@ def _render_service_section(conn, *, show_heading: bool = True):
         options = [int(r["service_id"]) for r in records]
         def service_label(record):
             do_ref = clean_text(record.get("do_number")) or "(no DO)"
-            date_ref = clean_text(record.get("service_date"))
+            date_ref = clean_text(record.get("service_period")) or clean_text(
+                record.get("service_date")
+            )
             customer_ref = clean_text(record.get("customer"))
             parts = [do_ref]
             if date_ref:
@@ -2469,10 +2693,59 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                 key=state_key,
             )
-        maintenance_date = st.date_input("Maintenance date", value=datetime.now().date())
+        today = datetime.now().date()
+        maintenance_period_value = st.date_input(
+            "Maintenance period",
+            value=(today, today),
+            help="Select when this maintenance work started and finished.",
+        )
         description = st.text_area("Maintenance description")
         status_value = status_input_widget("maintenance_new", DEFAULT_SERVICE_STATUS)
         remarks = st.text_area("Remarks / updates")
+        maintenance_product_count = st.number_input(
+            "Products sold during maintenance",
+            min_value=0,
+            max_value=20,
+            value=0,
+            step=1,
+            key="maintenance_additional_product_count",
+            help="Track any new items purchased while maintenance was carried out.",
+        )
+        maintenance_product_entries: list[dict[str, object]] = []
+        for idx in range(int(maintenance_product_count)):
+            cols = st.columns((2, 2, 2, 1))
+            with cols[0]:
+                product_name = st.text_input(
+                    f"Product {idx + 1} details",
+                    key=f"maintenance_product_name_{idx}",
+                )
+            with cols[1]:
+                product_model = st.text_input(
+                    f"Model {idx + 1}",
+                    key=f"maintenance_product_model_{idx}",
+                )
+            with cols[2]:
+                product_serial = st.text_input(
+                    f"Serial {idx + 1}",
+                    key=f"maintenance_product_serial_{idx}",
+                )
+            with cols[3]:
+                product_quantity = st.number_input(
+                    f"Qty {idx + 1}",
+                    min_value=1,
+                    max_value=999,
+                    value=1,
+                    step=1,
+                    key=f"maintenance_product_quantity_{idx}",
+                )
+            maintenance_product_entries.append(
+                {
+                    "name": product_name,
+                    "model": product_model,
+                    "serial": product_serial,
+                    "quantity": int(product_quantity),
+                }
+            )
         maintenance_files = st.file_uploader(
             "Attach maintenance documents (PDF)",
             type=["pdf"],
@@ -2488,15 +2761,71 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
             selected_customer = int(selected_customer) if selected_customer is not None else None
             cur = conn.cursor()
+            if isinstance(maintenance_period_value, (list, tuple)):
+                if len(maintenance_period_value) >= 1:
+                    maintenance_start_date = maintenance_period_value[0]
+                    maintenance_end_date = (
+                        maintenance_period_value[-1]
+                        if len(maintenance_period_value) > 1
+                        else maintenance_period_value[0]
+                    )
+                else:
+                    maintenance_start_date = maintenance_end_date = None
+            else:
+                maintenance_start_date = maintenance_end_date = maintenance_period_value
+            if (
+                maintenance_start_date
+                and maintenance_end_date
+                and maintenance_end_date < maintenance_start_date
+            ):
+                maintenance_start_date, maintenance_end_date = (
+                    maintenance_end_date,
+                    maintenance_start_date,
+                )
+            maintenance_start_str = (
+                maintenance_start_date.strftime("%Y-%m-%d")
+                if maintenance_start_date
+                else None
+            )
+            maintenance_end_str = (
+                maintenance_end_date.strftime("%Y-%m-%d")
+                if maintenance_end_date
+                else None
+            )
+            maintenance_date_str = maintenance_start_str or maintenance_end_str
+            _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
+                maintenance_product_entries
+            )
+            maintenance_product_label = (
+                "\n".join(maintenance_product_labels)
+                if maintenance_product_labels
+                else None
+            )
             cur.execute(
-                "INSERT INTO maintenance_records (do_number, customer_id, maintenance_date, description, status, remarks, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO maintenance_records (
+                    do_number,
+                    customer_id,
+                    maintenance_date,
+                    maintenance_start_date,
+                    maintenance_end_date,
+                    description,
+                    status,
+                    remarks,
+                    maintenance_product_info,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     selected_do,
                     selected_customer,
-                    maintenance_date.strftime("%Y-%m-%d") if maintenance_date else None,
+                    maintenance_date_str,
+                    maintenance_start_str,
+                    maintenance_end_str,
                     clean_text(description),
                     status_value,
                     clean_text(remarks),
+                    maintenance_product_label,
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
@@ -2524,6 +2853,9 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         SELECT m.maintenance_id,
                m.do_number,
                m.maintenance_date,
+               m.maintenance_start_date,
+               m.maintenance_end_date,
+               m.maintenance_product_info,
                m.description,
                m.status,
                m.remarks,
@@ -2536,11 +2868,20 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         LEFT JOIN customers cdo ON cdo.customer_id = d.customer_id
         LEFT JOIN maintenance_documents md ON md.maintenance_id = m.maintenance_id
         GROUP BY m.maintenance_id
-        ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
+        ORDER BY datetime(COALESCE(m.maintenance_start_date, m.maintenance_date)) DESC, m.maintenance_id DESC
         """,
     )
     if not maintenance_df.empty:
-        maintenance_df = fmt_dates(maintenance_df, ["maintenance_date"])
+        maintenance_df = fmt_dates(
+            maintenance_df,
+            ["maintenance_date", "maintenance_start_date", "maintenance_end_date"],
+        )
+        maintenance_df["maintenance_period"] = maintenance_df.apply(
+            lambda row: format_period_label(
+                row.get("maintenance_start_date"), row.get("maintenance_end_date")
+            ),
+            axis=1,
+        )
         maintenance_df["Last update"] = pd.to_datetime(maintenance_df.get("updated_at"), errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
         maintenance_df.loc[maintenance_df["Last update"].isna(), "Last update"] = None
         if "status" in maintenance_df.columns:
@@ -2549,6 +2890,10 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
             columns={
                 "do_number": "DO Serial",
                 "maintenance_date": "Maintenance date",
+                "maintenance_start_date": "Maintenance start date",
+                "maintenance_end_date": "Maintenance end date",
+                "maintenance_period": "Maintenance period",
+                "maintenance_product_info": "Products sold",
                 "description": "Description",
                 "status": "Status",
                 "remarks": "Remarks",
@@ -2567,7 +2912,9 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         options = [int(r["maintenance_id"]) for r in records]
         def maintenance_label(record):
             do_ref = clean_text(record.get("do_number")) or "(no DO)"
-            date_ref = clean_text(record.get("maintenance_date"))
+            date_ref = clean_text(record.get("maintenance_period")) or clean_text(
+                record.get("maintenance_date")
+            )
             customer_ref = clean_text(record.get("customer"))
             parts = [do_ref]
             if date_ref:
@@ -2750,6 +3097,9 @@ def customer_summary_page(conn):
         SELECT s.service_id,
                s.do_number,
                s.service_date,
+               s.service_start_date,
+               s.service_end_date,
+               s.service_product_info,
                s.description,
                s.remarks,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
@@ -2761,11 +3111,18 @@ def customer_summary_page(conn):
         LEFT JOIN service_documents sd ON sd.service_id = s.service_id
         WHERE COALESCE(s.customer_id, d.customer_id) IN ({placeholders})
         GROUP BY s.service_id
-        ORDER BY datetime(s.service_date) DESC, s.service_id DESC
+        ORDER BY datetime(COALESCE(s.service_start_date, s.service_date)) DESC, s.service_id DESC
         """,
         ids,
     )
-    service_df = fmt_dates(service_df, ["service_date"])
+    service_df = fmt_dates(service_df, ["service_date", "service_start_date", "service_end_date"])
+    if not service_df.empty:
+        service_df["service_period"] = service_df.apply(
+            lambda row: format_period_label(
+                row.get("service_start_date"), row.get("service_end_date")
+            ),
+            axis=1,
+        )
 
     maintenance_df = df_query(
         conn,
@@ -2773,6 +3130,9 @@ def customer_summary_page(conn):
         SELECT m.maintenance_id,
                m.do_number,
                m.maintenance_date,
+               m.maintenance_start_date,
+               m.maintenance_end_date,
+               m.maintenance_product_info,
                m.description,
                m.remarks,
                COALESCE(c.name, cdo.name, '(unknown)') AS customer,
@@ -2784,11 +3144,21 @@ def customer_summary_page(conn):
         LEFT JOIN maintenance_documents md ON md.maintenance_id = m.maintenance_id
         WHERE COALESCE(m.customer_id, d.customer_id) IN ({placeholders})
         GROUP BY m.maintenance_id
-        ORDER BY datetime(m.maintenance_date) DESC, m.maintenance_id DESC
+        ORDER BY datetime(COALESCE(m.maintenance_start_date, m.maintenance_date)) DESC, m.maintenance_id DESC
         """,
         ids,
     )
-    maintenance_df = fmt_dates(maintenance_df, ["maintenance_date"])
+    maintenance_df = fmt_dates(
+        maintenance_df,
+        ["maintenance_date", "maintenance_start_date", "maintenance_end_date"],
+    )
+    if not maintenance_df.empty:
+        maintenance_df["maintenance_period"] = maintenance_df.apply(
+            lambda row: format_period_label(
+                row.get("maintenance_start_date"), row.get("maintenance_end_date")
+            ),
+            axis=1,
+        )
 
     do_df = df_query(
         conn,
@@ -2883,6 +3253,10 @@ def customer_summary_page(conn):
             columns={
                 "do_number": "DO Serial",
                 "service_date": "Service date",
+                "service_start_date": "Service start date",
+                "service_end_date": "Service end date",
+                "service_period": "Service period",
+                "service_product_info": "Products sold",
                 "description": "Description",
                 "remarks": "Remarks",
                 "customer": "Customer",
@@ -2902,6 +3276,10 @@ def customer_summary_page(conn):
             columns={
                 "do_number": "DO Serial",
                 "maintenance_date": "Maintenance date",
+                "maintenance_start_date": "Maintenance start date",
+                "maintenance_end_date": "Maintenance end date",
+                "maintenance_period": "Maintenance period",
+                "maintenance_product_info": "Products sold",
                 "description": "Description",
                 "remarks": "Remarks",
                 "customer": "Customer",
