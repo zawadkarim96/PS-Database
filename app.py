@@ -4,6 +4,7 @@ import re
 import sqlite3
 import hashlib
 import zipfile
+from calendar import monthrange
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Iterable, Optional
@@ -314,6 +315,180 @@ def fmt_dates(df: pd.DataFrame, cols):
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime(DATE_FMT)
     return df
+
+
+def add_months(base: date, months: int) -> date:
+    """Return ``base`` shifted by ``months`` while clamping the day to the target month."""
+
+    if not isinstance(base, date):
+        raise TypeError("base must be a date instance")
+    try:
+        months = int(months)
+    except (TypeError, ValueError):
+        raise TypeError("months must be an integer") from None
+
+    month_index = base.month - 1 + months
+    year = base.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(base.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def month_bucket_counts(
+    conn,
+    table: str,
+    date_column: str,
+    *,
+    where: Optional[str] = None,
+    params: Optional[Iterable[object]] = None,
+) -> tuple[int, int]:
+    """Return the current and previous month counts for ``table.date_column``."""
+
+    params = tuple(params or ())
+    criteria = [f"{date_column} IS NOT NULL"]
+    if where:
+        criteria.append(f"({where})")
+    where_clause = " AND ".join(criteria)
+    query = dedent(
+        f"""
+        SELECT
+            SUM(CASE WHEN strftime('%Y-%m', {date_column}) = strftime('%Y-%m', 'now') THEN 1 ELSE 0 END) AS current_month,
+            SUM(CASE WHEN strftime('%Y-%m', {date_column}) = strftime('%Y-%m', date('now', '-1 month')) THEN 1 ELSE 0 END) AS previous_month
+        FROM {table}
+        WHERE {where_clause}
+        """
+    )
+    cur = conn.execute(query, params)
+    row = cur.fetchone()
+    if not row:
+        return 0, 0
+    current, previous = row
+    current_count = int(current or 0)
+    previous_count = int(previous or 0)
+    return current_count, previous_count
+
+
+def format_metric_delta(current: int, previous: int) -> str:
+    """Format a delta label comparing the current value to the previous month."""
+
+    diff = int(current) - int(previous)
+    if diff == 0:
+        return "On par with last month"
+    if previous == 0:
+        return f"+{current} (new this month)"
+    pct = (diff / previous) * 100
+    return f"{diff:+d} ({pct:+.1f}%) vs last month"
+
+
+def upcoming_warranty_projection(conn, months_ahead: int = 6) -> pd.DataFrame:
+    """Return a month-by-month projection of expiring active warranties."""
+
+    try:
+        months = int(months_ahead)
+    except (TypeError, ValueError):
+        months = 6
+    months = max(1, min(months, 24))
+
+    today = date.today()
+    start_month = date(today.year, today.month, 1)
+    last_bucket = add_months(start_month, months - 1)
+    last_day = monthrange(last_bucket.year, last_bucket.month)[1]
+    range_end = date(last_bucket.year, last_bucket.month, last_day)
+
+    projection = df_query(
+        conn,
+        dedent(
+            """
+            SELECT strftime('%Y-%m', expiry_date) AS month_bucket,
+                   COUNT(*) AS total
+            FROM warranties
+            WHERE status='active'
+              AND expiry_date IS NOT NULL
+              AND date(expiry_date) BETWEEN date(?) AND date(?)
+            GROUP BY month_bucket
+            ORDER BY month_bucket
+            """
+        ),
+        params=(start_month.isoformat(), range_end.isoformat()),
+    )
+
+    records: list[dict[str, object]] = []
+    current_bucket = start_month
+    while len(records) < months:
+        bucket_key = current_bucket.strftime("%Y-%m")
+        label = current_bucket.strftime("%b %Y")
+        matching = projection[projection["month_bucket"] == bucket_key]
+        if matching.empty:
+            count = 0
+        else:
+            count = int(matching.iloc[0]["total"] or 0)
+        records.append({"Month": label, "Expiring warranties": count})
+        current_bucket = add_months(current_bucket, 1)
+
+    return pd.DataFrame(records)
+
+
+def upcoming_warranty_breakdown(
+    conn, days_ahead: int = 60, group_by: str = "sales_person"
+) -> pd.DataFrame:
+    """Summarise upcoming expiries grouped by a chosen dimension."""
+
+    try:
+        days = int(days_ahead)
+    except (TypeError, ValueError):
+        days = 60
+    days = max(1, min(days, 365))
+
+    grouping_options = {
+        "sales_person": (
+            "COALESCE(NULLIF(TRIM(c.sales_person), ''), 'Unassigned')",
+            "Sales person",
+        ),
+        "customer": (
+            "COALESCE(NULLIF(TRIM(c.name), ''), '(Unknown customer)')",
+            "Customer",
+        ),
+        "product": (
+            "COALESCE(NULLIF(TRIM(COALESCE(p.name, '') || CASE WHEN p.model IS NULL OR TRIM(p.model) = '' THEN '' ELSE ' ' || p.model END), ''), '(Unspecified product)')",
+            "Product",
+        ),
+    }
+
+    normalized_group = (group_by or "sales_person").lower()
+    group_expr, column_label = grouping_options.get(
+        normalized_group, grouping_options["sales_person"]
+    )
+
+    today = date.today()
+    range_end = today + timedelta(days=days)
+
+    breakdown = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT {group_expr} AS bucket,
+                   COUNT(*) AS total
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            LEFT JOIN products p ON p.product_id = w.product_id
+            WHERE w.status='active'
+              AND w.expiry_date IS NOT NULL
+              AND date(w.expiry_date) BETWEEN date(?) AND date(?)
+            GROUP BY bucket
+            ORDER BY total DESC, bucket ASC
+            """
+        ),
+        params=(today.isoformat(), range_end.isoformat()),
+    )
+
+    if breakdown.empty:
+        return pd.DataFrame(columns=[column_label, "Expiring warranties"])
+
+    renamed = breakdown.rename(
+        columns={"bucket": column_label, "total": "Expiring warranties"}
+    )
+    renamed["Expiring warranties"] = renamed["Expiring warranties"].astype(int)
+    return renamed
 
 
 def clean_text(value):
@@ -1581,39 +1756,31 @@ def dashboard(conn):
     else:
         st.info("Staff view: focus on upcoming activities below. Metrics are available to admins only.")
 
-    month_expired = int(
-        df_query(
-            conn,
-            """
-            SELECT COUNT(*) c
-            FROM warranties
-            WHERE status='active'
-              AND date(expiry_date) < date('now')
-              AND strftime('%Y-%m', expiry_date) = strftime('%Y-%m', 'now')
-            """,
-        ).iloc[0]["c"]
+    month_expired_current, month_expired_previous = month_bucket_counts(
+        conn,
+        "warranties",
+        "expiry_date",
+        where="status='active' AND date(expiry_date) < date('now')",
     )
-    service_month = int(
-        df_query(
-            conn,
-            """
-            SELECT COUNT(*) c
-            FROM services
-            WHERE service_date IS NOT NULL
-              AND strftime('%Y-%m', service_date) = strftime('%Y-%m', 'now')
-            """,
-        ).iloc[0]["c"]
+    month_expired = month_expired_current
+    expired_delta = format_metric_delta(month_expired_current, month_expired_previous)
+
+    service_month_current, service_month_previous = month_bucket_counts(
+        conn,
+        "services",
+        "service_date",
     )
-    maintenance_month = int(
-        df_query(
-            conn,
-            """
-            SELECT COUNT(*) c
-            FROM maintenance_records
-            WHERE maintenance_date IS NOT NULL
-              AND strftime('%Y-%m', maintenance_date) = strftime('%Y-%m', 'now')
-            """,
-        ).iloc[0]["c"]
+    service_month = service_month_current
+    service_delta = format_metric_delta(service_month_current, service_month_previous)
+
+    maintenance_month_current, maintenance_month_previous = month_bucket_counts(
+        conn,
+        "maintenance_records",
+        "maintenance_date",
+    )
+    maintenance_month = maintenance_month_current
+    maintenance_delta = format_metric_delta(
+        maintenance_month_current, maintenance_month_previous
     )
     today_expired_df = df_query(
         conn,
@@ -1629,11 +1796,15 @@ def dashboard(conn):
     today_expired_count = len(today_expired_df.index)
     col5, col6, col7, col8 = st.columns(4)
     with col5:
-        st.metric("Expired this month", month_expired)
+        st.metric("Expired this month", month_expired, delta=expired_delta)
     with col6:
-        st.metric("Services this month", service_month)
+        st.metric("Services this month", service_month, delta=service_delta)
     with col7:
-        st.metric("Maintenance this month", maintenance_month)
+        st.metric(
+            "Maintenance this month",
+            maintenance_month,
+            delta=maintenance_delta,
+        )
     with col8:
         st.metric("Expired today", today_expired_count)
         toggle_label = "Show list" if not st.session_state.get("show_today_expired") else "Hide list"
@@ -1754,18 +1925,104 @@ def dashboard(conn):
     ])
 
     with tab1:
-        days_window = st.slider(
-            "Upcoming window (days)",
-            min_value=7,
-            max_value=180,
-            value=60,
-            step=1,
-            help="Adjust how far ahead to look for upcoming warranty expiries.",
-        )
+        range_col, projection_col = st.columns((2, 1))
+        with range_col:
+            days_window = st.slider(
+                "Upcoming window (days)",
+                min_value=7,
+                max_value=180,
+                value=60,
+                step=1,
+                help="Adjust how far ahead to look for upcoming warranty expiries.",
+            )
+        with projection_col:
+            months_projection = st.slider(
+                "Projection window (months)",
+                min_value=1,
+                max_value=12,
+                value=6,
+                help="Preview the workload trend for active warranties.",
+            )
+
         upcoming = fetch_warranty_window(conn, 0, int(days_window))
         upcoming = format_warranty_table(upcoming)
-        st.caption(f"Active warranties scheduled to expire in the next {int(days_window)} days.")
-        st.dataframe(upcoming.head(10), use_container_width=True)
+        upcoming_count = int(len(upcoming.index)) if upcoming is not None else 0
+
+        metric_col1, metric_col2 = st.columns((1, 1))
+        with metric_col1:
+            st.metric("Upcoming expiries", upcoming_count)
+        with metric_col2:
+            st.metric("Days in view", int(days_window))
+
+        st.caption(
+            f"Active warranties scheduled to expire in the next {int(days_window)} days."
+        )
+
+        if upcoming is None or upcoming.empty:
+            st.info("No active warranties are due within the selected window.")
+        else:
+            show_all = False
+            if len(upcoming.index) > 10:
+                show_all = st.checkbox(
+                    "Show all upcoming expiries", key="show_all_upcoming"
+                )
+            upcoming_display = upcoming if show_all else upcoming.head(10)
+            st.dataframe(upcoming_display, use_container_width=True)
+
+            csv_bytes = upcoming.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download upcoming expiries (CSV)",
+                csv_bytes,
+                file_name="upcoming_warranties.csv",
+                mime="text/csv",
+                key="download_upcoming_csv",
+            )
+
+            breakdown_labels = {
+                "sales_person": "Sales person",
+                "customer": "Customer",
+                "product": "Product",
+            }
+            selected_breakdown = st.selectbox(
+                "Group upcoming expiries by",
+                options=list(breakdown_labels.keys()),
+                format_func=lambda key: breakdown_labels[key],
+                help="Identify who or what is most affected in the chosen window.",
+                key="upcoming_breakdown_selector",
+            )
+
+            breakdown_df = upcoming_warranty_breakdown(
+                conn, int(days_window), selected_breakdown
+            )
+            label_column = breakdown_df.columns[0] if not breakdown_df.empty else breakdown_labels[selected_breakdown]
+            st.caption(
+                "Use this breakdown to prioritise outreach for the busiest owners or products."
+            )
+            if breakdown_df.empty:
+                st.info(
+                    f"No grouping data available for the selected window ({label_column})."
+                )
+            else:
+                st.dataframe(breakdown_df, use_container_width=True)
+                top_focus = breakdown_df.iloc[0]
+                st.success(
+                    f"Highest upcoming load: {top_focus[label_column]} ({int(top_focus['Expiring warranties'])} warranties)."
+                )
+
+        projection_df = upcoming_warranty_projection(conn, int(months_projection))
+        st.caption("Projected monthly warranty expiries")
+        if projection_df.empty:
+            st.info("No active warranties are scheduled to expire in the selected projection window.")
+        else:
+            st.bar_chart(projection_df.set_index("Month"))
+            peak_row = projection_df.loc[projection_df["Expiring warranties"].idxmax()]
+            peak_value = int(peak_row["Expiring warranties"])
+            if peak_value > 0:
+                st.success(
+                    f"Peak month: {peak_row['Month']} with {peak_value} scheduled expiries."
+                )
+            else:
+                st.info("All selected months currently show zero scheduled expiries.")
 
     with tab2:
         recent_services = df_query(
