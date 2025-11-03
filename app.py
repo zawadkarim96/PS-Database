@@ -882,6 +882,7 @@ def _reset_new_customer_form_state() -> None:
     for key in [
         "new_customer_name",
         "new_customer_phone",
+        "new_customer_email",
         "new_customer_address",
         "new_customer_purchase_date",
         "new_customer_do_code",
@@ -997,6 +998,24 @@ def save_uploaded_file(uploaded_file, target_dir: Path, filename: Optional[str] 
     return dest
 
 
+def store_uploaded_pdf(uploaded_file, target_dir: Path, filename: Optional[str] = None) -> Optional[str]:
+    """Persist an uploaded PDF and return its path relative to ``BASE_DIR``.
+
+    Streamlit's ``UploadedFile`` objects expose a ``read`` method and ``name``
+    attribute. This helper mirrors ``save_uploaded_file`` but normalises the
+    resulting path so callers can safely stash it in the database without
+    worrying about absolute paths or platform differences.
+    """
+
+    saved_path = save_uploaded_file(uploaded_file, target_dir, filename=filename)
+    if not saved_path:
+        return None
+    try:
+        return str(saved_path.relative_to(BASE_DIR))
+    except ValueError:
+        return str(saved_path)
+
+
 def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     if not path_str:
         return None
@@ -1089,13 +1108,9 @@ def attach_documents(
         original_name = uploaded.name or f"{prefix}_{idx}.pdf"
         safe_original = Path(original_name).name
         filename = f"{prefix}_{idx}_{safe_original}"
-        saved_path = save_uploaded_file(uploaded, target_dir, filename=filename)
-        if not saved_path:
+        stored_path = store_uploaded_pdf(uploaded, target_dir, filename=filename)
+        if not stored_path:
             continue
-        try:
-            stored_path = str(saved_path.relative_to(BASE_DIR))
-        except ValueError:
-            stored_path = str(saved_path)
         conn.execute(
             f"INSERT INTO {table} ({fk_column}, file_path, original_name) VALUES (?, ?, ?)",
             (int(record_id), stored_path, safe_original),
@@ -1146,7 +1161,7 @@ def merge_customer_records(conn, customer_ids) -> bool:
     placeholders = ",".join(["?"] * len(ids))
     query = dedent(
         f"""
-        SELECT customer_id, name, phone, address, purchase_date, product_info, delivery_order_code, sales_person, created_at
+        SELECT customer_id, name, phone, email, address, purchase_date, product_info, delivery_order_code, sales_person, created_at
         FROM customers
         WHERE customer_id IN ({placeholders})
         """
@@ -1171,12 +1186,15 @@ def merge_customer_records(conn, customer_ids) -> bool:
     name_values = [v for v in name_values if v]
     address_values = [clean_text(v) for v in df.get("address", pd.Series(dtype=object)).tolist()]
     address_values = [v for v in address_values if v]
+    email_values = [clean_text(v) for v in df.get("email", pd.Series(dtype=object)).tolist()]
+    email_values = [v for v in email_values if v]
     phone_values = [clean_text(v) for v in df.get("phone", pd.Series(dtype=object)).tolist()]
     phone_values = [v for v in phone_values if v]
     phones_to_recalc: set[str] = set(phone_values)
 
     base_name = clean_text(base_row.get("name")) or (name_values[0] if name_values else None)
     base_address = clean_text(base_row.get("address")) or (address_values[0] if address_values else None)
+    base_email = clean_text(base_row.get("email")) or (email_values[0] if email_values else None)
     base_phone = clean_text(base_row.get("phone")) or (phone_values[0] if phone_values else None)
 
     do_codes = []
@@ -1217,12 +1235,13 @@ def merge_customer_records(conn, customer_ids) -> bool:
     conn.execute(
         """
         UPDATE customers
-        SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, dup_flag=0
+        SET name=?, phone=?, email=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, dup_flag=0
         WHERE customer_id=?
         """,
         (
             base_name,
             base_phone,
+            base_email,
             base_address,
             earliest_purchase,
             clean_text(combined_products),
@@ -2538,6 +2557,11 @@ def customers_page(conn):
         with st.form("new_customer"):
             name = st.text_input("Name *", key="new_customer_name")
             phone = st.text_input("Phone", key="new_customer_phone")
+            email = st.text_input(
+                "Email",
+                key="new_customer_email",
+                help="Optional contact email for the customer.",
+            )
             address = st.text_area("Address", key="new_customer_address")
             purchase_date = st.date_input(
                 "Purchase/Issue date",
@@ -2585,18 +2609,29 @@ def customers_page(conn):
             product_entries = edited_products.to_dict("records")
             st.session_state["new_customer_products_rows"] = product_entries
             st.session_state["new_customer_products_table"] = edited_products
-            do_code = st.text_input(
-                "Delivery order code",
-                key="new_customer_do_code",
-                help="Link the customer to an existing delivery order if available.",
-            )
-            sales_person_input = st.text_input(
-                "Sales person",
-                key="new_customer_sales_person",
-                help="Record who handled this sale for quick reference later.",
-            )
-            customer_pdf = st.file_uploader("Attach customer PDF", type=["pdf"], key="new_customer_pdf")
-            do_pdf = st.file_uploader("Attach Delivery Order (PDF)", type=["pdf"], key="new_customer_do_pdf")
+            with st.expander("Advanced details (optional)", expanded=True):
+                do_code = st.text_input(
+                    "Delivery order code",
+                    key="new_customer_do_code",
+                    help="Link the customer to an existing delivery order if available.",
+                )
+                sales_person_input = st.text_input(
+                    "Sales person",
+                    key="new_customer_sales_person",
+                    help="Record who handled this sale for quick reference later.",
+                )
+                customer_pdf = st.file_uploader(
+                    "Attach customer PDF",
+                    type=["pdf"],
+                    key="new_customer_pdf",
+                    help="Upload signed agreements, invoices or other supporting paperwork.",
+                )
+                do_pdf = st.file_uploader(
+                    "Attach Delivery Order (PDF)",
+                    type=["pdf"],
+                    key="new_customer_do_pdf",
+                    help="Upload the delivery order so it is linked to this record.",
+                )
             action_cols = st.columns((1, 1))
             submitted = action_cols[0].form_submit_button(
                 "Save new customer", type="primary"
@@ -2610,20 +2645,33 @@ def customers_page(conn):
                 )
                 _safe_rerun()
                 return
-            if submitted and name.strip():
+            if submitted:
+                errors: list[str] = []
+                if not name.strip():
+                    errors.append("Customer name is required before saving.")
+                do_serial = clean_text(do_code)
+                if do_pdf is not None and not do_serial:
+                    errors.append(
+                        "Enter a delivery order code before attaching a delivery order PDF."
+                    )
+                if errors:
+                    for msg in errors:
+                        st.error(msg)
+                    return
                 cur = conn.cursor()
                 name_val = clean_text(name)
                 phone_val = clean_text(phone)
+                email_val = clean_text(email)
                 address_val = clean_text(address)
                 cleaned_products, product_labels = normalize_product_entries(product_entries)
                 product_label = "\n".join(product_labels) if product_labels else None
                 purchase_str = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
-                do_serial = clean_text(do_code)
                 cur.execute(
-                    "INSERT INTO customers (name, phone, address, purchase_date, product_info, delivery_order_code, sales_person, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                    "INSERT INTO customers (name, phone, email, address, purchase_date, product_info, delivery_order_code, sales_person, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (
                         name_val,
                         phone_val,
+                        email_val,
                         address_val,
                         purchase_str,
                         product_label,
@@ -2666,39 +2714,73 @@ def customers_page(conn):
                         )
                     conn.commit()
                 if do_serial:
+                    stored_path = None
+                    if do_pdf is not None:
+                        safe_name = _sanitize_path_component(do_serial)
+                        stored_path = store_uploaded_pdf(
+                            do_pdf, DELIVERY_ORDER_DIR, filename=f"{safe_name}.pdf"
+                        )
                     cur = conn.cursor()
-                    cur.execute("SELECT 1 FROM delivery_orders WHERE do_number = ?", (do_serial,))
-                    if cur.fetchone():
-                        st.warning("Delivery order code already exists. Skipped linking.")
+                    existing = cur.execute(
+                        "SELECT customer_id, file_path FROM delivery_orders WHERE do_number = ?",
+                        (do_serial,),
+                    ).fetchone()
+                    product_summary = (
+                        cleaned_products[0].get("name") if cleaned_products else product_label
+                    )
+                    sales_clean = clean_text(sales_person_input)
+                    if existing:
+                        existing_customer = existing[0]
+                        existing_path = existing[1]
+                        if existing_customer and int(existing_customer) != int(cid):
+                            st.warning(
+                                "Delivery order code already linked to another customer. Upload skipped."
+                            )
+                            if stored_path and stored_path != existing_path:
+                                new_path = resolve_upload_path(stored_path)
+                                if new_path and new_path.exists():
+                                    try:
+                                        new_path.unlink()
+                                    except Exception:
+                                        pass
+                        else:
+                            final_path = stored_path or existing_path
+                            if stored_path and existing_path and stored_path != existing_path:
+                                old_path = resolve_upload_path(existing_path)
+                                if old_path and old_path.exists():
+                                    try:
+                                        old_path.unlink()
+                                    except Exception:
+                                        pass
+                            conn.execute(
+                                "UPDATE delivery_orders SET customer_id=?, description=?, sales_person=?, file_path=? WHERE do_number=?",
+                                (
+                                    cid,
+                                    product_summary,
+                                    sales_clean,
+                                    final_path,
+                                    do_serial,
+                                ),
+                            )
+                            conn.commit()
                     else:
-                        stored_path = None
-                        if do_pdf is not None:
-                            safe_name = _sanitize_path_component(do_serial)
-                            saved = save_uploaded_file(do_pdf, DELIVERY_ORDER_DIR, filename=f"{safe_name}.pdf")
-                            if saved:
-                                try:
-                                    stored_path = str(saved.relative_to(BASE_DIR))
-                                except ValueError:
-                                    stored_path = str(saved)
                         conn.execute(
                             "INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path) VALUES (?, ?, ?, ?, ?, ?)",
                             (
                                 do_serial,
                                 cid,
                                 None,
-                                cleaned_products[0].get("name") if cleaned_products else None,
-                                clean_text(sales_person_input),
+                                product_summary,
+                                sales_clean,
                                 stored_path,
                             ),
                         )
                         conn.commit()
                 if customer_pdf is not None:
-                    saved = save_uploaded_file(customer_pdf, CUSTOMER_DOCS_DIR, filename=f"customer_{cid}.pdf")
-                    if saved:
-                        try:
-                            stored_path = str(saved.relative_to(BASE_DIR))
-                        except ValueError:
-                            stored_path = str(saved)
+                    stored_path = store_uploaded_pdf(
+                        customer_pdf, CUSTOMER_DOCS_DIR, filename=f"customer_{cid}.pdf"
+                    )
+                    if stored_path:
                         conn.execute(
                             "UPDATE customers SET attachment_path=? WHERE customer_id=?",
                             (stored_path, cid),
@@ -2714,17 +2796,28 @@ def customers_page(conn):
                 )
                 _safe_rerun()
                 return
-            elif submitted:
-                st.error("Customer name is required before saving.")
     sort_dir = st.radio("Sort by created date", ["Newest first", "Oldest first"], horizontal=True)
     order = "DESC" if sort_dir == "Newest first" else "ASC"
     q = st.text_input("Search (name/phone/address/product/DO)")
-    df_raw = df_query(conn, f"""
-        SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, sales_person, attachment_path, created_at, dup_flag
+    df_raw = df_query(
+        conn,
+        f"""
+        SELECT customer_id as id, name, phone, email, address, purchase_date, product_info, delivery_order_code, sales_person, attachment_path, created_at, dup_flag
         FROM customers
-        WHERE (? = '' OR name LIKE '%'||?||'%' OR phone LIKE '%'||?||'%' OR address LIKE '%'||?||'%' OR product_info LIKE '%'||?||'%' OR delivery_order_code LIKE '%'||?||'%' OR sales_person LIKE '%'||?||'%')
+        WHERE (
+            ? = ''
+            OR name LIKE '%'||?||'%'
+            OR phone LIKE '%'||?||'%'
+            OR email LIKE '%'||?||'%'
+            OR address LIKE '%'||?||'%'
+            OR product_info LIKE '%'||?||'%'
+            OR delivery_order_code LIKE '%'||?||'%'
+            OR sales_person LIKE '%'||?||'%'
+        )
         ORDER BY datetime(created_at) {order}
-    """, (q, q, q, q, q, q, q))
+    """,
+        (q, q, q, q, q, q, q, q),
+    )
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
     st.markdown("### Quick edit or delete")
@@ -2750,6 +2843,7 @@ def customers_page(conn):
                 "id",
                 "name",
                 "phone",
+                "email",
                 "address",
                 "purchase_date",
                 "product_info",
@@ -2771,6 +2865,10 @@ def customers_page(conn):
                 "id": st.column_config.Column("ID", disabled=True),
                 "name": st.column_config.TextColumn("Name"),
                 "phone": st.column_config.TextColumn("Phone"),
+                "email": st.column_config.TextColumn(
+                    "Email",
+                    help="Optional email address kept with the customer record.",
+                ),
                 "address": st.column_config.TextColumn("Address"),
                 "purchase_date": st.column_config.DateColumn("Purchase date", format="DD-MM-YYYY", required=False),
                 "product_info": st.column_config.TextColumn("Product"),
@@ -2806,6 +2904,7 @@ def customers_page(conn):
                         continue
                     new_name = clean_text(row.get("name"))
                     new_phone = clean_text(row.get("phone"))
+                    new_email = clean_text(row.get("email"))
                     new_address = clean_text(row.get("address"))
                     purchase_str, _ = date_strings_from_input(row.get("purchase_date"))
                     product_label = clean_text(row.get("product_info"))
@@ -2814,6 +2913,7 @@ def customers_page(conn):
                     original_row = original_map[cid]
                     old_name = clean_text(original_row.get("name"))
                     old_phone = clean_text(original_row.get("phone"))
+                    old_email = clean_text(original_row.get("email"))
                     old_address = clean_text(original_row.get("address"))
                     old_purchase = clean_text(original_row.get("purchase_date"))
                     old_product = clean_text(original_row.get("product_info"))
@@ -2822,6 +2922,7 @@ def customers_page(conn):
                     if (
                         new_name == old_name
                         and new_phone == old_phone
+                        and new_email == old_email
                         and new_address == old_address
                         and purchase_str == old_purchase
                         and product_label == old_product
@@ -2830,10 +2931,11 @@ def customers_page(conn):
                     ):
                         continue
                     conn.execute(
-                        "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, dup_flag=0 WHERE customer_id=?",
+                        "UPDATE customers SET name=?, phone=?, email=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, dup_flag=0 WHERE customer_id=?",
                         (
                             new_name,
                             new_phone,
+                            new_email,
                             new_address,
                             purchase_str,
                             product_label,
@@ -2936,6 +3038,7 @@ def customers_page(conn):
             with st.form(f"edit_customer_{selected_customer_id}"):
                 name_edit = st.text_input("Name", value=clean_text(selected_raw.get("name")) or "")
                 phone_edit = st.text_input("Phone", value=clean_text(selected_raw.get("phone")) or "")
+                email_edit = st.text_input("Email", value=clean_text(selected_raw.get("email")) or "")
                 address_edit = st.text_area("Address", value=clean_text(selected_raw.get("address")) or "")
                 purchase_edit = st.text_input(
                     "Purchase date (DD-MM-YYYY)", value=clean_text(selected_fmt.get("purchase_date")) or ""
@@ -2957,6 +3060,7 @@ def customers_page(conn):
                 old_phone = clean_text(selected_raw.get("phone"))
                 new_name = clean_text(name_edit)
                 new_phone = clean_text(phone_edit)
+                new_email = clean_text(email_edit)
                 new_address = clean_text(address_edit)
                 purchase_str, _ = date_strings_from_input(purchase_edit)
                 product_label = clean_text(product_edit)
@@ -2965,25 +3069,28 @@ def customers_page(conn):
                 new_sales_person = clean_text(sales_person_edit)
                 new_attachment_path = attachment_path
                 if new_pdf is not None:
-                    saved = save_uploaded_file(new_pdf, CUSTOMER_DOCS_DIR, filename=f"customer_{selected_customer_id}.pdf")
-                    if saved:
-                        try:
-                            stored_path = str(saved.relative_to(BASE_DIR))
-                        except ValueError:
-                            stored_path = str(saved)
+                    stored_path = store_uploaded_pdf(
+                        new_pdf,
+                        CUSTOMER_DOCS_DIR,
+                        filename=f"customer_{selected_customer_id}.pdf",
+                    )
+                    if stored_path:
                         new_attachment_path = stored_path
                         if attachment_path:
                             old_path = resolve_upload_path(attachment_path)
-                            if old_path and old_path.exists() and old_path != saved:
-                                try:
-                                    old_path.unlink()
-                                except Exception:
-                                    pass
+                            if old_path and old_path.exists():
+                                new_path = resolve_upload_path(stored_path)
+                                if not new_path or new_path != old_path:
+                                    try:
+                                        old_path.unlink()
+                                    except Exception:
+                                        pass
                 conn.execute(
-                    "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, attachment_path=?, dup_flag=0 WHERE customer_id=?",
+                    "UPDATE customers SET name=?, phone=?, email=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, sales_person=?, attachment_path=?, dup_flag=0 WHERE customer_id=?",
                     (
                         new_name,
                         new_phone,
+                        new_email,
                         new_address,
                         purchase_str,
                         product_label,
@@ -3207,7 +3314,7 @@ def customers_page(conn):
                             st.warning("Some changes were saved, but please review the errors above.")
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
-        SELECT customer_id as id, name, phone, purchase_date, product_info, delivery_order_code, sales_person, created_at
+        SELECT customer_id as id, name, phone, email, purchase_date, product_info, delivery_order_code, sales_person, created_at
         FROM customers
         ORDER BY datetime(created_at) DESC LIMIT 200
     """)
@@ -3530,16 +3637,12 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 )
                 bill_saved = False
                 if bill_file is not None:
-                    saved_bill = save_uploaded_file(
+                    stored_path = store_uploaded_pdf(
                         bill_file,
                         SERVICE_BILL_DIR,
                         filename=f"service_{service_id}_bill.pdf",
                     )
-                    if saved_bill:
-                        try:
-                            stored_path = str(saved_bill.relative_to(BASE_DIR))
-                        except ValueError:
-                            stored_path = str(saved_bill)
+                    if stored_path:
                         conn.execute(
                             "UPDATE services SET bill_document_path = ? WHERE service_id = ?",
                             (stored_path, int(service_id)),
@@ -3781,25 +3884,23 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 replaced_bill = False
                 removed_bill = False
                 if bill_file_edit is not None:
-                    saved_bill = save_uploaded_file(
+                    stored_path = store_uploaded_pdf(
                         bill_file_edit,
                         SERVICE_BILL_DIR,
                         filename=f"service_{selected_service_id}_bill.pdf",
                     )
-                    if saved_bill:
-                        try:
-                            stored_path = str(saved_bill.relative_to(BASE_DIR))
-                        except ValueError:
-                            stored_path = str(saved_bill)
+                    if stored_path:
                         bill_path_value = stored_path
                         replaced_bill = True
                         if current_bill_path:
                             old_path = resolve_upload_path(current_bill_path)
-                            if old_path and old_path.exists() and old_path != saved_bill:
-                                try:
-                                    old_path.unlink()
-                                except Exception:
-                                    pass
+                            if old_path and old_path.exists():
+                                new_path = resolve_upload_path(stored_path)
+                                if not new_path or new_path != old_path:
+                                    try:
+                                        old_path.unlink()
+                                    except Exception:
+                                        pass
                 elif clear_bill and current_bill_path:
                     old_path = resolve_upload_path(current_bill_path)
                     if old_path and old_path.exists():
@@ -5250,7 +5351,7 @@ def scraps_page(conn):
     scraps = df_query(
         conn,
         f"""
-        SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, created_at
+        SELECT customer_id as id, name, phone, email, address, purchase_date, product_info, delivery_order_code, created_at
         FROM customers
         WHERE {customer_incomplete_clause()}
         ORDER BY datetime(created_at) DESC
@@ -5270,7 +5371,7 @@ def scraps_page(conn):
         return ", ".join(missing)
 
     scraps = scraps.assign(missing=scraps.apply(missing_fields, axis=1))
-    display_cols = ["name", "phone", "address", "purchase_date", "product_info", "delivery_order_code", "missing", "created_at"]
+    display_cols = ["name", "phone", "email", "address", "purchase_date", "product_info", "delivery_order_code", "missing", "created_at"]
     st.dataframe(scraps[display_cols])
 
     st.markdown("### Update scrap record")
@@ -5298,6 +5399,7 @@ def scraps_page(conn):
     with st.form("scrap_update_form"):
         name = st.text_input("Name", existing_value("name"))
         phone = st.text_input("Phone", existing_value("phone"))
+        email = st.text_input("Email", existing_value("email"))
         address = st.text_area("Address", existing_value("address"))
         purchase = st.text_input("Purchase date (DD-MM-YYYY)", existing_value("purchase_date"))
         product = st.text_input("Product", existing_value("product_info"))
@@ -5309,16 +5411,18 @@ def scraps_page(conn):
     if save:
         new_name = clean_text(name)
         new_phone = clean_text(phone)
+        new_email = clean_text(email)
         new_address = clean_text(address)
         purchase_str, _ = date_strings_from_input(purchase)
         new_product = clean_text(product)
         new_do = clean_text(do_code)
         old_phone = clean_text(selected.get("phone"))
         conn.execute(
-            "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
+            "UPDATE customers SET name=?, phone=?, email=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
             (
                 new_name,
                 new_phone,
+                new_email,
                 new_address,
                 purchase_str,
                 new_product,
@@ -5402,6 +5506,7 @@ HEADER_MAP = {
     "customer_name": {"customer_name", "customer", "company", "company_name", "client", "party", "name"},
     "address": {"address", "addr", "street", "location"},
     "phone": {"phone", "mobile", "contact", "contact_no", "phone_no", "phone_number", "cell", "whatsapp"},
+    "email": {"email", "mail", "e_mail", "email_address", "contact_email"},
     "product": {"product", "item", "generator", "model", "description"},
     "do_code": {"do_code", "delivery_order", "delivery_order_code", "delivery_order_no", "do", "d_o_code", "do_number"},
 }
@@ -5700,7 +5805,7 @@ def duplicates_page(conn):
     st.subheader("⚠️ Possible Duplicates")
     cust_raw = df_query(
         conn,
-        "SELECT customer_id as id, name, phone, address, purchase_date, product_info, delivery_order_code, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC",
+        "SELECT customer_id as id, name, phone, email, address, purchase_date, product_info, delivery_order_code, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC",
     )
     warr = df_query(
         conn,
@@ -5738,6 +5843,7 @@ def duplicates_page(conn):
                 "__group_key",
                 "name",
                 "phone",
+                "email",
                 "address",
                 "purchase_date_fmt",
                 "product_info",
@@ -5793,6 +5899,7 @@ def duplicates_page(conn):
                     "id",
                     "name",
                     "phone",
+                    "email",
                     "address",
                     "purchase_date",
                     "product_info",
@@ -5814,6 +5921,7 @@ def duplicates_page(conn):
                     "id": st.column_config.Column("ID", disabled=True),
                     "name": st.column_config.TextColumn("Name"),
                     "phone": st.column_config.TextColumn("Phone"),
+                    "email": st.column_config.TextColumn("Email"),
                     "address": st.column_config.TextColumn("Address"),
                     "purchase_date": st.column_config.DateColumn("Purchase date", format="DD-MM-YYYY", required=False),
                     "product_info": st.column_config.TextColumn("Product"),
@@ -5851,6 +5959,7 @@ def duplicates_page(conn):
                             continue
                         new_name = clean_text(row.get("name"))
                         new_phone = clean_text(row.get("phone"))
+                        new_email = clean_text(row.get("email"))
                         new_address = clean_text(row.get("address"))
                         purchase_str, _ = date_strings_from_input(row.get("purchase_date"))
                         product_label = clean_text(row.get("product_info"))
@@ -5858,6 +5967,7 @@ def duplicates_page(conn):
                         original_row = raw_map[cid]
                         old_name = clean_text(original_row.get("name"))
                         old_phone = clean_text(original_row.get("phone"))
+                        old_email = clean_text(original_row.get("email"))
                         old_address = clean_text(original_row.get("address"))
                         old_purchase = clean_text(original_row.get("purchase_date"))
                         old_product = clean_text(original_row.get("product_info"))
@@ -5865,6 +5975,7 @@ def duplicates_page(conn):
                         if (
                             new_name == old_name
                             and new_phone == old_phone
+                            and new_email == old_email
                             and new_address == old_address
                             and purchase_str == old_purchase
                             and product_label == old_product
@@ -5872,10 +5983,11 @@ def duplicates_page(conn):
                         ):
                             continue
                         conn.execute(
-                            "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
+                            "UPDATE customers SET name=?, phone=?, email=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
                             (
                                 new_name,
                                 new_phone,
+                                new_email,
                                 new_address,
                                 purchase_str,
                                 product_label,
@@ -6010,13 +6122,14 @@ def _import_clean6(conn, df, tag="Import"):
     for _, r in df.iterrows():
         d = r.get("date", pd.NaT)
         cust = r.get("customer_name"); addr = r.get("address")
-        phone = r.get("phone"); prod = r.get("product")
+        phone = r.get("phone"); email = r.get("email"); prod = r.get("product")
         do_code = r.get("do_code")
         if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
             continue
         cust = str(cust) if pd.notna(cust) else None
         addr = str(addr) if pd.notna(addr) else None
         phone = str(phone) if pd.notna(phone) else None
+        email = str(email) if pd.notna(email) else None
         prod = str(prod) if pd.notna(prod) else None
         purchase_dt = parse_date_value(d)
         purchase_str = purchase_dt.strftime("%Y-%m-%d") if isinstance(purchase_dt, pd.Timestamp) else None
@@ -6039,8 +6152,8 @@ def _import_clean6(conn, df, tag="Import"):
 
         dupc = 1 if exists_phone(phone, purchase_str) else 0
         cur.execute(
-            "INSERT INTO customers (name, phone, address, dup_flag) VALUES (?, ?, ?, ?)",
-            (cust, phone, addr, dupc),
+            "INSERT INTO customers (name, phone, email, address, dup_flag) VALUES (?, ?, ?, ?, ?)",
+            (cust, phone, email, addr, dupc),
         )
         cid = cur.lastrowid
         if dupc:

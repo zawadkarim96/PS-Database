@@ -189,3 +189,28 @@ def test_export_database_to_excel_has_curated_sheets(db_conn, app_module):
     summary = dict(zip(master_df["Sheet"], master_df["Details"]))
     assert "Customers" in summary and summary["Customers"].startswith("1 ")
     assert "Warranties" in summary and summary["Warranties"].startswith("1 ")
+
+
+def test_store_uploaded_pdf_returns_relative_path(tmp_path, app_module):
+    target_dir = app_module.UPLOADS_DIR / "test_helper"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dummy = io.BytesIO(b"example data")
+    dummy.name = "dummy.pdf"
+
+    stored_path = app_module.store_uploaded_pdf(dummy, target_dir)
+
+    assert stored_path is not None
+    resolved = app_module.resolve_upload_path(stored_path)
+    assert resolved is not None and resolved.exists()
+    assert resolved.suffix == ".pdf"
+    assert stored_path.endswith("dummy.pdf")
+
+    # Clean up helper artefacts so repeated test runs stay isolated
+    try:
+        if resolved.exists():
+            resolved.unlink()
+    finally:
+        try:
+            target_dir.rmdir()
+        except OSError:
+            pass
