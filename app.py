@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import re
 import sqlite3
@@ -15,6 +16,7 @@ import pandas as pd
 
 
 import streamlit as st
+from collections import OrderedDict
 
 try:
     from storage_paths import get_storage_dir
@@ -45,6 +47,8 @@ SERVICE_DOCS_DIR = UPLOADS_DIR / "service_documents"
 MAINTENANCE_DOCS_DIR = UPLOADS_DIR / "maintenance_documents"
 CUSTOMER_DOCS_DIR = UPLOADS_DIR / "customer_documents"
 SERVICE_BILL_DIR = UPLOADS_DIR / "service_bills"
+
+DEFAULT_QUOTATION_VALID_DAYS = 30
 
 REQUIRED_CUSTOMER_FIELDS = {
     "name": "Name",
@@ -546,6 +550,41 @@ def format_money(value) -> Optional[str]:
     return f"{amount:,.2f}"
 
 
+def _coerce_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return default
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def _clamp_percentage(value: float) -> float:
+    if value < 0.0:
+        return 0.0
+    if value > 100.0:
+        return 100.0
+    return value
+
+
+def _value_or_default(value: object, default: object) -> object:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):  # type: ignore[arg-type]
+            return default
+    except Exception:
+        pass
+    if isinstance(value, str) and value.strip() == "":
+        return default
+    return value
+
+
 def normalize_product_entries(
     entries: Iterable[dict[str, object]]
 ) -> tuple[list[dict[str, object]], list[str]]:
@@ -556,11 +595,12 @@ def normalize_product_entries(
         model_clean = clean_text(entry.get("model")) if isinstance(entry, dict) else None
         serial_clean = clean_text(entry.get("serial")) if isinstance(entry, dict) else None
         quantity_raw = entry.get("quantity") if isinstance(entry, dict) else None
+        qty_val = _coerce_float(quantity_raw, 1.0)
         try:
-            qty_val = int(quantity_raw or 1)
+            qty_val_int = int(round(qty_val))
         except Exception:
-            qty_val = 1
-        qty_val = max(qty_val, 1)
+            qty_val_int = 1
+        qty_val = max(qty_val_int, 1)
         if not any([name_clean, model_clean, serial_clean]):
             continue
         cleaned.append(
@@ -580,6 +620,76 @@ def normalize_product_entries(
         if label:
             labels.append(label)
     return cleaned, labels
+
+
+def normalize_quotation_items(
+    entries: Iterable[dict[str, object]]
+) -> tuple[list[dict[str, object]], dict[str, float]]:
+    cleaned: list[dict[str, object]] = []
+    totals = {
+        "gross_total": 0.0,
+        "discount_total": 0.0,
+        "taxable_total": 0.0,
+        "cgst_total": 0.0,
+        "sgst_total": 0.0,
+        "igst_total": 0.0,
+        "grand_total": 0.0,
+    }
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        description = clean_text(entry.get("description"))
+        if not description:
+            continue
+
+        hsn = clean_text(entry.get("hsn"))
+        unit = clean_text(entry.get("unit"))
+        quantity = max(_coerce_float(entry.get("quantity"), 0.0), 0.0)
+        rate = max(_coerce_float(entry.get("rate"), 0.0), 0.0)
+        discount_pct = _clamp_percentage(_coerce_float(entry.get("discount"), 0.0))
+        cgst_pct = _clamp_percentage(_coerce_float(entry.get("cgst"), 0.0))
+        sgst_pct = _clamp_percentage(_coerce_float(entry.get("sgst"), 0.0))
+        igst_pct = _clamp_percentage(_coerce_float(entry.get("igst"), 0.0))
+
+        gross_amount = quantity * rate
+        discount_amount = gross_amount * (discount_pct / 100.0)
+        taxable_value = max(gross_amount - discount_amount, 0.0)
+        cgst_amount = taxable_value * (cgst_pct / 100.0)
+        sgst_amount = taxable_value * (sgst_pct / 100.0)
+        igst_amount = taxable_value * (igst_pct / 100.0)
+        line_total = taxable_value + cgst_amount + sgst_amount + igst_amount
+
+        item = {
+            "Item": len(cleaned) + 1,
+            "Description": description,
+            "HSN/SAC": hsn,
+            "Unit": unit,
+            "Quantity": quantity,
+            "Rate": rate,
+            "Gross amount": gross_amount,
+            "Discount (%)": discount_pct,
+            "Discount amount": discount_amount,
+            "Taxable value": taxable_value,
+            "CGST (%)": cgst_pct,
+            "CGST amount": cgst_amount,
+            "SGST (%)": sgst_pct,
+            "SGST amount": sgst_amount,
+            "IGST (%)": igst_pct,
+            "IGST amount": igst_amount,
+            "Line total": line_total,
+        }
+        cleaned.append(item)
+
+        totals["gross_total"] += gross_amount
+        totals["discount_total"] += discount_amount
+        totals["taxable_total"] += taxable_value
+        totals["cgst_total"] += cgst_amount
+        totals["sgst_total"] += sgst_amount
+        totals["igst_total"] += igst_amount
+        totals["grand_total"] += line_total
+
+    return cleaned, totals
 
 
 def format_period_label(
@@ -759,6 +869,71 @@ def _safe_rerun():
             st.experimental_rerun()
         except Exception:
             pass
+
+
+def _default_new_customer_products() -> list[dict[str, object]]:
+    return [{"name": "", "model": "", "serial": "", "quantity": 1}]
+
+
+def _reset_new_customer_form_state() -> None:
+    default_products = _default_new_customer_products()
+    st.session_state["new_customer_products_rows"] = default_products
+    st.session_state["new_customer_products_table"] = pd.DataFrame(default_products)
+    for key in [
+        "new_customer_name",
+        "new_customer_phone",
+        "new_customer_address",
+        "new_customer_purchase_date",
+        "new_customer_do_code",
+        "new_customer_sales_person",
+        "new_customer_pdf",
+        "new_customer_do_pdf",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _default_quotation_items() -> list[dict[str, object]]:
+    return [
+        {
+            "description": "",
+            "hsn": "",
+            "unit": "",
+            "quantity": 1.0,
+            "rate": 0.0,
+            "discount": 0.0,
+            "cgst": 0.0,
+            "sgst": 0.0,
+            "igst": 0.0,
+        }
+    ]
+
+
+def _reset_quotation_form_state() -> None:
+    default_items = _default_quotation_items()
+    st.session_state["quotation_item_rows"] = default_items
+    st.session_state["quotation_items_table"] = pd.DataFrame(default_items)
+    for key in [
+        "quotation_reference",
+        "quotation_date",
+        "quotation_prepared_by",
+        "quotation_valid_days",
+        "quotation_round_total",
+        "quotation_company_name",
+        "quotation_company_details",
+        "quotation_customer_name",
+        "quotation_customer_contact",
+        "quotation_customer_address",
+        "quotation_project_name",
+        "quotation_subject",
+        "quotation_scope_notes",
+        "quotation_terms",
+        "quotation_default_discount",
+        "quotation_default_cgst",
+        "quotation_default_sgst",
+        "quotation_default_igst",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state.pop("quotation_result", None)
 
 
 def _streamlit_runtime_active() -> bool:
@@ -2340,61 +2515,101 @@ def show_expiry_notifications(conn):
 
 def customers_page(conn):
     st.subheader("👥 Customers")
+    feedback = st.session_state.pop("new_customer_feedback", None)
+    if feedback:
+        level, message = feedback
+        if level == "success":
+            st.success(message)
+        elif level == "info":
+            st.info(message)
+        elif level == "warning":
+            st.warning(message)
+        else:
+            st.write(message)
+
     with st.expander("Add new customer"):
+        products_state = st.session_state.get(
+            "new_customer_products_rows",
+            _default_new_customer_products(),
+        )
+        st.session_state.setdefault(
+            "new_customer_products_rows", products_state
+        )
         with st.form("new_customer"):
-            name = st.text_input("Name *")
-            phone = st.text_input("Phone")
-            address = st.text_area("Address")
-            purchase_date = st.date_input("Purchase/Issue date", value=datetime.now().date())
-            product_count = st.number_input(
-                "Number of products",
-                min_value=1,
-                max_value=20,
-                value=1,
-                step=1,
-                key="new_customer_product_count",
-                help="Add additional rows when a customer has purchased multiple products.",
+            name = st.text_input("Name *", key="new_customer_name")
+            phone = st.text_input("Phone", key="new_customer_phone")
+            address = st.text_area("Address", key="new_customer_address")
+            purchase_date = st.date_input(
+                "Purchase/Issue date",
+                value=datetime.now().date(),
+                key="new_customer_purchase_date",
             )
-            product_entries: list[dict[str, object]] = []
-            for idx in range(int(product_count)):
-                cols = st.columns((2, 2, 2, 1))
-                with cols[0]:
-                    product_name = st.text_input(
-                        f"Product {idx + 1} details",
-                        key=f"new_customer_product_name_{idx}",
-                    )
-                with cols[1]:
-                    product_model = st.text_input(
-                        f"Model {idx + 1}",
-                        key=f"new_customer_product_model_{idx}",
-                    )
-                with cols[2]:
-                    product_serial = st.text_input(
-                        f"Serial {idx + 1}",
-                        key=f"new_customer_product_serial_{idx}",
-                    )
-                with cols[3]:
-                    product_quantity = st.number_input(
-                        f"Qty {idx + 1}",
+            st.markdown("#### Products / services purchased")
+            st.caption(
+                "Use the **Add row** option below to record each product or service purchased."
+            )
+            products_df = pd.DataFrame(products_state)
+            required_columns = ["name", "model", "serial", "quantity"]
+            for column in required_columns:
+                if column not in products_df.columns:
+                    default_value = 1 if column == "quantity" else ""
+                    products_df[column] = default_value
+            products_df = products_df[required_columns]
+            edited_products = st.data_editor(
+                products_df,
+                key="new_customer_products_table",
+                num_rows="dynamic",
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "name": st.column_config.TextColumn(
+                        "Product / service",
+                        help="Name or brief description of the item purchased.",
+                    ),
+                    "model": st.column_config.TextColumn(
+                        "Model",
+                        help="Add model or variant details to help identify the product.",
+                    ),
+                    "serial": st.column_config.TextColumn(
+                        "Serial / ID",
+                        help="Serial number or unique identifier (optional).",
+                    ),
+                    "quantity": st.column_config.NumberColumn(
+                        "Quantity",
                         min_value=1,
-                        max_value=999,
-                        value=1,
                         step=1,
-                        key=f"new_customer_product_quantity_{idx}",
-                    )
-                product_entries.append(
-                    {
-                        "name": product_name,
-                        "model": product_model,
-                        "serial": product_serial,
-                        "quantity": int(product_quantity),
-                    }
-                )
-            do_code = st.text_input("Delivery order code")
-            sales_person_input = st.text_input("Sales person")
+                        format="%d",
+                    ),
+                },
+            )
+            product_entries = edited_products.to_dict("records")
+            st.session_state["new_customer_products_rows"] = product_entries
+            st.session_state["new_customer_products_table"] = edited_products
+            do_code = st.text_input(
+                "Delivery order code",
+                key="new_customer_do_code",
+                help="Link the customer to an existing delivery order if available.",
+            )
+            sales_person_input = st.text_input(
+                "Sales person",
+                key="new_customer_sales_person",
+                help="Record who handled this sale for quick reference later.",
+            )
             customer_pdf = st.file_uploader("Attach customer PDF", type=["pdf"], key="new_customer_pdf")
             do_pdf = st.file_uploader("Attach Delivery Order (PDF)", type=["pdf"], key="new_customer_do_pdf")
-            submitted = st.form_submit_button("Save")
+            action_cols = st.columns((1, 1))
+            submitted = action_cols[0].form_submit_button(
+                "Save new customer", type="primary"
+            )
+            reset_form = action_cols[1].form_submit_button("Reset form")
+            if reset_form:
+                _reset_new_customer_form_state()
+                st.session_state["new_customer_feedback"] = (
+                    "info",
+                    "Customer form cleared. You can start again with a blank form.",
+                )
+                _safe_rerun()
+                return
             if submitted and name.strip():
                 cur = conn.cursor()
                 name_val = clean_text(name)
@@ -2492,8 +2707,15 @@ def customers_page(conn):
                 if phone_val:
                     recalc_customer_duplicate_flag(conn, phone_val)
                     conn.commit()
-                st.success("Customer saved")
+                _reset_new_customer_form_state()
+                st.session_state["new_customer_feedback"] = (
+                    "success",
+                    f"Customer {name_val or 'record'} saved successfully.",
+                )
                 _safe_rerun()
+                return
+            elif submitted:
+                st.error("Customer name is required before saving.")
     sort_dir = st.radio("Sort by created date", ["Newest first", "Oldest first"], horizontal=True)
     order = "DESC" if sort_dir == "Newest first" else "ASC"
     q = st.text_input("Search (name/phone/address/product/DO)")
@@ -3683,6 +3905,440 @@ def _render_service_section(conn, *, show_heading: bool = True):
         st.info("No service records yet. Log one using the form above.")
 
 
+def _build_quotation_workbook(
+    *,
+    metadata: dict[str, Optional[str]],
+    items: list[dict[str, object]],
+    totals: list[tuple[str, float]],
+) -> bytes:
+    buffer = io.BytesIO()
+    summary_rows = [(key, metadata.get(key) or "-") for key in metadata]
+    summary_df = pd.DataFrame(summary_rows, columns=["Field", "Value"])
+    items_df = pd.DataFrame(items)
+    totals_df = pd.DataFrame(totals, columns=["Label", "Amount"])
+
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Quotation", index=False)
+        start_row = len(summary_df) + 2
+        if not items_df.empty:
+            items_df.to_excel(writer, sheet_name="Quotation", index=False, startrow=start_row)
+            totals_start = start_row + len(items_df) + 2
+        else:
+            totals_start = start_row
+        if not totals_df.empty:
+            totals_df.to_excel(writer, sheet_name="Quotation", index=False, startrow=totals_start)
+
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _render_quotation_section():
+    st.subheader("🧾 Create quotation")
+
+    default_date = datetime.now().date()
+    result_key = "quotation_result"
+    feedback = st.session_state.pop("quotation_feedback", None)
+    if feedback:
+        level, message = feedback
+        if level == "success":
+            st.success(message)
+        elif level == "info":
+            st.info(message)
+        elif level == "warning":
+            st.warning(message)
+        else:
+            st.write(message)
+
+    st.session_state.setdefault("quotation_item_rows", _default_quotation_items())
+
+    with st.form("quotation_form"):
+        col_left, col_right = st.columns(2)
+        with col_left:
+            reference_value = st.text_input(
+                "Quotation reference", key="quotation_reference"
+            )
+            quotation_date = st.date_input(
+                "Quotation date",
+                value=default_date,
+                key="quotation_date",
+            )
+            prepared_by = st.text_input("Prepared by", key="quotation_prepared_by")
+        with col_right:
+            valid_days = st.number_input(
+                "Valid for (days)",
+                min_value=0,
+                value=DEFAULT_QUOTATION_VALID_DAYS,
+                step=1,
+                format="%d",
+                key="quotation_valid_days",
+            )
+            round_total = st.checkbox(
+                "Round grand total to nearest rupee",
+                value=False,
+                help="If enabled the final amount will be rounded to the nearest rupee.",
+                key="quotation_round_total",
+            )
+
+        company_name = st.text_input("Company / branch", key="quotation_company_name")
+        company_details = st.text_area(
+            "Company details / address",
+            help="Include GST number, phone number or any header text that should appear with the quotation.",
+            key="quotation_company_details",
+        )
+
+        customer_cols = st.columns(2)
+        with customer_cols[0]:
+            customer_name = st.text_input(
+                "Customer / organisation", key="quotation_customer_name"
+            )
+        with customer_cols[1]:
+            customer_contact = st.text_input(
+                "Customer contact (phone / email)",
+                key="quotation_customer_contact",
+            )
+        customer_address = st.text_area(
+            "Customer address / details", key="quotation_customer_address"
+        )
+
+        project_cols = st.columns(2)
+        with project_cols[0]:
+            project_name = st.text_input("Project / site", key="quotation_project_name")
+        with project_cols[1]:
+            subject_line = st.text_input(
+                "Subject / scope title", key="quotation_subject"
+            )
+
+        notes_value = st.text_area(
+            "Scope / notes",
+            help="Outline the deliverables or inclusions for this quotation.",
+            key="quotation_scope_notes",
+        )
+        terms_value = st.text_area(
+            "Terms & conditions",
+            help="Payment terms, validity clauses or other conditions that should be shared with the client.",
+            key="quotation_terms",
+        )
+
+        defaults_cols = st.columns(4)
+        with defaults_cols[0]:
+            default_discount = st.number_input(
+                "Default discount (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5,
+                format="%.2f",
+                key="quotation_default_discount",
+            )
+        with defaults_cols[1]:
+            default_cgst = st.number_input(
+                "Default CGST (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5,
+                format="%.2f",
+                key="quotation_default_cgst",
+            )
+        with defaults_cols[2]:
+            default_sgst = st.number_input(
+                "Default SGST (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5,
+                format="%.2f",
+                key="quotation_default_sgst",
+            )
+        with defaults_cols[3]:
+            default_igst = st.number_input(
+                "Default IGST (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.5,
+                format="%.2f",
+                key="quotation_default_igst",
+            )
+
+        st.markdown("#### Line items")
+        st.caption(
+            "Add each item or service below. Use the built-in controls to add, duplicate or reorder rows."
+        )
+
+        items_state = st.session_state.get(
+            "quotation_item_rows", _default_quotation_items()
+        )
+        items_df = pd.DataFrame(items_state)
+        required_item_columns = [
+            "description",
+            "hsn",
+            "unit",
+            "quantity",
+            "rate",
+            "discount",
+            "cgst",
+            "sgst",
+            "igst",
+        ]
+        for column in required_item_columns:
+            if column not in items_df.columns:
+                if column in {"description", "hsn", "unit"}:
+                    items_df[column] = ""
+                elif column == "quantity":
+                    items_df[column] = 1.0
+                else:
+                    items_df[column] = 0.0
+        items_df = items_df[required_item_columns]
+        edited_items = st.data_editor(
+            items_df,
+            key="quotation_items_table",
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "description": st.column_config.TextColumn(
+                    "Description",
+                    help="Item or service being quoted.",
+                ),
+                "hsn": st.column_config.TextColumn(
+                    "HSN / SAC",
+                    help="Optional tax code (HSN/SAC).",
+                ),
+                "unit": st.column_config.TextColumn(
+                    "Unit",
+                    help="Unit of measure (Nos, Lot, etc.).",
+                ),
+                "quantity": st.column_config.NumberColumn(
+                    "Quantity",
+                    min_value=0.0,
+                    step=0.5,
+                    format="%.2f",
+                ),
+                "rate": st.column_config.NumberColumn(
+                    "Rate",
+                    min_value=0.0,
+                    step=10.0,
+                    format="%.2f",
+                ),
+                "discount": st.column_config.NumberColumn(
+                    "Discount (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.5,
+                    format="%.2f",
+                ),
+                "cgst": st.column_config.NumberColumn(
+                    "CGST (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.5,
+                    format="%.2f",
+                ),
+                "sgst": st.column_config.NumberColumn(
+                    "SGST (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.5,
+                    format="%.2f",
+                ),
+                "igst": st.column_config.NumberColumn(
+                    "IGST (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.5,
+                    format="%.2f",
+                ),
+            },
+        )
+        item_records = edited_items.to_dict("records")
+        st.session_state["quotation_item_rows"] = item_records
+        st.session_state["quotation_items_table"] = edited_items
+
+        action_cols = st.columns((1, 1))
+        submit = action_cols[0].form_submit_button("Create quotation", type="primary")
+        reset_form = action_cols[1].form_submit_button("Reset form")
+        if reset_form:
+            _reset_quotation_form_state()
+            st.session_state["quotation_feedback"] = (
+                "info",
+                "Quotation form cleared. Start with fresh details.",
+            )
+            _safe_rerun()
+            return
+
+    if submit:
+        prepared_items: list[dict[str, object]] = []
+        for record in item_records:
+            prepared_items.append(
+                {
+                    "description": record.get("description"),
+                    "hsn": record.get("hsn"),
+                    "unit": record.get("unit"),
+                    "quantity": _value_or_default(record.get("quantity"), 1.0),
+                    "rate": _value_or_default(record.get("rate"), 0.0),
+                    "discount": _value_or_default(
+                        record.get("discount"), default_discount
+                    ),
+                    "cgst": _value_or_default(record.get("cgst"), default_cgst),
+                    "sgst": _value_or_default(record.get("sgst"), default_sgst),
+                    "igst": _value_or_default(record.get("igst"), default_igst),
+                }
+            )
+
+        items_clean, totals_data = normalize_quotation_items(prepared_items)
+
+        if not items_clean:
+            st.error("Add at least one item with a description to create a quotation.")
+            st.session_state.pop(result_key, None)
+            return
+
+        valid_days_value = int(valid_days)
+        valid_until = None
+        if valid_days_value > 0:
+            valid_until = quotation_date + timedelta(days=valid_days_value)
+
+        metadata = OrderedDict(
+            {
+                "Quotation reference": clean_text(reference_value) or "-",
+                "Quotation date": quotation_date.strftime(DATE_FMT),
+                "Valid until": valid_until.strftime(DATE_FMT) if valid_until else "-",
+                "Prepared by": clean_text(prepared_by) or "-",
+                "Company / branch": clean_text(company_name) or "-",
+                "Company details": clean_text(company_details) or "-",
+                "Customer / organisation": clean_text(customer_name) or "-",
+                "Customer contact": clean_text(customer_contact) or "-",
+                "Customer address": clean_text(customer_address) or "-",
+                "Project / site": clean_text(project_name) or "-",
+                "Subject / scope": clean_text(subject_line) or "-",
+            }
+        )
+        notes_clean = clean_text(notes_value)
+        if notes_clean:
+            metadata["Scope / notes"] = notes_clean
+        terms_clean = clean_text(terms_value)
+        if terms_clean:
+            metadata["Terms & conditions"] = terms_clean
+
+        grand_total_before_round = totals_data["grand_total"]
+        rounded_grand_total = grand_total_before_round
+        round_off_value = 0.0
+        if round_total:
+            rounded_grand_total = float(round(grand_total_before_round))
+            round_off_value = rounded_grand_total - grand_total_before_round
+
+        totals_rows: list[tuple[str, float]] = []
+        totals_rows.append(("Gross amount", totals_data["gross_total"]))
+        if totals_data["discount_total"]:
+            totals_rows.append(("Discount total", totals_data["discount_total"]))
+        totals_rows.append(("Taxable value", totals_data["taxable_total"]))
+        if totals_data["cgst_total"]:
+            totals_rows.append(("CGST total", totals_data["cgst_total"]))
+        if totals_data["sgst_total"]:
+            totals_rows.append(("SGST total", totals_data["sgst_total"]))
+        if totals_data["igst_total"]:
+            totals_rows.append(("IGST total", totals_data["igst_total"]))
+        if round_total:
+            totals_rows.append(("Grand total (before round)", grand_total_before_round))
+        if round_off_value:
+            totals_rows.append(("Round off", round_off_value))
+        totals_rows.append(("Grand total", rounded_grand_total))
+
+        workbook_items = [item.copy() for item in items_clean]
+
+        workbook_bytes = _build_quotation_workbook(
+            metadata=metadata,
+            items=workbook_items,
+            totals=totals_rows,
+        )
+
+        display_df = pd.DataFrame(workbook_items)
+
+        def _format_quantity_display(value: object) -> str:
+            amount = _coerce_float(value, 0.0)
+            if math.isclose(amount, round(amount)):
+                return f"{int(round(amount))}"
+            return f"{amount:,.2f}"
+
+        money_columns = [
+            "Rate",
+            "Gross amount",
+            "Discount amount",
+            "Taxable value",
+            "CGST amount",
+            "SGST amount",
+            "IGST amount",
+            "Line total",
+        ]
+        for col in money_columns:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(
+                    lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+                )
+        if "Quantity" in display_df.columns:
+            display_df["Quantity"] = display_df["Quantity"].apply(_format_quantity_display)
+        percentage_columns = ["Discount (%)", "CGST (%)", "SGST (%)", "IGST (%)"]
+        for col in percentage_columns:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(lambda value: f"{_coerce_float(value, 0.0):.2f}%")
+        display_df = display_df.fillna("")
+
+        base_filename = clean_text(reference_value) or f"quotation_{quotation_date.strftime('%Y%m%d')}"
+        safe_name = _sanitize_path_component(base_filename)
+        if not safe_name:
+            safe_name = f"quotation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        filename = f"{safe_name}.xlsx"
+
+        st.session_state[result_key] = {
+            "display": display_df,
+            "metadata_items": list(metadata.items()),
+            "totals_rows": totals_rows,
+            "gross_total": totals_data["gross_total"],
+            "taxable_total": totals_data["taxable_total"],
+            "grand_total": rounded_grand_total,
+            "grand_total_before_round": grand_total_before_round,
+            "round_off": round_off_value,
+            "metadata": metadata,
+            "excel_bytes": workbook_bytes,
+            "filename": filename,
+        }
+
+    result = st.session_state.get(result_key)
+    if result:
+        st.success("Quotation ready. Review the details below or download the Excel file.")
+        metadata_df = pd.DataFrame(result["metadata_items"], columns=["Field", "Value"])
+        st.table(metadata_df)
+
+        st.dataframe(result["display"], use_container_width=True)
+
+        totals_rows = result.get("totals_rows", [])
+        if totals_rows:
+            totals_df = pd.DataFrame(totals_rows, columns=["Label", "Amount"])
+            totals_df["Amount"] = totals_df["Amount"].apply(
+                lambda value: format_money(value) or f"{_coerce_float(value, 0.0):,.2f}"
+            )
+            st.table(totals_df)
+
+        grand_total_label = format_money(result["grand_total"]) or f"{result['grand_total']:,.2f}"
+        st.markdown(f"**Grand total:** {grand_total_label}")
+        round_off_value = result.get("round_off", 0.0)
+        if round_off_value:
+            round_off_label = format_money(round_off_value) or f"{round_off_value:,.2f}"
+            original_total = result.get("grand_total_before_round", result["grand_total"])
+            original_label = format_money(original_total) or f"{original_total:,.2f}"
+            st.caption(
+                f"Rounded from {original_label} (round off {round_off_label})."
+            )
+
+        st.download_button(
+            "Download quotation",
+            data=result["excel_bytes"],
+            file_name=result["filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="quotation_download",
+        )
+
+
 def _render_maintenance_section(conn, *, show_heading: bool = True):
     if show_heading:
         st.subheader("🔧 Maintenance Records")
@@ -4138,12 +4794,11 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
 
 
 def service_maintenance_page(conn):
-    st.subheader("🛠️ Service & Maintenance")
-    service_tab, maintenance_tab = st.tabs(["Service", "Maintenance"])
-    with service_tab:
-        _render_service_section(conn, show_heading=False)
-    with maintenance_tab:
-        _render_maintenance_section(conn, show_heading=False)
+    st.subheader("🛠️ Maintenance and Service")
+    st.markdown("### Service records")
+    _render_service_section(conn, show_heading=False)
+    st.markdown("---")
+    _render_quotation_section()
 
 
 def customer_summary_page(conn):
@@ -5783,10 +6438,10 @@ def main():
                 "Import",
                 "Duplicates",
                 "Users (Admin)",
-                "Service & Maintenance",
+                "Maintenance and Service",
             ]
         else:
-            pages = ["Dashboard", "Warranties", "Import", "Service & Maintenance"]
+            pages = ["Dashboard", "Warranties", "Import", "Maintenance and Service"]
         if st.session_state.page not in pages:
             st.session_state.page = pages[0]
         current_index = pages.index(st.session_state.page)
@@ -5811,7 +6466,7 @@ def main():
         duplicates_page(conn)
     elif page == "Users (Admin)":
         users_admin_page(conn)
-    elif page == "Service & Maintenance":
+    elif page == "Maintenance and Service":
         service_maintenance_page(conn)
 
 if _streamlit_runtime_active():
