@@ -1,3 +1,4 @@
+import contextlib
 import io
 import math
 import os
@@ -47,6 +48,7 @@ SERVICE_DOCS_DIR = UPLOADS_DIR / "service_documents"
 MAINTENANCE_DOCS_DIR = UPLOADS_DIR / "maintenance_documents"
 CUSTOMER_DOCS_DIR = UPLOADS_DIR / "customer_documents"
 SERVICE_BILL_DIR = UPLOADS_DIR / "service_bills"
+REPORT_DOCS_DIR = UPLOADS_DIR / "report_documents"
 
 DEFAULT_QUOTATION_VALID_DAYS = 30
 
@@ -259,12 +261,14 @@ CREATE TABLE IF NOT EXISTS work_reports (
     tasks TEXT,
     remarks TEXT,
     research TEXT,
+    attachment_path TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_work_reports_user_period ON work_reports(user_id, period_type, period_start);
 CREATE INDEX IF NOT EXISTS idx_work_reports_period ON work_reports(period_type, period_start, period_end);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_work_reports_user_period ON work_reports(user_id, period_type, period_start);
 CREATE TABLE IF NOT EXISTS needs (
     need_id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER,
@@ -332,6 +336,26 @@ def ensure_schema_upgrades(conn):
     add_column("delivery_orders", "remarks", "TEXT")
     add_column("import_history", "amount_spent", "REAL")
     add_column("import_history", "imported_by", "INTEGER")
+    add_column("work_reports", "attachment_path", "TEXT")
+
+    cur = conn.execute(
+        """
+        SELECT report_id, user_id, LOWER(COALESCE(period_type, '')), COALESCE(period_start, '')
+        FROM work_reports
+        ORDER BY user_id, LOWER(COALESCE(period_type, '')), COALESCE(period_start, ''), report_id DESC
+        """
+    )
+    seen_keys: set[tuple[int, str, str]] = set()
+    duplicates: list[int] = []
+    for report_id, user_id, period_type, period_start in cur.fetchall():
+        key = (int(user_id), period_type or "", period_start or "")
+        if key in seen_keys:
+            duplicates.append(int(report_id))
+        else:
+            seen_keys.add(key)
+    for report_id in duplicates:
+        conn.execute("DELETE FROM work_reports WHERE report_id=?", (int(report_id),))
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS customer_notes (
@@ -369,6 +393,7 @@ def ensure_schema_upgrades(conn):
             tasks TEXT,
             remarks TEXT,
             research TEXT,
+            attachment_path TEXT,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
@@ -380,6 +405,9 @@ def ensure_schema_upgrades(conn):
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_work_reports_period ON work_reports(period_type, period_start, period_end)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_work_reports_user_period ON work_reports(user_id, period_type, period_start)"
     )
 
 
@@ -1153,6 +1181,7 @@ def ensure_upload_dirs():
         MAINTENANCE_DOCS_DIR,
         CUSTOMER_DOCS_DIR,
         SERVICE_BILL_DIR,
+        REPORT_DOCS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -1195,6 +1224,38 @@ def store_uploaded_pdf(uploaded_file, target_dir: Path, filename: Optional[str] 
         return str(saved_path)
 
 
+def store_report_attachment(uploaded_file, *, identifier: Optional[str] = None) -> Optional[str]:
+    """Persist a supporting document for a work report."""
+
+    if uploaded_file is None:
+        return None
+
+    ensure_upload_dirs()
+    raw_name = uploaded_file.name or "attachment"
+    allowed_exts = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    suffix = Path(raw_name).suffix.lower()
+    if suffix not in allowed_exts:
+        suffix = ".pdf"
+    stem = Path(raw_name).stem
+    safe_stem = "".join(ch for ch in stem if ch.isalnum() or ch in ("_", "-")) or "attachment"
+    safe_stem = safe_stem.strip("_") or "attachment"
+    if identifier:
+        ident = "".join(ch for ch in identifier if ch.isalnum() or ch in ("_", "-"))
+        if ident:
+            safe_stem = f"{ident}_{safe_stem}"
+    dest = REPORT_DOCS_DIR / f"{safe_stem}{suffix}"
+    counter = 1
+    while dest.exists():
+        dest = REPORT_DOCS_DIR / f"{safe_stem}_{counter}{suffix}"
+        counter += 1
+    with open(dest, "wb") as fh:
+        fh.write(uploaded_file.read())
+    try:
+        return str(dest.relative_to(BASE_DIR))
+    except ValueError:
+        return str(dest)
+
+
 def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     if not path_str:
         return None
@@ -1202,6 +1263,75 @@ def resolve_upload_path(path_str: Optional[str]) -> Optional[Path]:
     if not path.is_absolute():
         path = BASE_DIR / path
     return path
+
+
+_ATTACHMENT_UNCHANGED = object()
+
+
+def normalize_report_window(period_type: str, start_value, end_value) -> tuple[str, date, date]:
+    """Return a canonical report period and date window."""
+
+    key = (period_type or "").strip().lower()
+    if key not in REPORT_PERIOD_OPTIONS:
+        key = "daily"
+
+    def _coerce(value) -> Optional[date]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        iso = to_iso_date(value)
+        if iso:
+            try:
+                return datetime.strptime(iso, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            parsed = None
+        if parsed is None or pd.isna(parsed):
+            return None
+        if isinstance(parsed, pd.DatetimeIndex):
+            if len(parsed) == 0:
+                return None
+            parsed = parsed[0]
+        if hasattr(parsed, "to_pydatetime"):
+            parsed = parsed.to_pydatetime()
+        if isinstance(parsed, datetime):
+            return parsed.date()
+        if isinstance(parsed, date):
+            return parsed
+        return None
+
+    start_date = _coerce(start_value)
+    end_date = _coerce(end_value)
+
+    if key == "daily":
+        anchor = start_date or end_date
+        if anchor is None:
+            raise ValueError("Select a date for the daily report.")
+        start_date = end_date = anchor
+    elif key == "weekly":
+        anchor = start_date or end_date
+        if anchor is None:
+            raise ValueError("Select a week for the report.")
+        start_date = anchor - timedelta(days=anchor.weekday())
+        end_date = start_date + timedelta(days=6)
+    else:
+        anchor = start_date or end_date
+        if anchor is None:
+            raise ValueError("Select a month for the report.")
+        start_date = anchor.replace(day=1)
+        last_day = monthrange(start_date.year, start_date.month)[1]
+        end_date = date(start_date.year, start_date.month, last_day)
+
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    return key, start_date, end_date
 
 
 def _sanitize_path_component(value: Optional[str]) -> str:
@@ -6983,20 +7113,17 @@ def upsert_work_report(
     tasks: Optional[str],
     remarks: Optional[str],
     research: Optional[str],
+    attachment_path=_ATTACHMENT_UNCHANGED,
+    current_attachment: Optional[str] = None,
 ) -> int:
     if user_id is None:
         raise ValueError("User is required to save a report.")
 
-    start_iso = to_iso_date(period_start)
-    end_iso = to_iso_date(period_end)
-    if not start_iso or not end_iso:
-        raise ValueError("Provide valid dates for the report period.")
-    if start_iso > end_iso:
-        start_iso, end_iso = end_iso, start_iso
-
-    key = (period_type or "").strip().lower()
-    if key not in REPORT_PERIOD_OPTIONS:
-        key = "daily"
+    key, normalized_start, normalized_end = normalize_report_window(
+        period_type, period_start, period_end
+    )
+    start_iso = normalized_start.isoformat()
+    end_iso = normalized_end.isoformat()
 
     tasks_val = _normalize_report_text(tasks)
     remarks_val = _normalize_report_text(remarks)
@@ -7004,38 +7131,87 @@ def upsert_work_report(
 
     cur = conn.cursor()
     effective_id = report_id
-    if effective_id is None:
+    cur.execute(
+        """
+        SELECT report_id, attachment_path
+        FROM work_reports
+        WHERE user_id=? AND period_type=? AND period_start=?
+        LIMIT 1
+        """,
+        (user_id, key, start_iso),
+    )
+    row = cur.fetchone()
+    if row:
+        existing_id = int(row[0])
+        if effective_id is None:
+            effective_id = existing_id
+            if current_attachment is None:
+                current_attachment = row[1]
+        elif existing_id != effective_id:
+            raise ValueError(
+                "Another report already exists for this period. Select it from the dropdown to edit."
+            )
+
+    if effective_id is not None and current_attachment is None:
         cur.execute(
-            """
-            SELECT report_id
-            FROM work_reports
-            WHERE user_id=? AND period_type=? AND period_start=? AND period_end=?
-            LIMIT 1
-            """,
-            (user_id, key, start_iso, end_iso),
+            "SELECT attachment_path FROM work_reports WHERE report_id=?",
+            (effective_id,),
         )
-        row = cur.fetchone()
-        if row:
-            effective_id = int(row[0])
+        match = cur.fetchone()
+        if match:
+            current_attachment = match[0]
+
+    if attachment_path is _ATTACHMENT_UNCHANGED:
+        attachment_value = current_attachment
+    else:
+        attachment_value = attachment_path
 
     if effective_id is None:
-        cur.execute(
-            """
-            INSERT INTO work_reports (user_id, period_type, period_start, period_end, tasks, remarks, research)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, key, start_iso, end_iso, tasks_val, remarks_val, research_val),
-        )
+        try:
+            cur.execute(
+                """
+                INSERT INTO work_reports (user_id, period_type, period_start, period_end, tasks, remarks, research, attachment_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    key,
+                    start_iso,
+                    end_iso,
+                    tasks_val,
+                    remarks_val,
+                    research_val,
+                    attachment_value,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                "Another report already exists for this period. Select it from the dropdown to edit."
+            ) from exc
         effective_id = int(cur.lastrowid)
     else:
-        cur.execute(
-            """
-            UPDATE work_reports
-            SET period_type=?, period_start=?, period_end=?, tasks=?, remarks=?, research=?, updated_at=datetime('now')
-            WHERE report_id=?
-            """,
-            (key, start_iso, end_iso, tasks_val, remarks_val, research_val, effective_id),
-        )
+        try:
+            cur.execute(
+                """
+                UPDATE work_reports
+                SET period_type=?, period_start=?, period_end=?, tasks=?, remarks=?, research=?, attachment_path=?, updated_at=datetime('now')
+                WHERE report_id=?
+                """,
+                (
+                    key,
+                    start_iso,
+                    end_iso,
+                    tasks_val,
+                    remarks_val,
+                    research_val,
+                    attachment_value,
+                    effective_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                "Another report already exists for this period. Select it from the dropdown to edit."
+            ) from exc
 
     conn.commit()
     return effective_id
@@ -7250,7 +7426,7 @@ def reports_page(conn):
         conn,
         dedent(
             """
-            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, created_at, updated_at
+            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, attachment_path, created_at, updated_at
             FROM work_reports
             WHERE user_id=?
             ORDER BY date(period_start) DESC, report_id DESC
@@ -7278,6 +7454,11 @@ def reports_page(conn):
             return record_labels.get(int(value), f"Report #{int(value)}")
         except Exception:
             return "Report"
+
+    if "report_edit_select_pending" in st.session_state:
+        pending_selection = st.session_state.pop("report_edit_select_pending")
+        if pending_selection is not None:
+            st.session_state["report_edit_select"] = pending_selection
 
     selected_report_id = st.selectbox(
         "Load an existing report",
@@ -7343,6 +7524,23 @@ def reports_page(conn):
 
     start_date = default_start
     end_date = default_end
+
+    existing_attachment_value: Optional[str] = (
+        editing_record.get("attachment_path") if editing_record else None
+    )
+    existing_attachment_path = (
+        resolve_upload_path(existing_attachment_value)
+        if existing_attachment_value
+        else None
+    )
+    existing_attachment_bytes: Optional[bytes] = None
+    existing_attachment_name: Optional[str] = None
+    if existing_attachment_path and existing_attachment_path.exists():
+        existing_attachment_name = existing_attachment_path.name
+        try:
+            existing_attachment_bytes = existing_attachment_path.read_bytes()
+        except OSError:
+            existing_attachment_bytes = None
 
     with st.form("work_report_form"):
         period_choice = st.selectbox(
@@ -7418,27 +7616,207 @@ def reports_page(conn):
             value=research_seed,
             help="Capture findings, experiments, or ideas to explore next.",
         )
+        remove_attachment = False
+        attachment_upload = None
+        if existing_attachment_value:
+            st.caption("Current attachment")
+            if existing_attachment_bytes and existing_attachment_name:
+                st.download_button(
+                    "Download current attachment",
+                    data=existing_attachment_bytes,
+                    file_name=existing_attachment_name,
+                    key="report_attachment_download",
+                )
+            else:
+                st.warning(
+                    "The saved attachment could not be located on disk.",
+                    icon="⚠️",
+                )
+            remove_attachment = st.checkbox(
+                "Remove current attachment",
+                key="report_remove_attachment",
+            )
+        attachment_upload = st.file_uploader(
+            "Attach supporting document (PDF or image)",
+            type=["pdf", "png", "jpg", "jpeg", "webp", "gif"],
+            key="report_attachment_uploader",
+            help="Optional proof of work, photos, or documentation.",
+        )
         submitted = st.form_submit_button("Save report", type="primary")
 
     if submitted:
+        cleanup_path: Optional[str] = None
         try:
-            saved_id = upsert_work_report(
-                conn,
-                report_id=int(selected_report_id) if selected_report_id is not None else None,
-                user_id=int(report_owner_id),
-                period_type=period_choice,
-                period_start=start_date,
-                period_end=end_date,
-                tasks=tasks_input,
-                remarks=remarks_input,
-                research=research_input,
+            normalized_key, normalized_start, normalized_end = normalize_report_window(
+                period_choice, start_date, end_date
             )
         except ValueError as err:
             st.error(str(err))
         else:
-            st.success("Report saved successfully.")
-            st.session_state["report_edit_select"] = saved_id
-            _safe_rerun()
+            attachment_to_store = _ATTACHMENT_UNCHANGED
+            attachment_save_failed = False
+            if attachment_upload is not None:
+                identifier = (
+                    f"user{report_owner_id}_{normalized_key}_{normalized_start.isoformat()}"
+                )
+                stored_path = store_report_attachment(
+                    attachment_upload,
+                    identifier=identifier,
+                )
+                if stored_path:
+                    attachment_to_store = stored_path
+                    if existing_attachment_value:
+                        cleanup_path = existing_attachment_value
+                else:
+                    st.error("Attachment could not be saved. Please try again.")
+                    attachment_save_failed = True
+            elif remove_attachment and existing_attachment_value:
+                attachment_to_store = None
+                cleanup_path = existing_attachment_value
+
+            if not attachment_save_failed:
+                try:
+                    saved_id = upsert_work_report(
+                        conn,
+                        report_id=int(selected_report_id) if selected_report_id is not None else None,
+                        user_id=int(report_owner_id),
+                        period_type=normalized_key,
+                        period_start=normalized_start,
+                        period_end=normalized_end,
+                        tasks=tasks_input,
+                        remarks=remarks_input,
+                        research=research_input,
+                        attachment_path=attachment_to_store,
+                        current_attachment=existing_attachment_value,
+                    )
+                except ValueError as err:
+                    st.error(str(err))
+                else:
+                    st.success("Report saved successfully.")
+                    if cleanup_path:
+                        old_path = resolve_upload_path(cleanup_path)
+                        if old_path and old_path.exists():
+                            with contextlib.suppress(OSError):
+                                old_path.unlink()
+                    st.session_state["report_edit_select_pending"] = saved_id
+                    st.session_state.pop("report_attachment_uploader", None)
+                    _safe_rerun()
+
+    if is_admin:
+        st.markdown("#### Team submission tracker")
+        tracker_period = st.selectbox(
+            "Audit cadence",
+            list(REPORT_PERIOD_OPTIONS.keys()),
+            format_func=lambda key: REPORT_PERIOD_OPTIONS.get(key, key.title()),
+            key="report_tracker_period",
+        )
+        tracker_anchor = st.date_input(
+            "Audit date",
+            value=today,
+            key="report_tracker_anchor",
+            help="Pick any date inside the period you want to audit.",
+        )
+        try:
+            tracker_key, tracker_start, tracker_end = normalize_report_window(
+                tracker_period, tracker_anchor, tracker_anchor
+            )
+        except ValueError as err:
+            st.error(str(err))
+        else:
+            staff_records: list[tuple[int, str]] = []
+            if not directory.empty:
+                directory["role"] = directory["role"].fillna("")
+                for _, row in directory.iterrows():
+                    try:
+                        uid = int(row["user_id"])
+                    except Exception:
+                        continue
+                    role_label = clean_text(row.get("role")) or ""
+                    if role_label.lower() == "admin":
+                        continue
+                    label = user_labels.get(uid, f"User #{uid}")
+                    staff_records.append((uid, label))
+            if not staff_records:
+                st.info("No team members found to audit. Add staff accounts to start tracking.")
+            else:
+                placeholders = ",".join("?" for _ in staff_records)
+                params = [uid for uid, _ in staff_records]
+                params.extend([tracker_key, tracker_start.isoformat()])
+                tracker_results = df_query(
+                    conn,
+                    dedent(
+                        f"""
+                        SELECT user_id, report_id, updated_at, attachment_path
+                        FROM work_reports
+                        WHERE user_id IN ({placeholders}) AND period_type=? AND period_start=?
+                        """
+                    ),
+                    tuple(params),
+                )
+                report_map: dict[int, dict] = {}
+                if not tracker_results.empty:
+                    tracker_results["user_id"] = tracker_results["user_id"].apply(
+                        lambda val: int(float(val))
+                    )
+                    tracker_results["report_id"] = tracker_results["report_id"].apply(
+                        lambda val: int(float(val))
+                    )
+                    report_map = {
+                        int(row["user_id"]): row for _, row in tracker_results.iterrows()
+                    }
+                summary_rows: list[dict[str, object]] = []
+                missing_labels: list[str] = []
+                for uid, label in staff_records:
+                    record = report_map.get(uid)
+                    if record:
+                        updated = pd.to_datetime(record.get("updated_at"), errors="coerce")
+                        if pd.isna(updated):
+                            updated_label = "—"
+                        else:
+                            updated_label = pd.Timestamp(updated).strftime("%d-%m-%Y %H:%M")
+                        summary_rows.append(
+                            {
+                                "Member": label,
+                                "Status": "Submitted",
+                                "Report ID": int(record.get("report_id")),
+                                "Updated": updated_label,
+                                "Attachment": "📎" if clean_text(record.get("attachment_path")) else "—",
+                            }
+                        )
+                    else:
+                        missing_labels.append(label)
+                        summary_rows.append(
+                            {
+                                "Member": label,
+                                "Status": "Missing",
+                                "Report ID": "—",
+                                "Updated": "—",
+                                "Attachment": "—",
+                            }
+                        )
+                tracker_df = pd.DataFrame(summary_rows)
+                if not tracker_df.empty:
+                    tracker_df["Status"] = pd.Categorical(
+                        tracker_df["Status"],
+                        categories=["Missing", "Submitted"],
+                        ordered=True,
+                    )
+                    tracker_df.sort_values(["Status", "Member"], inplace=True)
+                    tracker_df.reset_index(drop=True, inplace=True)
+                    st.caption(
+                        f"{format_period_label(tracker_key)} · {format_period_range(tracker_start.isoformat(), tracker_end.isoformat())}"
+                    )
+                    st.dataframe(tracker_df, use_container_width=True)
+                if missing_labels:
+                    st.warning(
+                        "No submission from: " + ", ".join(missing_labels),
+                        icon="⏰",
+                    )
+                else:
+                    st.success(
+                        "All tracked team members have submitted their reports.",
+                        icon="✅",
+                    )
 
     st.markdown("---")
     st.markdown("#### Report history")
@@ -7533,7 +7911,7 @@ def reports_page(conn):
         dedent(
             f"""
             SELECT wr.report_id, wr.user_id, wr.period_type, wr.period_start, wr.period_end,
-                   wr.tasks, wr.remarks, wr.research, wr.created_at, wr.updated_at,
+                   wr.tasks, wr.remarks, wr.research, wr.attachment_path, wr.created_at, wr.updated_at,
                    u.username
             FROM work_reports wr
             JOIN users u ON u.user_id = wr.user_id
@@ -7561,6 +7939,9 @@ def reports_page(conn):
         lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
         axis=1,
     )
+    display["Attachment"] = display["attachment_path"].apply(
+        lambda value: "📎" if clean_text(value) else "—"
+    )
     for col in ("created_at", "updated_at"):
         display[col] = pd.to_datetime(display[col], errors="coerce").dt.strftime(DATE_FMT)
     for col in ("tasks", "remarks", "research"):
@@ -7576,7 +7957,7 @@ def reports_page(conn):
         inplace=True,
     )
     table = display[
-        ["Owner", "Type", "Period", "Tasks", "Remarks", "Research", "Created", "Updated"]
+        ["Owner", "Type", "Period", "Tasks", "Remarks", "Research", "Attachment", "Created", "Updated"]
     ]
     st.dataframe(table, use_container_width=True)
 
