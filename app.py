@@ -2175,6 +2175,83 @@ def dashboard(conn):
                 ).iloc[0]["c"]
             )
             st.metric("Expired", expired_count)
+
+        st.markdown("#### Daily report coverage")
+        report_date_value = st.date_input(
+            "Review date",
+            value=date.today(),
+            key="dashboard_daily_report_date",
+            help="Identify who submitted a daily report on the selected date.",
+        )
+        report_iso = to_iso_date(report_date_value) or date.today().isoformat()
+        staff_df = df_query(
+            conn,
+            dedent(
+                """
+                SELECT user_id, username
+                FROM users
+                WHERE LOWER(COALESCE(role, 'staff')) <> 'admin'
+                ORDER BY LOWER(username)
+                """
+            ),
+        )
+
+        if staff_df.empty:
+            st.info("No staff accounts available for coverage tracking yet.")
+        else:
+            staff_df["user_id"] = staff_df["user_id"].apply(lambda val: int(float(val)))
+            staff_df["username"] = staff_df.apply(
+                lambda row: clean_text(row.get("username")) or f"User #{int(row['user_id'])}",
+                axis=1,
+            )
+            submitted_df = df_query(
+                conn,
+                dedent(
+                    """
+                    SELECT DISTINCT user_id
+                    FROM work_reports
+                    WHERE period_type='daily' AND date(period_start)=date(?)
+                    """
+                ),
+                (report_iso,),
+            )
+            submitted_ids: set[int] = set()
+            if not submitted_df.empty:
+                submitted_ids = {
+                    int(float(uid))
+                    for uid in submitted_df["user_id"].dropna().tolist()
+                }
+
+            staff_df["Submitted"] = staff_df["user_id"].apply(lambda uid: uid in submitted_ids)
+            total_staff = int(staff_df.shape[0])
+            submitted_total = int(staff_df["Submitted"].sum())
+            missing_total = total_staff - submitted_total
+
+            coverage_cols = st.columns(3)
+            coverage_cols[0].metric("Team members", total_staff)
+            coverage_cols[1].metric("Reports filed", submitted_total)
+            coverage_cols[2].metric("Missing reports", missing_total)
+
+            missing_df = staff_df[~staff_df["Submitted"]]
+            if missing_total:
+                st.warning("Daily reports pending for the following team members:")
+                st.markdown("\n".join(f"- {name}" for name in missing_df["username"]))
+            else:
+                st.success("All tracked team members have filed their daily report.")
+
+            status_table = staff_df.rename(
+                columns={"username": "Team member", "Submitted": "Daily report"}
+            )
+            status_table["Daily report"] = status_table["Daily report"].map(
+                {True: "Submitted", False: "Missing"}
+            )
+            st.dataframe(
+                status_table[["Team member", "Daily report"]],
+                use_container_width=True,
+            )
+            st.caption(
+                f"Coverage for {format_period_range(report_iso, report_iso)} • Admins are excluded from this list."
+            )
     else:
         st.info("Staff view: focus on upcoming activities below. Metrics are available to admins only.")
 
