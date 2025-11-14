@@ -60,6 +60,14 @@ SERVICE_STATUS_OPTIONS = ["In progress", "Completed", "Haven't started"]
 DEFAULT_SERVICE_STATUS = SERVICE_STATUS_OPTIONS[0]
 GENERATOR_CONDITION_OPTIONS = ["Mint", "Good", "Bad"]
 
+REPORT_PERIOD_OPTIONS = OrderedDict(
+    [
+        ("daily", "Daily"),
+        ("weekly", "Weekly"),
+        ("monthly", "Monthly"),
+    ]
+)
+
 
 def customer_complete_clause(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
@@ -242,6 +250,21 @@ CREATE TABLE IF NOT EXISTS import_history (
     FOREIGN KEY(warranty_id) REFERENCES warranties(warranty_id) ON DELETE SET NULL,
     FOREIGN KEY(imported_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
+CREATE TABLE IF NOT EXISTS work_reports (
+    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    period_type TEXT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    tasks TEXT,
+    remarks TEXT,
+    research TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_work_reports_user_period ON work_reports(user_id, period_type, period_start);
+CREATE INDEX IF NOT EXISTS idx_work_reports_period ON work_reports(period_type, period_start, period_end);
 CREATE TABLE IF NOT EXISTS needs (
     need_id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER,
@@ -334,6 +357,29 @@ def ensure_schema_upgrades(conn):
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_import_history_imported_by ON import_history(imported_by)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS work_reports (
+            report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            period_type TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            tasks TEXT,
+            remarks TEXT,
+            research TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_reports_user_period ON work_reports(user_id, period_type, period_start)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_reports_period ON work_reports(period_type, period_start, period_end)"
     )
 
 
@@ -663,6 +709,35 @@ def parse_amount(value) -> Optional[float]:
     if math.isclose(amount, 0.0):
         return 0.0
     return round(amount, 2)
+
+
+def format_period_label(period_type: str) -> str:
+    if not period_type:
+        return "Unknown"
+    key = str(period_type).strip().lower()
+    return REPORT_PERIOD_OPTIONS.get(key, key.title())
+
+
+def format_period_range(start: Optional[str], end: Optional[str]) -> str:
+    def _label(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        if isinstance(parsed, pd.DatetimeIndex):
+            if len(parsed) == 0:
+                return None
+            parsed = parsed[0]
+        return pd.Timestamp(parsed).strftime(DATE_FMT)
+
+    start_label = _label(start)
+    end_label = _label(end)
+    if start_label and end_label:
+        if start_label == end_label:
+            return start_label
+        return f"{start_label} → {end_label}"
+    return start_label or end_label or "—"
 
 
 def _clamp_percentage(value: float) -> float:
@@ -2474,6 +2549,7 @@ def show_expiry_notifications(conn):
     if not st.session_state.get("just_logged_in"):
         return
 
+    scope_clause, scope_params = customer_scope_filter("c")
     allowed_customers = accessible_customer_ids(conn)
     scheduled_services = df_query(
         conn,
@@ -6809,6 +6885,85 @@ def delete_import_entry(conn, record: dict) -> None:
         conn.commit()
 
 
+def _normalize_report_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    cleaned = clean_text(value)
+    return cleaned
+
+
+def upsert_work_report(
+    conn,
+    *,
+    report_id: Optional[int],
+    user_id: int,
+    period_type: str,
+    period_start,
+    period_end,
+    tasks: Optional[str],
+    remarks: Optional[str],
+    research: Optional[str],
+) -> int:
+    if user_id is None:
+        raise ValueError("User is required to save a report.")
+
+    start_iso = to_iso_date(period_start)
+    end_iso = to_iso_date(period_end)
+    if not start_iso or not end_iso:
+        raise ValueError("Provide valid dates for the report period.")
+    if start_iso > end_iso:
+        start_iso, end_iso = end_iso, start_iso
+
+    key = (period_type or "").strip().lower()
+    if key not in REPORT_PERIOD_OPTIONS:
+        key = "daily"
+
+    tasks_val = _normalize_report_text(tasks)
+    remarks_val = _normalize_report_text(remarks)
+    research_val = _normalize_report_text(research)
+
+    cur = conn.cursor()
+    effective_id = report_id
+    if effective_id is None:
+        cur.execute(
+            """
+            SELECT report_id
+            FROM work_reports
+            WHERE user_id=? AND period_type=? AND period_start=? AND period_end=?
+            LIMIT 1
+            """,
+            (user_id, key, start_iso, end_iso),
+        )
+        row = cur.fetchone()
+        if row:
+            effective_id = int(row[0])
+
+    if effective_id is None:
+        cur.execute(
+            """
+            INSERT INTO work_reports (user_id, period_type, period_start, period_end, tasks, remarks, research)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, key, start_iso, end_iso, tasks_val, remarks_val, research_val),
+        )
+        effective_id = int(cur.lastrowid)
+    else:
+        cur.execute(
+            """
+            UPDATE work_reports
+            SET period_type=?, period_start=?, period_end=?, tasks=?, remarks=?, research=?, updated_at=datetime('now')
+            WHERE report_id=?
+            """,
+            (key, start_iso, end_iso, tasks_val, remarks_val, research_val, effective_id),
+        )
+
+    conn.commit()
+    return effective_id
+
+
 def manage_import_history(conn):
     st.subheader("🗃️ Manage imported rows")
     user = get_current_user()
@@ -6953,6 +7108,465 @@ def manage_import_history(conn):
         _safe_rerun()
     elif delete_btn and not is_admin:
         st.error("Only admins can delete import rows.")
+
+# ---------- Reports ----------
+def reports_page(conn):
+    st.subheader("📈 Work reports")
+    user = get_current_user()
+    if not user:
+        st.info("Log in to capture and review team reports.")
+        return
+
+    viewer_id = current_user_id()
+    if viewer_id is None:
+        st.warning("Unable to determine your account. Please log in again.")
+        return
+
+    is_admin = user.get("role") == "admin"
+    st.caption(
+        "Staff can see only their own entries. Admins can review every team member's submissions."
+    )
+
+    directory = df_query(
+        conn,
+        "SELECT user_id, username, role FROM users ORDER BY LOWER(username)",
+    )
+    user_labels: dict[int, str] = {}
+    if not directory.empty:
+        for _, row in directory.iterrows():
+            try:
+                uid = int(row["user_id"])
+            except Exception:
+                continue
+            username = clean_text(row.get("username")) or f"User #{uid}"
+            role_label = clean_text(row.get("role"))
+            if role_label == "admin":
+                username = f"{username} (admin)"
+            user_labels[uid] = username
+    if viewer_id not in user_labels:
+        user_labels[viewer_id] = clean_text(user.get("username")) or f"User #{viewer_id}"
+
+    sorted_users = sorted(user_labels.items(), key=lambda item: item[1].lower())
+    user_ids = [uid for uid, _ in sorted_users]
+    label_map = {uid: label for uid, label in sorted_users}
+    if not user_ids:
+        user_ids = [viewer_id]
+        label_map[viewer_id] = clean_text(user.get("username")) or f"User #{viewer_id}"
+
+    if is_admin:
+        default_index = user_ids.index(viewer_id) if viewer_id in user_ids else 0
+        report_owner_id = st.selectbox(
+            "Report owner",
+            user_ids,
+            index=default_index,
+            format_func=lambda uid: label_map.get(uid, f"User #{uid}"),
+            key="report_owner_select",
+        )
+    else:
+        report_owner_id = viewer_id
+        st.info(
+            f"Recording progress for **{label_map.get(viewer_id, 'you')}**.",
+            icon="📝",
+        )
+
+    owner_reports = df_query(
+        conn,
+        dedent(
+            """
+            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, created_at, updated_at
+            FROM work_reports
+            WHERE user_id=?
+            ORDER BY date(period_start) DESC, report_id DESC
+            LIMIT 50
+            """
+        ),
+        (report_owner_id,),
+    )
+    record_labels: dict[int, str] = {}
+    if not owner_reports.empty:
+        owner_reports["report_id"] = owner_reports["report_id"].apply(lambda val: int(float(val)))
+        for _, row in owner_reports.iterrows():
+            rid = int(row["report_id"])
+            record_labels[rid] = (
+                f"{format_period_label(row.get('period_type'))} – "
+                f"{format_period_range(row.get('period_start'), row.get('period_end'))}"
+            )
+
+    report_choices = [None] + owner_reports.get("report_id", pd.Series(dtype=int)).tolist()
+
+    def _format_report_choice(value):
+        if value is None:
+            return "➕ Create new report"
+        try:
+            return record_labels.get(int(value), f"Report #{int(value)}")
+        except Exception:
+            return "Report"
+
+    selected_report_id = st.selectbox(
+        "Load an existing report",
+        report_choices,
+        format_func=_format_report_choice,
+        key="report_edit_select",
+    )
+
+    editing_record: Optional[dict] = None
+    if selected_report_id is not None and not owner_reports.empty:
+        match = owner_reports[owner_reports["report_id"] == int(selected_report_id)]
+        if not match.empty:
+            editing_record = match.iloc[0].to_dict()
+
+    today = datetime.now().date()
+
+    def _date_or(value, fallback: date) -> date:
+        if value is None:
+            return fallback
+        parsed_iso = to_iso_date(value)
+        if parsed_iso:
+            try:
+                return datetime.strptime(parsed_iso, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+        except Exception:
+            return fallback
+        if pd.isna(parsed):
+            return fallback
+        if isinstance(parsed, pd.DatetimeIndex):
+            if len(parsed) == 0:
+                return fallback
+            parsed = parsed[0]
+        return pd.Timestamp(parsed).date()
+
+    def _text_seed(value) -> str:
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    default_period_key = "daily"
+    if editing_record:
+        seed_period = clean_text(editing_record.get("period_type"))
+        if seed_period:
+            seed_period = seed_period.lower()
+            if seed_period in REPORT_PERIOD_OPTIONS:
+                default_period_key = seed_period
+    period_keys = list(REPORT_PERIOD_OPTIONS.keys())
+    period_index = period_keys.index(default_period_key) if default_period_key in period_keys else 0
+
+    default_start = _date_or(editing_record.get("period_start") if editing_record else None, today)
+    default_end = _date_or(editing_record.get("period_end") if editing_record else None, default_start)
+    tasks_seed = _text_seed(editing_record.get("tasks") if editing_record else None)
+    remarks_seed = _text_seed(editing_record.get("remarks") if editing_record else None)
+    research_seed = _text_seed(editing_record.get("research") if editing_record else None)
+
+    start_date = default_start
+    end_date = default_end
+
+    with st.form("work_report_form"):
+        period_choice = st.selectbox(
+            "Report cadence",
+            period_keys,
+            index=period_index,
+            format_func=lambda key: REPORT_PERIOD_OPTIONS.get(key, key.title()),
+            key="report_period_type",
+        )
+        if period_choice == "daily":
+            day_value = st.date_input(
+                "Report date",
+                value=default_start,
+                key="report_period_daily",
+            )
+            start_date = day_value
+            end_date = day_value
+        elif period_choice == "weekly":
+            base_start = default_start if editing_record else today - timedelta(days=today.weekday())
+            base_end = default_end if editing_record else base_start + timedelta(days=6)
+            week_value = st.date_input(
+                "Week range",
+                value=(base_start, base_end),
+                key="report_period_weekly",
+            )
+            if isinstance(week_value, (list, tuple)) and len(week_value) == 2:
+                start_date, end_date = week_value
+            else:
+                start_date = week_value
+                end_date = week_value + timedelta(days=6)
+            st.caption(
+                f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
+            )
+        else:
+            base_month = default_start if editing_record else today
+            try:
+                month_seed = base_month.replace(day=1)
+            except Exception:
+                month_seed = date(today.year, today.month, 1)
+            month_value = st.date_input(
+                "Month",
+                value=month_seed,
+                key="report_period_monthly",
+            )
+            if isinstance(month_value, (list, tuple)) and month_value:
+                month_seed = month_value[0]
+            else:
+                month_seed = month_value
+            if not isinstance(month_seed, date):
+                month_seed = month_seed.to_pydatetime().date() if hasattr(month_seed, "to_pydatetime") else month_seed
+            if not isinstance(month_seed, date):
+                month_seed = date(today.year, today.month, 1)
+            month_start = month_seed.replace(day=1)
+            last_day = monthrange(month_start.year, month_start.month)[1]
+            month_end = date(month_start.year, month_start.month, last_day)
+            start_date, end_date = month_start, month_end
+            st.caption(
+                f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
+            )
+
+        tasks_input = st.text_area(
+            "Tasks completed",
+            value=tasks_seed,
+            help="Summarize what was delivered in this period.",
+        )
+        remarks_input = st.text_area(
+            "Remarks / blockers",
+            value=remarks_seed,
+            help="Track follow-ups, risks, or additional notes.",
+        )
+        research_input = st.text_area(
+            "Research / learnings",
+            value=research_seed,
+            help="Capture findings, experiments, or ideas to explore next.",
+        )
+        submitted = st.form_submit_button("Save report", type="primary")
+
+    if submitted:
+        try:
+            saved_id = upsert_work_report(
+                conn,
+                report_id=int(selected_report_id) if selected_report_id is not None else None,
+                user_id=int(report_owner_id),
+                period_type=period_choice,
+                period_start=start_date,
+                period_end=end_date,
+                tasks=tasks_input,
+                remarks=remarks_input,
+                research=research_input,
+            )
+        except ValueError as err:
+            st.error(str(err))
+        else:
+            st.success("Report saved successfully.")
+            st.session_state["report_edit_select"] = saved_id
+            _safe_rerun()
+
+    st.markdown("---")
+    st.markdown("#### Report history")
+
+    def _display_text(value: Optional[object]) -> str:
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        return str(value).strip()
+
+    history_user = viewer_id
+    if is_admin:
+        history_options: list[Optional[int]] = [None] + user_ids
+
+        def _history_label(uid: Optional[int]) -> str:
+            if uid is None:
+                return "All team members"
+            return label_map.get(uid, f"User #{uid}")
+
+        default_history_index = (
+            history_options.index(report_owner_id)
+            if report_owner_id in history_options
+            else 0
+        )
+        history_user = st.selectbox(
+            "Team member",
+            history_options,
+            index=default_history_index,
+            format_func=_history_label,
+            key="report_history_user",
+        )
+
+    period_keys = list(REPORT_PERIOD_OPTIONS.keys())
+    history_periods = st.multiselect(
+        "Cadence",
+        period_keys,
+        default=period_keys,
+        format_func=lambda key: REPORT_PERIOD_OPTIONS.get(key, key.title()),
+        key="report_history_periods",
+    )
+
+    default_history_start = today - timedelta(days=30)
+    history_range = st.date_input(
+        "Period range",
+        value=(default_history_start, today),
+        key="report_history_range",
+    )
+    range_start = range_end = None
+    if isinstance(history_range, (list, tuple)) and len(history_range) == 2:
+        range_start, range_end = history_range
+    elif history_range:
+        range_start = history_range
+        range_end = history_range
+
+    search_term = st.text_input(
+        "Search notes",
+        key="report_history_search",
+        placeholder="Keyword in tasks, remarks, or research",
+    )
+
+    filters: list[str] = []
+    params: list[object] = []
+    if not is_admin or history_user is not None:
+        target = history_user if history_user is not None else viewer_id
+        filters.append("wr.user_id = ?")
+        params.append(int(target))
+    if history_periods and len(history_periods) != len(period_keys):
+        placeholders = ",".join("?" for _ in history_periods)
+        filters.append(f"wr.period_type IN ({placeholders})")
+        params.extend(history_periods)
+    if range_start:
+        filters.append("date(wr.period_start) >= date(?)")
+        params.append(to_iso_date(range_start))
+    if range_end:
+        filters.append("date(wr.period_end) <= date(?)")
+        params.append(to_iso_date(range_end))
+    if search_term:
+        keyword = search_term.strip()
+        if keyword:
+            filters.append(
+                "(wr.tasks LIKE '%'||?||'%' OR wr.remarks LIKE '%'||?||'%' OR wr.research LIKE '%'||?||'%')"
+            )
+            params.extend([keyword, keyword, keyword])
+
+    where_clause = " AND ".join(filters) if filters else "1=1"
+    history_df = df_query(
+        conn,
+        dedent(
+            f"""
+            SELECT wr.report_id, wr.user_id, wr.period_type, wr.period_start, wr.period_end,
+                   wr.tasks, wr.remarks, wr.research, wr.created_at, wr.updated_at,
+                   u.username
+            FROM work_reports wr
+            JOIN users u ON u.user_id = wr.user_id
+            WHERE {where_clause}
+            ORDER BY date(wr.period_start) DESC, wr.report_id DESC
+            """
+        ),
+        tuple(params),
+    )
+
+    if history_df.empty:
+        st.info("No reports found for the selected filters.")
+        return
+
+    history_df["report_id"] = history_df["report_id"].apply(lambda val: int(float(val)))
+    history_df["username"] = history_df.apply(
+        lambda row: clean_text(row.get("username")) or f"User #{int(row['user_id'])}",
+        axis=1,
+    )
+
+    display = history_df.copy()
+    display["Owner"] = display["username"]
+    display["Type"] = display["period_type"].apply(format_period_label)
+    display["Period"] = display.apply(
+        lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
+        axis=1,
+    )
+    for col in ("created_at", "updated_at"):
+        display[col] = pd.to_datetime(display[col], errors="coerce").dt.strftime(DATE_FMT)
+    for col in ("tasks", "remarks", "research"):
+        display[col] = display[col].apply(_display_text)
+    display.rename(
+        columns={
+            "tasks": "Tasks",
+            "remarks": "Remarks",
+            "research": "Research",
+            "created_at": "Created",
+            "updated_at": "Updated",
+        },
+        inplace=True,
+    )
+    table = display[
+        ["Owner", "Type", "Period", "Tasks", "Remarks", "Research", "Created", "Updated"]
+    ]
+    st.dataframe(table, use_container_width=True)
+
+    csv_data = table.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download filtered reports",
+        data=csv_data,
+        file_name="work_reports.csv",
+        mime="text/csv",
+        key="reports_download",
+    )
+
+    cadence_summary = (
+        history_df.assign(label=history_df["period_type"].apply(format_period_label))
+        .groupby("label")["report_id"]
+        .count()
+        .sort_index()
+    )
+    if not cadence_summary.empty:
+        st.markdown("##### Cadence summary")
+        cols = st.columns(len(cadence_summary))
+        for col, (label, count) in zip(cols, cadence_summary.items()):
+            col.metric(label, int(count))
+
+    if is_admin and history_user is None:
+        coverage = (
+            history_df.assign(
+                label=history_df["period_type"].apply(format_period_label),
+                owner=history_df["username"],
+            )
+            .pivot_table(
+                index="owner",
+                columns="label",
+                values="report_id",
+                aggfunc="count",
+                fill_value=0,
+            )
+            .astype(int)
+        )
+        coverage.columns.name = None
+        coverage = coverage.reset_index().rename(columns={"owner": "Team member"})
+        st.markdown("##### Reports by team member")
+        st.dataframe(coverage, use_container_width=True)
+
+    detail_limit = min(len(history_df), 20)
+    if detail_limit:
+        st.markdown("##### Quick read")
+        for _, row in history_df.head(detail_limit).iterrows():
+            header = (
+                f"{row['username']} – {format_period_label(row['period_type'])} "
+                f"({format_period_range(row.get('period_start'), row.get('period_end'))})"
+            )
+            with st.expander(header, expanded=False):
+                st.markdown("**Tasks completed**")
+                st.write(_display_text(row.get("tasks")) or "—")
+                st.markdown("**Remarks / blockers**")
+                st.write(_display_text(row.get("remarks")) or "—")
+                st.markdown("**Research / learnings**")
+                st.write(_display_text(row.get("research")) or "—")
+                created_label = format_period_range(
+                    row.get("created_at"), row.get("created_at")
+                )
+                updated_label = format_period_range(
+                    row.get("updated_at"), row.get("updated_at")
+                )
+                st.caption(f"Logged on {created_label} • Last updated {updated_label}")
+
 # ---------- Main ----------
 def main():
     init_ui()
@@ -6974,12 +7588,13 @@ def main():
                 "Scraps",
                 "Warranties",
                 "Import",
+                "Reports",
                 "Duplicates",
                 "Users (Admin)",
                 "Maintenance and Service",
             ]
         else:
-            pages = ["Dashboard", "Warranties", "Import", "Maintenance and Service"]
+            pages = ["Dashboard", "Warranties", "Import", "Reports", "Maintenance and Service"]
         if st.session_state.page not in pages:
             st.session_state.page = pages[0]
         current_index = pages.index(st.session_state.page)
@@ -7000,6 +7615,8 @@ def main():
         warranties_page(conn)
     elif page == "Import":
         import_page(conn)
+    elif page == "Reports":
+        reports_page(conn)
     elif page == "Duplicates":
         duplicates_page(conn)
     elif page == "Users (Admin)":
