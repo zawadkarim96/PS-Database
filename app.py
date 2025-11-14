@@ -98,9 +98,12 @@ CREATE TABLE IF NOT EXISTS customers (
     product_info TEXT,
     delivery_order_code TEXT,
     sales_person TEXT,
+    amount_spent REAL,
+    created_by INTEGER,
     attachment_path TEXT,
     created_at TEXT DEFAULT (datetime('now')),
-    dup_flag INTEGER DEFAULT 0
+    dup_flag INTEGER DEFAULT 0,
+    FOREIGN KEY(created_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS products (
     product_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +137,7 @@ CREATE TABLE IF NOT EXISTS warranties (
     issue_date TEXT,
     expiry_date TEXT,
     status TEXT DEFAULT 'active',
+    remarks TEXT,
     dup_flag INTEGER DEFAULT 0,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL,
     FOREIGN KEY(product_id) REFERENCES products(product_id) ON DELETE SET NULL
@@ -144,6 +148,7 @@ CREATE TABLE IF NOT EXISTS delivery_orders (
     order_id INTEGER,
     description TEXT,
     sales_person TEXT,
+    remarks TEXT,
     file_path TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL,
@@ -227,12 +232,15 @@ CREATE TABLE IF NOT EXISTS import_history (
     phone TEXT,
     product_label TEXT,
     notes TEXT,
+    amount_spent REAL,
+    imported_by INTEGER,
     deleted_at TEXT,
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE SET NULL,
     FOREIGN KEY(product_id) REFERENCES products(product_id) ON DELETE SET NULL,
     FOREIGN KEY(order_id) REFERENCES orders(order_id) ON DELETE SET NULL,
     FOREIGN KEY(order_item_id) REFERENCES order_items(order_item_id) ON DELETE SET NULL,
-    FOREIGN KEY(warranty_id) REFERENCES warranties(warranty_id) ON DELETE SET NULL
+    FOREIGN KEY(warranty_id) REFERENCES warranties(warranty_id) ON DELETE SET NULL,
+    FOREIGN KEY(imported_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS needs (
     need_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +291,8 @@ def ensure_schema_upgrades(conn):
     add_column("customers", "delivery_order_code", "TEXT")
     add_column("customers", "attachment_path", "TEXT")
     add_column("customers", "sales_person", "TEXT")
+    add_column("customers", "amount_spent", "REAL")
+    add_column("customers", "created_by", "INTEGER")
     add_column("services", "status", "TEXT DEFAULT 'In progress'")
     add_column("services", "service_start_date", "TEXT")
     add_column("services", "service_end_date", "TEXT")
@@ -295,6 +305,10 @@ def ensure_schema_upgrades(conn):
     add_column("maintenance_records", "maintenance_start_date", "TEXT")
     add_column("maintenance_records", "maintenance_end_date", "TEXT")
     add_column("maintenance_records", "maintenance_product_info", "TEXT")
+    add_column("warranties", "remarks", "TEXT")
+    add_column("delivery_orders", "remarks", "TEXT")
+    add_column("import_history", "amount_spent", "REAL")
+    add_column("import_history", "imported_by", "INTEGER")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS customer_notes (
@@ -315,6 +329,58 @@ def ensure_schema_upgrades(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_customer_notes_remind ON customer_notes(remind_on, is_done)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customers_created_by ON customers(created_by)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_import_history_imported_by ON import_history(imported_by)"
+    )
+
+
+def get_current_user() -> dict:
+    return st.session_state.get("user") or {}
+
+
+def current_user_id() -> Optional[int]:
+    user = get_current_user()
+    try:
+        return int(user.get("user_id")) if user.get("user_id") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def current_user_is_admin() -> bool:
+    return get_current_user().get("role") == "admin"
+
+
+def customer_scope_filter(alias: str = "") -> tuple[str, tuple[object, ...]]:
+    user = get_current_user()
+    if not user or user.get("role") == "admin":
+        return "", ()
+    user_id = current_user_id()
+    if user_id is None:
+        return "1=0", ()
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}created_by = ?", (user_id,)
+
+
+def accessible_customer_ids(conn) -> Optional[set[int]]:
+    if current_user_is_admin():
+        return None
+    user_id = current_user_id()
+    if user_id is None:
+        return set()
+    df = df_query(conn, "SELECT customer_id FROM customers WHERE created_by=?", (user_id,))
+    if df.empty:
+        return set()
+    ids: set[int] = set()
+    for value in df["customer_id"].dropna().tolist():
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
 
 def df_query(conn, q, params=()):
     return pd.read_sql_query(q, conn, params=params)
@@ -405,21 +471,24 @@ def upcoming_warranty_projection(conn, months_ahead: int = 6) -> pd.DataFrame:
     last_day = monthrange(last_bucket.year, last_bucket.month)[1]
     range_end = date(last_bucket.year, last_bucket.month, last_day)
 
+    scope_clause, scope_params = customer_scope_filter("c")
     projection = df_query(
         conn,
         dedent(
             """
-            SELECT strftime('%Y-%m', expiry_date) AS month_bucket,
+            SELECT strftime('%Y-%m', w.expiry_date) AS month_bucket,
                    COUNT(*) AS total
-            FROM warranties
-            WHERE status='active'
-              AND expiry_date IS NOT NULL
-              AND date(expiry_date) BETWEEN date(?) AND date(?)
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            WHERE w.status='active'
+              AND w.expiry_date IS NOT NULL
+              AND date(w.expiry_date) BETWEEN date(?) AND date(?)
+              {scope_filter}
             GROUP BY month_bucket
             ORDER BY month_bucket
             """
-        ),
-        params=(start_month.isoformat(), range_end.isoformat()),
+        ).format(scope_filter=f" AND {scope_clause}" if scope_clause else ""),
+        params=(start_month.isoformat(), range_end.isoformat(), *scope_params),
     )
 
     records: list[dict[str, object]] = []
@@ -472,6 +541,8 @@ def upcoming_warranty_breakdown(
     today = date.today()
     range_end = today + timedelta(days=days)
 
+    scope_clause, scope_params = customer_scope_filter("c")
+    scope_filter = f" AND {scope_clause}" if scope_clause else ""
     breakdown = df_query(
         conn,
         dedent(
@@ -484,11 +555,12 @@ def upcoming_warranty_breakdown(
             WHERE w.status='active'
               AND w.expiry_date IS NOT NULL
               AND date(w.expiry_date) BETWEEN date(?) AND date(?)
+              {scope_filter}
             GROUP BY bucket
             ORDER BY total DESC, bucket ASC
             """
         ),
-        params=(today.isoformat(), range_end.isoformat()),
+        params=(today.isoformat(), range_end.isoformat(), *scope_params),
     )
 
     if breakdown.empty:
@@ -568,6 +640,29 @@ def _coerce_float(value: object, default: float = 0.0) -> float:
     if not math.isfinite(number):
         return default
     return number
+
+
+def parse_amount(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        amount = float(value)
+        return round(amount, 2) if amount != 0 else amount
+    text = clean_text(value)
+    if not text:
+        return None
+    normalized = re.sub(r"[^0-9.\-]", "", text)
+    if normalized in {"", ".", "-", "-."}:
+        return None
+    try:
+        amount = float(normalized)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount):
+        return None
+    if math.isclose(amount, 0.0):
+        return 0.0
+    return round(amount, 2)
 
 
 def _clamp_percentage(value: float) -> float:
@@ -894,6 +989,7 @@ def _reset_new_customer_form_state() -> None:
         "new_customer_do_code",
         "new_customer_sales_person",
         "new_customer_remarks",
+        "new_customer_amount_spent",
         "new_customer_pdf",
         "new_customer_do_pdf",
         "new_customer_products_table",
@@ -1043,14 +1139,19 @@ def _sanitize_path_component(value: Optional[str]) -> str:
 
 
 def build_customer_groups(conn, only_complete: bool = True):
-    where_clause = ""
-    params = ()
+    criteria = []
+    params: list[object] = []
     if only_complete:
-        where_clause = f"WHERE {customer_complete_clause()}"
+        criteria.append(customer_complete_clause())
+    scope_clause, scope_params = customer_scope_filter()
+    if scope_clause:
+        criteria.append(scope_clause)
+        params.extend(scope_params)
+    where_clause = f"WHERE {' AND '.join(criteria)}" if criteria else ""
     df = df_query(
         conn,
         f"SELECT customer_id, TRIM(name) AS name FROM customers {where_clause}",
-        params,
+        tuple(params),
     )
     if df.empty:
         return [], {}
@@ -1354,6 +1455,10 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
+    if "remarks" in work.columns:
+        work["remarks_clean"] = work["remarks"].apply(clean_text)
+    else:
+        work["remarks_clean"] = None
     issue_dt = pd.to_datetime(work.get("issue_date"), errors="coerce")
     expiry_dt = pd.to_datetime(work.get("expiry_date"), errors="coerce")
     work["issue_fmt"] = issue_dt.dt.strftime(DATE_FMT)
@@ -1370,6 +1475,7 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
                     "description": dedupe_join(g["description"].tolist()),
                     "issue_date": dedupe_join(g["issue_fmt"].tolist()),
                     "expiry_date": dedupe_join(g["expiry_fmt"].tolist()),
+                    "remarks": dedupe_join(g["remarks_clean"].tolist()),
                     "_sort": g["expiry_dt"].min(),
                 }
             )
@@ -1377,7 +1483,16 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     grouped = grouped.sort_values("_sort", na_position="last").drop(columns=["_sort"])
-    grouped.rename(columns={"customer": "Customer", "description": "Description", "issue_date": "Issue date", "expiry_date": "Expiry date"}, inplace=True)
+    grouped.rename(
+        columns={
+            "customer": "Customer",
+            "description": "Description",
+            "issue_date": "Issue date",
+            "expiry_date": "Expiry date",
+            "remarks": "Remarks",
+        },
+        inplace=True,
+    )
     if "Customer" in grouped.columns:
         grouped["Customer"] = grouped["Customer"].fillna("(unknown)")
     return grouped
@@ -1391,6 +1506,7 @@ def _build_customers_export(conn) -> pd.DataFrame:
                phone,
                email,
                address,
+               amount_spent,
                purchase_date,
                product_info,
                delivery_order_code,
@@ -1409,6 +1525,7 @@ def _build_customers_export(conn) -> pd.DataFrame:
             "phone": "Phone",
             "email": "Email",
             "address": "Address",
+            "amount_spent": "Amount spent",
             "purchase_date": "Purchase date",
             "product_info": "Product info",
             "delivery_order_code": "Delivery order",
@@ -1425,6 +1542,7 @@ def _build_delivery_orders_export(conn) -> pd.DataFrame:
                COALESCE(c.name, '(unknown)') AS customer,
                d.description,
                d.sales_person,
+               d.remarks,
                d.created_at
         FROM delivery_orders d
         LEFT JOIN customers c ON c.customer_id = d.customer_id
@@ -1439,6 +1557,7 @@ def _build_delivery_orders_export(conn) -> pd.DataFrame:
             "customer": "Customer",
             "description": "Description",
             "sales_person": "Sales person",
+            "remarks": "Remarks",
             "created_at": "Created at",
         }
     )
@@ -1454,7 +1573,8 @@ def _build_warranties_export(conn) -> pd.DataFrame:
                w.serial,
                w.issue_date,
                w.expiry_date,
-               w.status
+               w.status,
+               w.remarks
         FROM warranties w
         LEFT JOIN customers c ON c.customer_id = w.customer_id
         LEFT JOIN products p ON p.product_id = w.product_id
@@ -1475,6 +1595,7 @@ def _build_warranties_export(conn) -> pd.DataFrame:
             "issue_date": "Issue date",
             "expiry_date": "Expiry date",
             "status": "Status",
+            "remarks": "Remarks",
         }
     )
 
@@ -1618,20 +1739,29 @@ def export_database_to_excel(conn) -> bytes:
 
 
 def fetch_warranty_window(conn, start_days: int, end_days: int) -> pd.DataFrame:
+    scope_clause, scope_params = customer_scope_filter("c")
+    filters = [
+        "w.status='active'",
+        "date(w.expiry_date) BETWEEN date('now', ?) AND date('now', ?)",
+    ]
+    params: list[object] = []
+    if scope_clause:
+        filters.append(scope_clause)
+        params.extend(scope_params)
+    where_clause = " AND ".join(filters)
     query = dedent(
-        """
-        SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
+        f"""
+        SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date, w.remarks
         FROM warranties w
         LEFT JOIN customers c ON c.customer_id = w.customer_id
         LEFT JOIN products p ON p.product_id = w.product_id
-        WHERE w.status='active'
-          AND date(w.expiry_date) BETWEEN date('now', ?) AND date('now', ?)
+        WHERE {where_clause}
         ORDER BY date(w.expiry_date) ASC
         """
     )
     start = f"+{start_days} day"
     end = f"+{end_days} day"
-    return df_query(conn, query, (start, end))
+    return df_query(conn, query, (start, end, *params))
 
 
 def format_warranty_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -1669,6 +1799,7 @@ def format_warranty_table(df: pd.DataFrame) -> pd.DataFrame:
         "customer": "Customer",
         "issue_date": "Issue date",
         "expiry_date": "Expiry date",
+        "remarks": "Remarks",
     }
     work.rename(columns={k: v for k, v in rename_map.items() if k in work.columns}, inplace=True)
     for col in ("dup_flag", "id", "duplicate"):
@@ -1933,6 +2064,8 @@ def dashboard(conn):
     )
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
+    allowed_customers = accessible_customer_ids(conn)
+    scope_clause, scope_params = customer_scope_filter("c")
 
     if "show_today_expired" not in st.session_state:
         st.session_state.show_today_expired = False
@@ -2243,6 +2376,8 @@ def dashboard(conn):
             conn,
             """
             SELECT s.do_number,
+                   s.customer_id,
+                   d.customer_id AS do_customer_id,
                    s.service_date,
                    COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                    s.description
@@ -2254,6 +2389,24 @@ def dashboard(conn):
             LIMIT 10
             """,
         )
+        if allowed_customers is not None:
+            recent_services = recent_services[
+                recent_services.apply(
+                    lambda row: any(
+                        cid in allowed_customers
+                        for cid in [
+                            int(row.get("customer_id"))
+                            if pd.notna(row.get("customer_id"))
+                            else None,
+                            int(row.get("do_customer_id"))
+                            if pd.notna(row.get("do_customer_id"))
+                            else None,
+                        ]
+                        if cid is not None
+                    ),
+                    axis=1,
+                )
+            ]
         recent_services = fmt_dates(recent_services, ["service_date"])
         st.dataframe(
             recent_services.rename(
@@ -2263,7 +2416,7 @@ def dashboard(conn):
                     "customer": "Customer",
                     "description": "Description",
                 }
-            ),
+            ).drop(columns=["customer_id", "do_customer_id"], errors="ignore"),
             use_container_width=True,
         )
 
@@ -2272,6 +2425,8 @@ def dashboard(conn):
             conn,
             """
             SELECT m.do_number,
+                   m.customer_id,
+                   d.customer_id AS do_customer_id,
                    m.maintenance_date,
                    COALESCE(c.name, cdo.name, '(unknown)') AS customer,
                    m.description
@@ -2283,6 +2438,24 @@ def dashboard(conn):
             LIMIT 10
             """,
         )
+        if allowed_customers is not None:
+            recent_maintenance = recent_maintenance[
+                recent_maintenance.apply(
+                    lambda row: any(
+                        cid in allowed_customers
+                        for cid in [
+                            int(row.get("customer_id"))
+                            if pd.notna(row.get("customer_id"))
+                            else None,
+                            int(row.get("do_customer_id"))
+                            if pd.notna(row.get("do_customer_id"))
+                            else None,
+                        ]
+                        if cid is not None
+                    ),
+                    axis=1,
+                )
+            ]
         recent_maintenance = fmt_dates(recent_maintenance, ["maintenance_date"])
         st.dataframe(
             recent_maintenance.rename(
@@ -2292,7 +2465,7 @@ def dashboard(conn):
                     "customer": "Customer",
                     "description": "Description",
                 }
-            ),
+            ).drop(columns=["customer_id", "do_customer_id"], errors="ignore"),
             use_container_width=True,
         )
 
@@ -2301,10 +2474,13 @@ def show_expiry_notifications(conn):
     if not st.session_state.get("just_logged_in"):
         return
 
+    allowed_customers = accessible_customer_ids(conn)
     scheduled_services = df_query(
         conn,
         """
         SELECT s.service_id,
+               s.customer_id,
+               d.customer_id AS do_customer_id,
                s.do_number,
                COALESCE(s.service_start_date, s.service_date) AS start_date,
                s.status,
@@ -2323,6 +2499,8 @@ def show_expiry_notifications(conn):
         conn,
         """
         SELECT m.maintenance_id,
+               m.customer_id,
+               d.customer_id AS do_customer_id,
                m.do_number,
                COALESCE(m.maintenance_start_date, m.maintenance_date) AS start_date,
                m.status,
@@ -2349,6 +2527,22 @@ def show_expiry_notifications(conn):
 
     scheduled_services = fmt_dates(scheduled_services, ["start_date"])
     scheduled_maintenance = fmt_dates(scheduled_maintenance, ["start_date"])
+    if allowed_customers is not None:
+        def _belongs(row):
+            candidates = []
+            for key in ("customer_id", "do_customer_id"):
+                value = row.get(key)
+                if pd.notna(value):
+                    try:
+                        candidates.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+            return any(cid in allowed_customers for cid in candidates)
+
+        scheduled_services = scheduled_services[scheduled_services.apply(_belongs, axis=1)]
+        scheduled_maintenance = scheduled_maintenance[scheduled_maintenance.apply(_belongs, axis=1)]
+    scheduled_services.drop(columns=["customer_id", "do_customer_id"], inplace=True, errors="ignore")
+    scheduled_maintenance.drop(columns=["customer_id", "do_customer_id"], inplace=True, errors="ignore")
 
     upcoming_sections: list[pd.DataFrame] = []
     upcoming_messages: list[str] = []
@@ -2357,6 +2551,7 @@ def show_expiry_notifications(conn):
         conn,
         """
         SELECT n.note_id,
+               n.customer_id,
                n.note,
                n.remind_on,
                c.name AS customer
@@ -2369,6 +2564,9 @@ def show_expiry_notifications(conn):
         """,
     )
     due_notes = fmt_dates(due_notes, ["remind_on"])
+    if allowed_customers is not None:
+        due_notes = due_notes[due_notes["customer_id"].apply(lambda value: pd.notna(value) and int(value) in allowed_customers)]
+    due_notes.drop(columns=["customer_id"], inplace=True, errors="ignore")
     notes_display = pd.DataFrame()
     if not due_notes.empty:
         notes_display = due_notes.rename(
@@ -2470,38 +2668,41 @@ def show_expiry_notifications(conn):
         else pd.DataFrame()
     )
 
-    total_expired = int(
-        df_query(
-            conn,
-            "SELECT COUNT(*) c FROM warranties WHERE date(expiry_date) < date('now')",
-        ).iloc[0]["c"]
+    scope_filter_clause = f" AND {scope_clause}" if scope_clause else ""
+    total_expired_query = dedent(
+        f"""
+        SELECT COUNT(*) c
+        FROM warranties w
+        LEFT JOIN customers c ON c.customer_id = w.customer_id
+        WHERE date(w.expiry_date) < date('now'){scope_filter_clause}
+        """
     )
+    total_expired = int(df_query(conn, total_expired_query, scope_params).iloc[0]["c"])
     month_expired = 0
     formatted = pd.DataFrame()
     if total_expired > 0:
-        month_expired = int(
-            df_query(
-                conn,
-                """
-                SELECT COUNT(*) c
-                FROM warranties
-                WHERE date(expiry_date) < date('now')
-                  AND strftime('%Y-%m', expiry_date) = strftime('%Y-%m', 'now')
-                """,
-            ).iloc[0]["c"]
-        )
-        expired_recent = df_query(
-            conn,
+        month_expired_query = dedent(
+            f"""
+            SELECT COUNT(*) c
+            FROM warranties w
+            LEFT JOIN customers c ON c.customer_id = w.customer_id
+            WHERE date(w.expiry_date) < date('now')
+              AND strftime('%Y-%m', w.expiry_date) = strftime('%Y-%m', 'now'){scope_filter_clause}
             """
+        )
+        month_expired = int(df_query(conn, month_expired_query, scope_params).iloc[0]["c"])
+        expired_recent_query = dedent(
+            f"""
             SELECT c.name AS customer, p.name AS product, p.model, w.serial, w.issue_date, w.expiry_date
             FROM warranties w
             LEFT JOIN customers c ON c.customer_id = w.customer_id
             LEFT JOIN products p ON p.product_id = w.product_id
-            WHERE date(w.expiry_date) < date('now')
+            WHERE date(w.expiry_date) < date('now'){scope_filter_clause}
             ORDER BY date(w.expiry_date) DESC
             LIMIT 12
-            """,
+            """
         )
+        expired_recent = df_query(conn, expired_recent_query, scope_params)
         formatted = format_warranty_table(expired_recent)
 
     show_upcoming = not upcoming_df.empty
@@ -2602,6 +2803,14 @@ def customers_page(conn):
                 key="new_customer_remarks",
                 help="Internal notes or special instructions for this customer.",
             )
+            amount_spent_input = st.number_input(
+                "Amount spent",
+                min_value=0.0,
+                step=100.0,
+                format="%.2f",
+                key="new_customer_amount_spent",
+                help="Record how much the customer has spent so far.",
+            )
             st.markdown("#### Products / services purchased")
             st.caption(
                 "Use the **Add row** option below to record each product or service purchased."
@@ -2701,8 +2910,12 @@ def customers_page(conn):
                 cleaned_products, product_labels = normalize_product_entries(product_entries)
                 product_label = "\n".join(product_labels) if product_labels else None
                 purchase_str = purchase_date.strftime("%Y-%m-%d") if purchase_date else None
+                amount_value = parse_amount(amount_spent_input)
+                if amount_value == 0.0 and (amount_spent_input is None or amount_spent_input == 0.0):
+                    amount_value = None
+                created_by = current_user_id()
                 cur.execute(
-                    "INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    "INSERT INTO customers (name, company_name, phone, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (
                         name_val,
                         company_val,
@@ -2714,6 +2927,8 @@ def customers_page(conn):
                         product_label,
                         do_serial,
                         clean_text(sales_person_input),
+                        amount_value,
+                        created_by,
                     ),
                 )
                 cid = cur.lastrowid
@@ -2746,8 +2961,8 @@ def customers_page(conn):
                             else None
                         )
                         cur.execute(
-                            "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status) VALUES (?, ?, ?, ?, ?, 'active')",
-                            (cid, pid, prod.get("serial"), issue, expiry),
+                            "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, remarks) VALUES (?, ?, ?, ?, ?, 'active', ?)",
+                            (cid, pid, prod.get("serial"), issue, expiry, remarks_val),
                         )
                     conn.commit()
                 if do_serial:
@@ -2802,13 +3017,14 @@ def customers_page(conn):
                             conn.commit()
                     else:
                         conn.execute(
-                            "INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (
                                 do_serial,
                                 cid,
                                 None,
                                 product_summary,
                                 sales_clean,
+                                remarks_val,
                                 stored_path,
                             ),
                         )
@@ -2999,12 +3215,13 @@ def customers_page(conn):
                     if new_do:
                         conn.execute(
                             """
-                            INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(do_number) DO UPDATE SET
                                 customer_id=excluded.customer_id,
                                 description=excluded.description,
-                                sales_person=excluded.sales_person
+                                sales_person=excluded.sales_person,
+                                remarks=excluded.remarks
                             """,
                             (
                                 new_do,
@@ -3012,6 +3229,7 @@ def customers_page(conn):
                                 None,
                                 product_label,
                                 new_sales_person,
+                                new_remarks,
                                 None,
                             ),
                         )
@@ -3176,12 +3394,13 @@ def customers_page(conn):
                 if new_do:
                     conn.execute(
                         """
-                        INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(do_number) DO UPDATE SET
                             customer_id=excluded.customer_id,
                             description=excluded.description,
-                            sales_person=excluded.sales_person
+                            sales_person=excluded.sales_person,
+                            remarks=excluded.remarks
                         """,
                         (
                             new_do,
@@ -3189,6 +3408,7 @@ def customers_page(conn):
                             None,
                             product_label,
                             new_sales_person,
+                            new_remarks,
                             None,
                         ),
                     )
@@ -3387,12 +3607,12 @@ def customers_page(conn):
                             st.warning("Some changes were saved, but please review the errors above.")
     st.markdown("**Recently Added Customers**")
     recent_df = df_query(conn, """
-        SELECT customer_id as id, name, company_name, phone, email, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, created_at
+        SELECT customer_id as id, name, company_name, phone, email, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_at
         FROM customers
         ORDER BY datetime(created_at) DESC LIMIT 200
     """)
     recent_df = fmt_dates(recent_df, ["created_at", "purchase_date"])
-    recent_df = recent_df.rename(columns={"sales_person": "Sales person"})
+    recent_df = recent_df.rename(columns={"sales_person": "Sales person", "amount_spent": "Amount spent"})
     st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
@@ -3403,18 +3623,30 @@ def warranties_page(conn):
     base = dedent(
         """
         SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial,
-               w.issue_date, w.expiry_date, w.status, w.dup_flag
+               w.issue_date, w.expiry_date, w.status, w.remarks, w.dup_flag
         FROM warranties w
         LEFT JOIN customers c ON c.customer_id = w.customer_id
         LEFT JOIN products p ON p.product_id = w.product_id
-        WHERE (? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')
-          AND (w.status IS NULL OR w.status <> 'deleted')
-          AND {date_cond}
+        WHERE {filters}
         ORDER BY date(w.expiry_date) {order}
         """
     )
 
-    active = df_query(conn, base.format(date_cond="date(w.expiry_date) >= date('now')", order=order), (q,q,q,q,q))
+    search_filter = "(? = '' OR c.name LIKE '%'||?||'%' OR p.name LIKE '%'||?||'%' OR p.model LIKE '%'||?||'%' OR w.serial LIKE '%'||?||'%')"
+    status_filter = "(w.status IS NULL OR w.status <> 'deleted')"
+    scope_clause, scope_params = customer_scope_filter("c")
+
+    def build_filters(date_condition: str) -> tuple[str, tuple[object, ...]]:
+        clauses = [search_filter, status_filter, date_condition]
+        params = [q, q, q, q, q]
+        if scope_clause:
+            clauses.append(scope_clause)
+            params.extend(scope_params)
+        return " AND ".join(clauses), tuple(params)
+
+    active_filters, active_params = build_filters("date(w.expiry_date) >= date('now')")
+    active_query = base.format(filters=active_filters, order=order)
+    active = df_query(conn, active_query, active_params)
     active = fmt_dates(active, ["issue_date","expiry_date"])
     if "dup_flag" in active.columns:
         active = active.assign(Duplicate=active["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
@@ -3423,7 +3655,9 @@ def warranties_page(conn):
     st.markdown("**Active Warranties**")
     st.dataframe(active, use_container_width=True)
 
-    expired = df_query(conn, base.format(date_cond="date(w.expiry_date) < date('now')", order="DESC"), (q,q,q,q,q))
+    expired_filters, expired_params = build_filters("date(w.expiry_date) < date('now')")
+    expired_query = base.format(filters=expired_filters, order="DESC")
+    expired = df_query(conn, expired_query, expired_params)
     expired = fmt_dates(expired, ["issue_date","expiry_date"])
     if "dup_flag" in expired.columns:
         expired = expired.assign(Duplicate=expired["dup_flag"].apply(lambda x: "🔁 duplicate serial" if int(x)==1 else ""))
@@ -3453,12 +3687,15 @@ def _render_service_section(conn, *, show_heading: bool = True):
     do_df = df_query(
         conn,
         """
-        SELECT d.do_number, d.customer_id, COALESCE(c.name, '(unknown)') AS customer_name, d.description
+        SELECT d.do_number, d.customer_id, COALESCE(c.name, '(unknown)') AS customer_name, d.description, d.remarks
         FROM delivery_orders d
         LEFT JOIN customers c ON c.customer_id = d.customer_id
         ORDER BY datetime(d.created_at) DESC
         """,
     )
+    allowed_customers = accessible_customer_ids(conn)
+    if allowed_customers is not None:
+        do_df = do_df[do_df["customer_id"].apply(lambda value: int(value) in allowed_customers if pd.notna(value) else False)]
     do_options = [None]
     do_labels = {None: "-- Select delivery order --"}
     do_customer_map = {}
@@ -3736,6 +3973,8 @@ def _render_service_section(conn, *, show_heading: bool = True):
         conn,
         """
         SELECT s.service_id,
+               s.customer_id,
+               d.customer_id AS do_customer_id,
                s.do_number,
                s.service_date,
                s.service_start_date,
@@ -3760,6 +3999,18 @@ def _render_service_section(conn, *, show_heading: bool = True):
         ORDER BY datetime(COALESCE(s.service_start_date, s.service_date)) DESC, s.service_id DESC
         """,
     )
+    if allowed_customers is not None:
+        def _service_row_allowed(row):
+            service_cust = row.get("customer_id")
+            do_cust = row.get("do_customer_id")
+            candidates = []
+            if pd.notna(service_cust):
+                candidates.append(int(service_cust))
+            if pd.notna(do_cust):
+                candidates.append(int(do_cust))
+            return any(cid in allowed_customers for cid in candidates)
+
+        service_df = service_df[service_df.apply(_service_row_allowed, axis=1)]
     if not service_df.empty:
         service_df = fmt_dates(service_df, ["service_date", "service_start_date", "service_end_date"])
         service_df["service_period"] = service_df.apply(
@@ -3768,6 +4019,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
             ),
             axis=1,
         )
+        service_df.drop(columns=["customer_id", "do_customer_id"], inplace=True, errors="ignore")
         service_df["Last update"] = pd.to_datetime(service_df.get("updated_at"), errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
         service_df.loc[service_df["Last update"].isna(), "Last update"] = None
         if "status" in service_df.columns:
@@ -4521,7 +4773,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
     do_df = df_query(
         conn,
         """
-        SELECT d.do_number, d.customer_id, COALESCE(c.name, '(unknown)') AS customer_name, d.description
+        SELECT d.do_number, d.customer_id, COALESCE(c.name, '(unknown)') AS customer_name, d.description, d.remarks
         FROM delivery_orders d
         LEFT JOIN customers c ON c.customer_id = d.customer_id
         ORDER BY datetime(d.created_at) DESC
@@ -4747,6 +4999,8 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         conn,
         """
         SELECT m.maintenance_id,
+               m.customer_id,
+               d.customer_id AS do_customer_id,
                m.do_number,
                m.maintenance_date,
                m.maintenance_start_date,
@@ -4767,11 +5021,24 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         ORDER BY datetime(COALESCE(m.maintenance_start_date, m.maintenance_date)) DESC, m.maintenance_id DESC
         """,
     )
+    if allowed_customers is not None:
+        def _maintenance_row_allowed(row):
+            maint_cust = row.get("customer_id")
+            do_cust = row.get("do_customer_id")
+            candidates = []
+            if pd.notna(maint_cust):
+                candidates.append(int(maint_cust))
+            if pd.notna(do_cust):
+                candidates.append(int(do_cust))
+            return any(cid in allowed_customers for cid in candidates)
+
+        maintenance_df = maintenance_df[maintenance_df.apply(_maintenance_row_allowed, axis=1)]
     if not maintenance_df.empty:
         maintenance_df = fmt_dates(
             maintenance_df,
             ["maintenance_date", "maintenance_start_date", "maintenance_end_date"],
         )
+        maintenance_df.drop(columns=["customer_id", "do_customer_id"], inplace=True, errors="ignore")
         maintenance_df["maintenance_period"] = maintenance_df.apply(
             lambda row: format_period_label(
                 row.get("maintenance_start_date"), row.get("maintenance_end_date")
@@ -5034,7 +5301,7 @@ def customer_summary_page(conn):
     warr = df_query(
         conn,
         f"""
-        SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.dup_flag
+        SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.status, w.remarks, w.dup_flag
         FROM warranties w
         LEFT JOIN customers c ON c.customer_id = w.customer_id
         LEFT JOIN products p ON p.product_id = w.product_id
@@ -5124,6 +5391,7 @@ def customer_summary_page(conn):
                COALESCE(c.name, '(unknown)') AS customer,
                d.description,
                d.sales_person,
+               d.remarks,
                d.created_at,
                d.file_path
         FROM delivery_orders d
@@ -5159,6 +5427,7 @@ def customer_summary_page(conn):
                    COALESCE(c.name, '(unknown)') AS customer,
                    d.description,
                    d.sales_person,
+                   d.remarks,
                    d.created_at,
                    d.file_path
             FROM delivery_orders d
@@ -5187,6 +5456,7 @@ def customer_summary_page(conn):
                         "customer": "Customer",
                         "description": "Description",
                         "sales_person": "Sales person",
+                        "remarks": "Remarks",
                         "created_at": "Created",
                         "Document": "Document",
                     }
@@ -5424,7 +5694,7 @@ def scraps_page(conn):
     scraps = df_query(
         conn,
         f"""
-        SELECT customer_id as id, name, phone, email, address, purchase_date, product_info, delivery_order_code, created_at
+        SELECT customer_id as id, name, phone, email, address, remarks, purchase_date, product_info, delivery_order_code, created_at
         FROM customers
         WHERE {customer_incomplete_clause()}
         ORDER BY datetime(created_at) DESC
@@ -5444,7 +5714,7 @@ def scraps_page(conn):
         return ", ".join(missing)
 
     scraps = scraps.assign(missing=scraps.apply(missing_fields, axis=1))
-    display_cols = ["name", "phone", "email", "address", "purchase_date", "product_info", "delivery_order_code", "missing", "created_at"]
+    display_cols = ["name", "phone", "email", "address", "remarks", "purchase_date", "product_info", "delivery_order_code", "missing", "created_at"]
     st.dataframe(scraps[display_cols])
 
     st.markdown("### Update scrap record")
@@ -5477,6 +5747,7 @@ def scraps_page(conn):
         purchase = st.text_input("Purchase date (DD-MM-YYYY)", existing_value("purchase_date"))
         product = st.text_input("Product", existing_value("product_info"))
         do_code = st.text_input("Delivery order code", existing_value("delivery_order_code"))
+        remarks_text = st.text_area("Remarks", existing_value("remarks"))
         col1, col2 = st.columns(2)
         save = col1.form_submit_button("Save changes", type="primary")
         delete = col2.form_submit_button("Delete scrap")
@@ -5486,17 +5757,19 @@ def scraps_page(conn):
         new_phone = clean_text(phone)
         new_email = clean_text(email)
         new_address = clean_text(address)
+        new_remarks = clean_text(remarks_text)
         purchase_str, _ = date_strings_from_input(purchase)
         new_product = clean_text(product)
         new_do = clean_text(do_code)
         old_phone = clean_text(selected.get("phone"))
         conn.execute(
-            "UPDATE customers SET name=?, phone=?, email=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
+            "UPDATE customers SET name=?, phone=?, email=?, address=?, remarks=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
             (
                 new_name,
                 new_phone,
                 new_email,
                 new_address,
+                new_remarks,
                 purchase_str,
                 new_product,
                 new_do,
@@ -5507,11 +5780,12 @@ def scraps_page(conn):
         if new_do:
             conn.execute(
                 """
-                INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(do_number) DO UPDATE SET
                     customer_id=excluded.customer_id,
-                    description=excluded.description
+                    description=excluded.description,
+                    remarks=excluded.remarks
                 """,
                 (
                     new_do,
@@ -5519,6 +5793,7 @@ def scraps_page(conn):
                     None,
                     new_product,
                     None,
+                    new_remarks,
                     None,
                 ),
             )
@@ -5582,6 +5857,8 @@ HEADER_MAP = {
     "email": {"email", "mail", "e_mail", "email_address", "contact_email"},
     "product": {"product", "item", "generator", "model", "description"},
     "do_code": {"do_code", "delivery_order", "delivery_order_code", "delivery_order_no", "do", "d_o_code", "do_number"},
+    "remarks": {"remarks", "remark", "notes", "note", "comments", "comment"},
+    "amount_spent": {"amount", "amount_spent", "value", "price", "invoice_amount", "total", "total_amount", "amt"},
 }
 
 def map_headers_guess(cols):
@@ -5677,7 +5954,8 @@ def import_page(conn):
     opts = ["(blank)"] + cols
     col1, col2, col3 = st.columns(3)
     col4, col5 = st.columns(2)
-    col6, _ = st.columns(2)
+    col6, col7 = st.columns(2)
+    col8, _ = st.columns(2)
     sel_date = col1.selectbox(
         "Date", options=opts, index=(guess["date"] + 1) if guess.get("date") is not None else 0
     )
@@ -5696,6 +5974,12 @@ def import_page(conn):
     sel_do = col6.selectbox(
         "Delivery order code", options=opts, index=(guess["do_code"] + 1) if guess.get("do_code") is not None else 0
     )
+    sel_remarks = col7.selectbox(
+        "Remarks", options=opts, index=(guess.get("remarks", None) + 1) if guess.get("remarks") is not None else 0
+    )
+    sel_amount = col8.selectbox(
+        "Amount spent", options=opts, index=(guess.get("amount_spent", None) + 1) if guess.get("amount_spent") is not None else 0
+    )
 
     def pick(col_name):
         return df[col_name] if col_name != "(blank)" else pd.Series([None] * len(df))
@@ -5708,6 +5992,8 @@ def import_page(conn):
             "phone": pick(sel_phone),
             "product": pick(sel_prod),
             "do_code": pick(sel_do),
+            "remarks": pick(sel_remarks),
+            "amount_spent": pick(sel_amount),
         }
     )
     skip_blanks = st.checkbox("Skip blank rows", value=True)
@@ -5728,6 +6014,10 @@ def import_page(conn):
         column_config={
             "date": st.column_config.DateColumn("Date", format="DD-MM-YYYY", required=False),
             "Action": st.column_config.SelectboxColumn("Action", options=["Import", "Skip"], required=True),
+            "remarks": st.column_config.TextColumn("Remarks", required=False),
+            "amount_spent": st.column_config.NumberColumn(
+                "Amount spent", min_value=0.0, step=0.01, format="%.2f", required=False
+            ),
         },
     )
 
@@ -5882,7 +6172,7 @@ def duplicates_page(conn):
     )
     warr = df_query(
         conn,
-        "SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.dup_flag FROM warranties w LEFT JOIN customers c ON c.customer_id = w.customer_id LEFT JOIN products p ON p.product_id = w.product_id ORDER BY date(w.issue_date) DESC",
+        "SELECT w.warranty_id as id, c.name as customer, p.name as product, p.model, w.serial, w.issue_date, w.expiry_date, w.remarks, w.dup_flag FROM warranties w LEFT JOIN customers c ON c.customer_id = w.customer_id LEFT JOIN products p ON p.product_id = w.product_id ORDER BY date(w.issue_date) DESC",
     )
     duplicate_customers = pd.DataFrame()
     if not cust_raw.empty:
@@ -6071,17 +6361,19 @@ def duplicates_page(conn):
                         if new_do:
                             conn.execute(
                                 """
-                                INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-                                VALUES (?, ?, ?, ?, ?, ?)
+                                INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
                                 ON CONFLICT(do_number) DO UPDATE SET
                                     customer_id=excluded.customer_id,
-                                    description=excluded.description
+                                    description=excluded.description,
+                                    remarks=excluded.remarks
                                 """,
                                 (
                                     new_do,
                                     cid,
                                     None,
                                     product_label,
+                                    None,
                                     None,
                                     None,
                                 ),
@@ -6192,11 +6484,14 @@ def _import_clean6(conn, df, tag="Import"):
     seeded = 0
     d_c = d_p = 0
     phones_to_recalc: set[str] = set()
+    created_by = current_user_id()
     for _, r in df.iterrows():
         d = r.get("date", pd.NaT)
         cust = r.get("customer_name"); addr = r.get("address")
         phone = r.get("phone"); email = r.get("email"); prod = r.get("product")
         do_code = r.get("do_code")
+        remarks_val = clean_text(r.get("remarks"))
+        amount_value = parse_amount(r.get("amount_spent"))
         if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
             continue
         cust = str(cust) if pd.notna(cust) else None
@@ -6225,8 +6520,8 @@ def _import_clean6(conn, df, tag="Import"):
 
         dupc = 1 if exists_phone(phone, purchase_str) else 0
         cur.execute(
-            "INSERT INTO customers (name, phone, email, address, dup_flag) VALUES (?, ?, ?, ?, ?)",
-            (cust, phone, email, addr, dupc),
+            "INSERT INTO customers (name, phone, email, address, remarks, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (cust, phone, email, addr, remarks_val, amount_value, created_by, dupc),
         )
         cid = cur.lastrowid
         if dupc:
@@ -6279,8 +6574,15 @@ def _import_clean6(conn, df, tag="Import"):
         base = base_dt
         expiry = base + pd.Timedelta(days=365)
         cur.execute(
-            "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, dup_flag) VALUES (?, ?, ?, ?, ?, 'active', 0)",
-            (cid, pid, None, base.strftime("%Y-%m-%d"), expiry.strftime("%Y-%m-%d")),
+            "INSERT INTO warranties (customer_id, product_id, serial, issue_date, expiry_date, status, remarks, dup_flag) VALUES (?, ?, ?, ?, ?, 'active', ?, 0)",
+            (
+                cid,
+                pid,
+                None,
+                base.strftime("%Y-%m-%d"),
+                expiry.strftime("%Y-%m-%d"),
+                remarks_val,
+            ),
         )
         warranty_id = cur.lastrowid
 
@@ -6288,28 +6590,31 @@ def _import_clean6(conn, df, tag="Import"):
         if do_serial:
             description = clean_text(prod)
             cur.execute(
-                "INSERT OR IGNORE INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     do_serial,
                     cid,
                     oid,
                     description,
                     None,
+                    remarks_val,
                     None,
                 ),
             )
         purchase_date = purchase_str or (base.strftime("%Y-%m-%d") if isinstance(base, pd.Timestamp) else None)
         cur.execute(
-            "UPDATE customers SET purchase_date=?, product_info=?, delivery_order_code=? WHERE customer_id=?",
+            "UPDATE customers SET purchase_date=?, product_info=?, delivery_order_code=?, remarks=?, amount_spent=? WHERE customer_id=?",
             (
                 purchase_date,
                 prod,
                 do_serial,
+                remarks_val,
+                amount_value,
                 cid,
             ),
         )
         cur.execute(
-            "INSERT INTO import_history (customer_id, product_id, order_id, order_item_id, warranty_id, do_number, import_tag, original_date, customer_name, address, phone, product_label, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO import_history (customer_id, product_id, order_id, order_item_id, warranty_id, do_number, import_tag, original_date, customer_name, address, phone, product_label, notes, amount_spent, imported_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 cid,
                 pid,
@@ -6323,7 +6628,9 @@ def _import_clean6(conn, df, tag="Import"):
                 addr,
                 phone,
                 prod,
-                None,
+                remarks_val,
+                amount_value,
+                created_by,
             ),
         )
         seeded += 1
@@ -6355,11 +6662,13 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
     purchase_date_str, expiry_str = date_strings_from_input(updates.get("purchase_date"))
     product_label = clean_text(updates.get("product_label"))
     new_do = clean_text(updates.get("do_number"))
+    new_remarks = clean_text(updates.get("remarks"))
+    new_amount = parse_amount(updates.get("amount_spent"))
     product_name, product_model = split_product_label(product_label)
 
     if customer_id is not None:
         cur.execute(
-            "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, dup_flag=0 WHERE customer_id=?",
+            "UPDATE customers SET name=?, phone=?, address=?, purchase_date=?, product_info=?, delivery_order_code=?, remarks=?, amount_spent=?, dup_flag=0 WHERE customer_id=?",
             (
                 new_name,
                 new_phone,
@@ -6367,6 +6676,8 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
                 purchase_date_str,
                 product_label,
                 new_do,
+                new_remarks,
+                new_amount,
                 customer_id,
             ),
         )
@@ -6391,19 +6702,20 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
 
     if warranty_id is not None:
         cur.execute(
-            "UPDATE warranties SET issue_date=?, expiry_date=?, status='active' WHERE warranty_id=?",
-            (purchase_date_str, expiry_str, warranty_id),
+            "UPDATE warranties SET issue_date=?, expiry_date=?, status='active', remarks=? WHERE warranty_id=?",
+            (purchase_date_str, expiry_str, new_remarks, warranty_id),
         )
 
     if new_do:
         cur.execute(
             """
-            INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, file_path)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(do_number) DO UPDATE SET
                 customer_id=excluded.customer_id,
                 order_id=excluded.order_id,
-                description=excluded.description
+                description=excluded.description,
+                remarks=excluded.remarks
             """,
             (
                 new_do,
@@ -6411,6 +6723,7 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
                 order_id,
                 product_label,
                 None,
+                new_remarks,
                 None,
             ),
         )
@@ -6423,7 +6736,7 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
         cur.execute(query, tuple(params))
 
         cur.execute(
-            "UPDATE import_history SET original_date=?, customer_name=?, address=?, phone=?, product_label=?, do_number=? WHERE import_id=?",
+            "UPDATE import_history SET original_date=?, customer_name=?, address=?, phone=?, product_label=?, do_number=?, notes=?, amount_spent=? WHERE import_id=?",
             (
                 purchase_date_str,
                 new_name,
@@ -6431,6 +6744,8 @@ def update_import_entry(conn, record: dict, updates: dict) -> None:
                 new_phone,
                 product_label,
                 new_do,
+                new_remarks,
+                new_amount,
                 import_id,
             ),
         )
@@ -6496,18 +6811,33 @@ def delete_import_entry(conn, record: dict) -> None:
 
 def manage_import_history(conn):
     st.subheader("🗃️ Manage imported rows")
+    user = get_current_user()
+    is_admin = user.get("role") == "admin"
+    where_parts = ["ih.deleted_at IS NULL"]
+    params: list[object] = []
+    if not is_admin:
+        user_id = current_user_id()
+        if user_id is None:
+            where_parts.append("1=0")
+        else:
+            where_parts.append(
+                "(ih.imported_by = ? OR (ih.imported_by IS NULL AND c.created_by = ?))"
+            )
+            params.extend([user_id, user_id])
+    where_clause = " AND ".join(where_parts)
     hist = df_query(
         conn,
-        """
+        f"""
         SELECT ih.*, c.name AS live_customer_name, c.address AS live_address, c.phone AS live_phone,
                c.purchase_date AS live_purchase_date, c.product_info AS live_product_info,
                c.delivery_order_code AS live_do_code, c.attachment_path AS live_attachment_path
         FROM import_history ih
         LEFT JOIN customers c ON c.customer_id = ih.customer_id
-        WHERE ih.deleted_at IS NULL
+        WHERE {where_clause}
         ORDER BY ih.import_id DESC
         LIMIT 200
         """,
+        tuple(params),
     )
     if hist.empty:
         st.info("No imported rows yet. Upload a file to get started.")
@@ -6521,6 +6851,7 @@ def manage_import_history(conn):
         "phone",
         "product_label",
         "do_number",
+        "amount_spent",
     ]
     display = hist[display_cols].copy()
     display = fmt_dates(display, ["imported_at"])
@@ -6533,6 +6864,7 @@ def manage_import_history(conn):
             "phone": "Phone",
             "product_label": "Product",
             "do_number": "DO code",
+            "amount_spent": "Amount spent",
         },
         inplace=True,
     )
@@ -6558,6 +6890,11 @@ def manage_import_history(conn):
     current_do = clean_text(selected.get("live_do_code")) or clean_text(selected.get("do_number")) or ""
     purchase_seed = selected.get("live_purchase_date") or selected.get("original_date")
     purchase_str = clean_text(purchase_seed) or ""
+    amount_seed = selected.get("amount_spent")
+    amount_value = parse_amount(amount_seed)
+    amount_display = ""
+    if amount_value is not None:
+        amount_display = format_money(amount_value) or f"{amount_value:,.2f}"
 
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
@@ -6569,7 +6906,16 @@ def manage_import_history(conn):
         purchase_input = st.text_input("Purchase date (DD-MM-YYYY)", value=purchase_str)
         product_input = st.text_input("Product", value=current_product)
         do_input = st.text_input("Delivery order code", value=current_do)
-        notes_input = st.text_area("Notes", value=clean_text(selected.get("notes")) or "", help="Optional remarks stored with this import entry.")
+        remarks_input = st.text_area(
+            "Remarks",
+            value=clean_text(selected.get("notes")) or "",
+            help="Optional remarks stored with this import entry.",
+        )
+        amount_input = st.text_input(
+            "Amount spent",
+            value=amount_display,
+            help="Track how much was spent for this imported row.",
+        )
         col1, col2 = st.columns(2)
         save_btn = col1.form_submit_button("Save changes", type="primary")
         delete_btn = col2.form_submit_button("Delete import", disabled=not is_admin)
@@ -6585,11 +6931,17 @@ def manage_import_history(conn):
                 "purchase_date": purchase_input,
                 "product_label": product_input,
                 "do_number": do_input,
+                "remarks": remarks_input,
+                "amount_spent": amount_input,
             },
         )
         conn.execute(
-            "UPDATE import_history SET notes=? WHERE import_id=?",
-            (clean_text(notes_input), int(selected_id)),
+            "UPDATE import_history SET notes=?, amount_spent=? WHERE import_id=?",
+            (
+                clean_text(remarks_input),
+                parse_amount(amount_input),
+                int(selected_id),
+            ),
         )
         conn.commit()
         st.success("Import entry updated.")
