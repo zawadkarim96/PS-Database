@@ -6226,6 +6226,13 @@ def import_page(conn):
         st.markdown("---")
         manage_import_history(conn)
         return
+    # Streamlit reruns the script whenever widgets change state. This means the
+    # uploaded file object is reused across runs and its pointer sits at the end
+    # after the first read. Attempting to read again (e.g. after a selectbox
+    # change) would therefore raise an "Excel file format cannot be determined"
+    # error or return empty data, effectively restarting the app view. Reset the
+    # pointer before every read so interactive mapping works reliably.
+    f.seek(0)
     if f.name.endswith(".csv"):
         df = pd.read_csv(f)
     else:
@@ -7701,122 +7708,6 @@ def reports_page(conn):
                     st.session_state["report_edit_select_pending"] = saved_id
                     st.session_state.pop("report_attachment_uploader", None)
                     _safe_rerun()
-
-    if is_admin:
-        st.markdown("#### Team submission tracker")
-        tracker_period = st.selectbox(
-            "Audit cadence",
-            list(REPORT_PERIOD_OPTIONS.keys()),
-            format_func=lambda key: REPORT_PERIOD_OPTIONS.get(key, key.title()),
-            key="report_tracker_period",
-        )
-        tracker_anchor = st.date_input(
-            "Audit date",
-            value=today,
-            key="report_tracker_anchor",
-            help="Pick any date inside the period you want to audit.",
-        )
-        try:
-            tracker_key, tracker_start, tracker_end = normalize_report_window(
-                tracker_period, tracker_anchor, tracker_anchor
-            )
-        except ValueError as err:
-            st.error(str(err))
-        else:
-            staff_records: list[tuple[int, str]] = []
-            if not directory.empty:
-                directory["role"] = directory["role"].fillna("")
-                for _, row in directory.iterrows():
-                    try:
-                        uid = int(row["user_id"])
-                    except Exception:
-                        continue
-                    role_label = clean_text(row.get("role")) or ""
-                    if role_label.lower() == "admin":
-                        continue
-                    label = user_labels.get(uid, f"User #{uid}")
-                    staff_records.append((uid, label))
-            if not staff_records:
-                st.info("No team members found to audit. Add staff accounts to start tracking.")
-            else:
-                placeholders = ",".join("?" for _ in staff_records)
-                params = [uid for uid, _ in staff_records]
-                params.extend([tracker_key, tracker_start.isoformat()])
-                tracker_results = df_query(
-                    conn,
-                    dedent(
-                        f"""
-                        SELECT user_id, report_id, updated_at, attachment_path
-                        FROM work_reports
-                        WHERE user_id IN ({placeholders}) AND period_type=? AND period_start=?
-                        """
-                    ),
-                    tuple(params),
-                )
-                report_map: dict[int, dict] = {}
-                if not tracker_results.empty:
-                    tracker_results["user_id"] = tracker_results["user_id"].apply(
-                        lambda val: int(float(val))
-                    )
-                    tracker_results["report_id"] = tracker_results["report_id"].apply(
-                        lambda val: int(float(val))
-                    )
-                    report_map = {
-                        int(row["user_id"]): row for _, row in tracker_results.iterrows()
-                    }
-                summary_rows: list[dict[str, object]] = []
-                missing_labels: list[str] = []
-                for uid, label in staff_records:
-                    record = report_map.get(uid)
-                    if record:
-                        updated = pd.to_datetime(record.get("updated_at"), errors="coerce")
-                        if pd.isna(updated):
-                            updated_label = "—"
-                        else:
-                            updated_label = pd.Timestamp(updated).strftime("%d-%m-%Y %H:%M")
-                        summary_rows.append(
-                            {
-                                "Member": label,
-                                "Status": "Submitted",
-                                "Report ID": int(record.get("report_id")),
-                                "Updated": updated_label,
-                                "Attachment": "📎" if clean_text(record.get("attachment_path")) else "—",
-                            }
-                        )
-                    else:
-                        missing_labels.append(label)
-                        summary_rows.append(
-                            {
-                                "Member": label,
-                                "Status": "Missing",
-                                "Report ID": "—",
-                                "Updated": "—",
-                                "Attachment": "—",
-                            }
-                        )
-                tracker_df = pd.DataFrame(summary_rows)
-                if not tracker_df.empty:
-                    tracker_df["Status"] = pd.Categorical(
-                        tracker_df["Status"],
-                        categories=["Missing", "Submitted"],
-                        ordered=True,
-                    )
-                    tracker_df.sort_values(["Status", "Member"], inplace=True)
-                    tracker_df.reset_index(drop=True, inplace=True)
-                    st.caption(
-                        f"{format_period_label(tracker_key)} · {format_period_range(tracker_start.isoformat(), tracker_end.isoformat())}"
-                    )
-                    st.dataframe(tracker_df, use_container_width=True)
-                if missing_labels:
-                    st.warning(
-                        "No submission from: " + ", ".join(missing_labels),
-                        icon="⏰",
-                    )
-                else:
-                    st.success(
-                        "All tracked team members have submitted their reports.",
-                        icon="✅",
-                    )
 
     st.markdown("---")
     st.markdown("#### Report history")
