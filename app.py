@@ -3977,6 +3977,43 @@ def customers_page(conn):
         )
         if not is_admin:
             st.caption("Set Action to “Delete” requires admin access; non-admin changes will be ignored.")
+        if is_admin and not editor_df.empty:
+            delete_labels: dict[int, str] = {}
+            for record in editor_df.to_dict("records"):
+                cid = int_or_none(record.get("id"))
+                if cid is None:
+                    continue
+                name_val = clean_text(record.get("name")) or "(no name)"
+                phone_val = clean_text(record.get("phone")) or "-"
+                delete_labels[cid] = f"#{cid} – {name_val} | {phone_val}"
+            delete_choices = sorted(
+                delete_labels.keys(), key=lambda cid: delete_labels[cid].lower()
+            )
+            with st.form("bulk_customer_delete"):
+                selected_delete_ids = st.multiselect(
+                    "Select customers to delete",
+                    delete_choices,
+                    format_func=lambda cid: delete_labels.get(
+                        int(cid), f"Customer #{cid}"
+                    ),
+                    help="Removes the selected customers and their related records.",
+                )
+                bulk_delete_submit = st.form_submit_button(
+                    "Delete selected customers",
+                    disabled=not selected_delete_ids,
+                    type="secondary",
+                )
+            if bulk_delete_submit and selected_delete_ids:
+                deleted_count = 0
+                for cid in selected_delete_ids:
+                    try:
+                        delete_customer_record(conn, int(cid))
+                        deleted_count += 1
+                    except Exception as err:
+                        st.error(f"Unable to delete customer #{cid}: {err}")
+                if deleted_count:
+                    st.warning(f"Deleted {deleted_count} customer(s).")
+                    _safe_rerun()
         if st.button("Apply table updates", type="primary"):
             editor_result = editor_state if isinstance(editor_state, pd.DataFrame) else pd.DataFrame(editor_state)
             if editor_result.empty:
@@ -7549,38 +7586,41 @@ def _import_clean6(conn, df, tag="Import"):
     created_by = current_user_id()
     for _, r in df.iterrows():
         d = r.get("date", pd.NaT)
-        cust = r.get("customer_name"); addr = r.get("address")
-        phone = r.get("phone"); email = r.get("email"); prod = r.get("product")
-        do_code = r.get("do_code")
+        cust = clean_text(r.get("customer_name"))
+        addr = clean_text(r.get("address"))
+        phone = clean_text(r.get("phone"))
+        email = clean_text(r.get("email"))
+        product_label = clean_text(r.get("product"))
+        do_serial = clean_text(r.get("do_code"))
         remarks_val = clean_text(r.get("remarks"))
         amount_value = parse_amount(r.get("amount_spent"))
-        if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
+        if cust is None and phone is None and product_label is None:
             continue
-        cust = str(cust) if pd.notna(cust) else None
-        addr = str(addr) if pd.notna(addr) else None
-        phone = str(phone) if pd.notna(phone) else None
-        email = str(email) if pd.notna(email) else None
-        prod = str(prod) if pd.notna(prod) else None
         purchase_dt = parse_date_value(d)
         purchase_str = purchase_dt.strftime("%Y-%m-%d") if isinstance(purchase_dt, pd.Timestamp) else None
         # dup checks
-        def exists_phone(phone_value, purchase_value):
+        def exists_phone(phone_value, purchase_value, do_value, product_value):
             normalized_phone = clean_text(phone_value)
             if not normalized_phone:
                 return False
+            clauses = ["phone = ?"]
+            params: list[object] = [normalized_phone]
             if purchase_value:
-                cur.execute(
-                    "SELECT 1 FROM customers WHERE phone = ? AND IFNULL(purchase_date, '') = ? LIMIT 1",
-                    (normalized_phone, purchase_value),
-                )
+                clauses.append("IFNULL(purchase_date, '') = ?")
+                params.append(purchase_value)
             else:
-                cur.execute(
-                    "SELECT 1 FROM customers WHERE phone = ? AND (purchase_date IS NULL OR purchase_date = '') LIMIT 1",
-                    (normalized_phone,),
-                )
+                clauses.append("(purchase_date IS NULL OR purchase_date = '')")
+            if do_value:
+                clauses.append("LOWER(IFNULL(delivery_order_code, '')) = LOWER(?)")
+                params.append(do_value)
+            elif product_value:
+                clauses.append("LOWER(IFNULL(product_info, '')) = LOWER(?)")
+                params.append(product_value)
+            query = f"SELECT 1 FROM customers WHERE {' AND '.join(clauses)} LIMIT 1"
+            cur.execute(query, tuple(params))
             return cur.fetchone() is not None
 
-        dupc = 1 if exists_phone(phone, purchase_str) else 0
+        dupc = 1 if exists_phone(phone, purchase_str, do_serial, product_label) else 0
         cur.execute(
             "INSERT INTO customers (name, phone, email, address, remarks, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (cust, phone, email, addr, remarks_val, amount_value, created_by, dupc),
@@ -7593,7 +7633,7 @@ def _import_clean6(conn, df, tag="Import"):
             if normalized_phone:
                 phones_to_recalc.add(normalized_phone)
 
-        name, model = split_product_label(prod)
+        name, model = split_product_label(product_label)
 
         def exists_prod(name, model):
             if not name:
@@ -7648,9 +7688,8 @@ def _import_clean6(conn, df, tag="Import"):
         )
         warranty_id = cur.lastrowid
 
-        do_serial = clean_text(do_code)
         if do_serial:
-            description = clean_text(prod)
+            description = product_label
             cur.execute(
                 "INSERT OR IGNORE INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -7668,7 +7707,7 @@ def _import_clean6(conn, df, tag="Import"):
             "UPDATE customers SET purchase_date=?, product_info=?, delivery_order_code=?, remarks=?, amount_spent=? WHERE customer_id=?",
             (
                 purchase_date,
-                prod,
+                product_label,
                 do_serial,
                 remarks_val,
                 amount_value,
@@ -7689,7 +7728,7 @@ def _import_clean6(conn, df, tag="Import"):
                 cust,
                 addr,
                 phone,
-                prod,
+                product_label,
                 remarks_val,
                 amount_value,
                 created_by,
@@ -8181,6 +8220,13 @@ def reports_page(conn):
         return
 
     is_admin = user.get("role") == "admin"
+    today = datetime.now().date()
+    current_week_start = today - timedelta(days=today.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+    current_month_start = date(today.year, today.month, 1)
+    current_month_end = date(
+        today.year, today.month, monthrange(today.year, today.month)[1]
+    )
     st.caption(
         "Staff can see only their own entries. Admins can review every team member's submissions."
     )
@@ -8226,59 +8272,9 @@ def reports_page(conn):
             f"Recording progress for **{label_map.get(viewer_id, 'you')}**.",
             icon="📝",
         )
-
-    owner_reports = df_query(
-        conn,
-        dedent(
-            """
-            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, attachment_path, created_at, updated_at
-            FROM work_reports
-            WHERE user_id=?
-            ORDER BY date(period_start) DESC, report_id DESC
-            LIMIT 50
-            """
-        ),
-        (report_owner_id,),
-    )
-    record_labels: dict[int, str] = {}
-    if not owner_reports.empty:
-        owner_reports["report_id"] = owner_reports["report_id"].apply(lambda val: int(float(val)))
-        for _, row in owner_reports.iterrows():
-            rid = int(row["report_id"])
-            record_labels[rid] = (
-                f"{format_period_label(row.get('period_type'))} – "
-                f"{format_period_range(row.get('period_start'), row.get('period_end'))}"
-            )
-
-    report_choices = [None] + owner_reports.get("report_id", pd.Series(dtype=int)).tolist()
-
-    def _format_report_choice(value):
-        if value is None:
-            return "➕ Create new report"
-        try:
-            return record_labels.get(int(value), f"Report #{int(value)}")
-        except Exception:
-            return "Report"
-
-    if "report_edit_select_pending" in st.session_state:
-        pending_selection = st.session_state.pop("report_edit_select_pending")
-        if pending_selection is not None:
-            st.session_state["report_edit_select"] = pending_selection
-
-    selected_report_id = st.selectbox(
-        "Load an existing report",
-        report_choices,
-        format_func=_format_report_choice,
-        key="report_edit_select",
-    )
-
-    editing_record: Optional[dict] = None
-    if selected_report_id is not None and not owner_reports.empty:
-        match = owner_reports[owner_reports["report_id"] == int(selected_report_id)]
-        if not match.empty:
-            editing_record = match.iloc[0].to_dict()
-
-    today = datetime.now().date()
+        st.caption(
+            "Daily entries are limited to today. Weekly reports unlock on Saturdays, and monthly reports cover only the current month."
+        )
 
     def _date_or(value, fallback: date) -> date:
         if value is None:
@@ -8301,6 +8297,113 @@ def reports_page(conn):
             parsed = parsed[0]
         return pd.Timestamp(parsed).date()
 
+    def _staff_report_window_allows_edit(
+        row,
+        *,
+        today: date,
+        week_start: date,
+        week_end: date,
+        month_start: date,
+        month_end: date,
+    ) -> bool:
+        period_key = clean_text(row.get("period_type")) or ""
+        period_key = period_key.lower()
+        row_start = _date_or(row.get("period_start"), today)
+        row_end = _date_or(row.get("period_end"), row_start)
+        if period_key == "daily":
+            return row_start == today == row_end
+        if period_key == "weekly":
+            return (
+                row_start == week_start
+                and row_end == week_end
+                and today.weekday() == 5
+            )
+        if period_key == "monthly":
+            return row_start == month_start and row_end == month_end
+        return False
+
+    owner_reports = df_query(
+        conn,
+        dedent(
+            """
+            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, attachment_path, created_at, updated_at
+            FROM work_reports
+            WHERE user_id=?
+            ORDER BY date(period_start) DESC, report_id DESC
+            LIMIT 50
+            """
+        ),
+        (report_owner_id,),
+    )
+    record_labels: dict[int, str] = {}
+    selectable_reports = owner_reports.copy()
+    if not owner_reports.empty:
+        selectable_reports["report_id"] = selectable_reports["report_id"].apply(
+            lambda val: int(float(val))
+        )
+        for _, row in selectable_reports.iterrows():
+            rid = int(row["report_id"])
+            record_labels[rid] = (
+                f"{format_period_label(row.get('period_type'))} – "
+                f"{format_period_range(row.get('period_start'), row.get('period_end'))}"
+            )
+        if not is_admin:
+            selectable_reports["__staff_can_edit__"] = selectable_reports.apply(
+                lambda row: _staff_report_window_allows_edit(
+                    row,
+                    today=today,
+                    week_start=current_week_start,
+                    week_end=current_week_end,
+                    month_start=current_month_start,
+                    month_end=current_month_end,
+                ),
+                axis=1,
+            )
+            selectable_reports = selectable_reports[
+                selectable_reports["__staff_can_edit__"] == True  # noqa: E712
+            ].copy()
+            selectable_reports.drop(
+                columns=["__staff_can_edit__"],
+                inplace=True,
+                errors="ignore",
+            )
+
+    selectable_ids: list[int] = []
+    if not selectable_reports.empty and "report_id" in selectable_reports.columns:
+        selectable_ids = (
+            selectable_reports["report_id"].astype(int).tolist()
+        )
+
+    report_choices = [None] + selectable_ids
+
+    def _format_report_choice(value):
+        if value is None:
+            return "➕ Create new report"
+        try:
+            return record_labels.get(int(value), f"Report #{int(value)}")
+        except Exception:
+            return "Report"
+
+    if "report_edit_select_pending" in st.session_state:
+        pending_selection = st.session_state.pop("report_edit_select_pending")
+        if pending_selection is not None:
+            st.session_state["report_edit_select"] = pending_selection
+
+    selected_report_id = st.selectbox(
+        "Load an existing report",
+        report_choices,
+        format_func=_format_report_choice,
+        key="report_edit_select",
+    )
+
+    editing_record: Optional[dict] = None
+    if selected_report_id is not None and not selectable_reports.empty:
+        match = selectable_reports[
+            selectable_reports["report_id"] == int(selected_report_id)
+        ]
+        if not match.empty:
+            editing_record = match.iloc[0].to_dict()
+
     def _text_seed(value) -> str:
         if value is None:
             return ""
@@ -8319,7 +8422,21 @@ def reports_page(conn):
             if seed_period in REPORT_PERIOD_OPTIONS:
                 default_period_key = seed_period
     period_keys = list(REPORT_PERIOD_OPTIONS.keys())
-    period_index = period_keys.index(default_period_key) if default_period_key in period_keys else 0
+    if not is_admin:
+        allowed_periods = ["daily"]
+        if today.weekday() == 5 or default_period_key == "weekly":
+            allowed_periods.append("weekly")
+        allowed_periods.append("monthly")
+        period_keys = [key for key in period_keys if key in allowed_periods]
+    if not period_keys:
+        period_keys = ["daily"]
+    if default_period_key not in period_keys:
+        default_period_key = period_keys[0]
+    period_index = (
+        period_keys.index(default_period_key)
+        if default_period_key in period_keys
+        else 0
+    )
 
     default_start = _date_or(editing_record.get("period_start") if editing_record else None, today)
     default_end = _date_or(editing_record.get("period_end") if editing_record else None, default_start)
@@ -8356,20 +8473,30 @@ def reports_page(conn):
             key="report_period_type",
         )
         if period_choice == "daily":
+            day_kwargs: dict[str, object] = {}
+            if not is_admin:
+                day_kwargs["min_value"] = today
+                day_kwargs["max_value"] = today
             day_value = st.date_input(
                 "Report date",
                 value=default_start,
                 key="report_period_daily",
+                **day_kwargs,
             )
             start_date = day_value
             end_date = day_value
         elif period_choice == "weekly":
             base_start = default_start if editing_record else today - timedelta(days=today.weekday())
             base_end = default_end if editing_record else base_start + timedelta(days=6)
+            week_kwargs: dict[str, object] = {}
+            if not is_admin:
+                week_kwargs["min_value"] = current_week_start
+                week_kwargs["max_value"] = current_week_end
             week_value = st.date_input(
                 "Week range",
                 value=(base_start, base_end),
                 key="report_period_weekly",
+                **week_kwargs,
             )
             if isinstance(week_value, (list, tuple)) and len(week_value) == 2:
                 start_date, end_date = week_value
@@ -8385,10 +8512,15 @@ def reports_page(conn):
                 month_seed = base_month.replace(day=1)
             except Exception:
                 month_seed = date(today.year, today.month, 1)
+            month_kwargs: dict[str, object] = {}
+            if not is_admin:
+                month_kwargs["min_value"] = current_month_start
+                month_kwargs["max_value"] = current_month_end
             month_value = st.date_input(
                 "Month",
                 value=month_seed,
                 key="report_period_monthly",
+                **month_kwargs,
             )
             if isinstance(month_value, (list, tuple)) and month_value:
                 month_seed = month_value[0]
@@ -8460,7 +8592,33 @@ def reports_page(conn):
         else:
             attachment_to_store = _ATTACHMENT_UNCHANGED
             attachment_save_failed = False
-            if attachment_upload is not None:
+            save_allowed = True
+            if not is_admin:
+                validation_error: Optional[str] = None
+                if normalized_key == "daily":
+                    if normalized_start != today or normalized_end != today:
+                        validation_error = "Daily reports can only be submitted for today."
+                elif normalized_key == "weekly":
+                    if today.weekday() != 5:
+                        validation_error = "Weekly reports can only be submitted on Saturdays."
+                    elif not (
+                        normalized_start == current_week_start
+                        and normalized_end == current_week_end
+                    ):
+                        validation_error = (
+                            "Weekly reports must cover the current week (Monday to Sunday)."
+                        )
+                elif normalized_key == "monthly":
+                    if not (
+                        normalized_start == current_month_start
+                        and normalized_end == current_month_end
+                    ):
+                        validation_error = "Monthly reports must cover the current month."
+                if validation_error:
+                    st.error(validation_error)
+                    save_allowed = False
+
+            if save_allowed and attachment_upload is not None:
                 identifier = (
                     f"user{report_owner_id}_{normalized_key}_{normalized_start.isoformat()}"
                 )
@@ -8475,11 +8633,11 @@ def reports_page(conn):
                 else:
                     st.error("Attachment could not be saved. Please try again.")
                     attachment_save_failed = True
-            elif remove_attachment and existing_attachment_value:
+            elif save_allowed and remove_attachment and existing_attachment_value:
                 attachment_to_store = None
                 cleanup_path = existing_attachment_value
 
-            if not attachment_save_failed:
+            if save_allowed and not attachment_save_failed:
                 try:
                     saved_id = upsert_work_report(
                         conn,

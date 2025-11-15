@@ -6,6 +6,7 @@
 - v7.6: Admins can bulk-delete customers from the Customers page with a select-all option.
 - v7.7: Importer allows blank column mappings and optional skipping of blank rows. Dashboard counts active warranties by expiry date. Customer summaries merge duplicate records and report how many were combined.
 - v7.8: Customer summary groups unnamed customers under "(blank)" so their contact info is still accessible.
+- v7.9: Staff can only submit the current day's daily report, file weekly updates on Saturdays, and record monthly reports for the active month. Client imports better distinguish repeat purchases with different generators to avoid duplicate flags.
 
 ## Run Without Touching the Command Line
 These launchers create a dedicated virtual environment, install dependencies from `requirements.txt`, and then open the Streamlit app inside the native desktop shell (no browser required). After the first setup run the cached environment is reused automatically, so relaunching is instant. You only need Python 3.9+ installed. You can still run `streamlit run app.py` for the traditional browser experience—both approaches share the exact same database and uploads.
