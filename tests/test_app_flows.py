@@ -214,3 +214,29 @@ def test_store_uploaded_pdf_returns_relative_path(tmp_path, app_module):
             target_dir.rmdir()
         except OSError:
             pass
+
+
+def test_import_handles_mixed_numeric_and_string_columns(db_conn, app_module):
+    df = pd.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-02-01"],
+            "customer_name": ["Alpha", "Beta"],
+            "address": ["Addr 1", "Addr 2"],
+            "phone": [9876543210.0, "9876543211"],
+            "product": ["Widget", "Gadget"],
+            "do_code": ["DO-1", "DO-2"],
+            "remarks": ["ok", "fine"],
+            "amount_spent": [1000.0, "2000"],
+        }
+    )
+
+    seeded, dup_customers, dup_products = app_module._import_clean6(db_conn, df, tag="Mixed test")
+
+    assert seeded == 2
+    assert dup_customers == 0
+    assert dup_products == 0
+
+    rows = db_conn.execute("SELECT name, phone, amount_spent FROM customers ORDER BY customer_id").fetchall()
+    assert len(rows) == 2
+    assert rows[0][0] == "Alpha"
+    assert rows[1][0] == "Beta"

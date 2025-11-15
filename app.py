@@ -6630,6 +6630,37 @@ def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
     df = df.explode(list(df.columns)).reset_index(drop=True)
     return df
 
+
+_TRAILING_ZERO_NUMBER = re.compile(r"^-?\d+\.0+$")
+
+
+def _normalize_sort_value(value: object) -> str:
+    text = clean_text(value)
+    if text is None:
+        return ""
+    if _TRAILING_ZERO_NUMBER.match(text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def _sort_dataframe_safe(df: pd.DataFrame, sort_columns: Iterable[str]) -> pd.DataFrame:
+    columns = [col for col in sort_columns if col in df.columns]
+    if not columns:
+        return df
+
+    def _sort_key(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return series
+        name = str(series.name or "").lower()
+        if "date" in name:
+            converted = pd.to_datetime(series, errors="coerce", dayfirst=True)
+            if not converted.isna().all():
+                return converted
+        return series.map(_normalize_sort_value)
+
+    return df.sort_values(by=columns, key=_sort_key, na_position="last")
+
+
 def normalize_headers(cols):
     norm = []
     for c in cols:
@@ -6797,7 +6828,8 @@ def import_page(conn):
     df_norm = df_norm.applymap(lambda x: x.strip() if isinstance(x, str) else x)
     if skip_blanks:
         df_norm = df_norm.dropna(how="all")
-    df_norm = df_norm.drop_duplicates().sort_values(by=["date", "customer_name", "phone", "do_code"]).reset_index(drop=True)
+    df_norm = df_norm.drop_duplicates()
+    df_norm = _sort_dataframe_safe(df_norm, ["date", "customer_name", "phone", "do_code"]).reset_index(drop=True)
     st.markdown("#### Review & edit rows before importing")
     preview = df_norm.copy()
     preview["Action"] = "Import"
@@ -7273,7 +7305,8 @@ def _import_clean6(conn, df, tag="Import"):
     sort_cols = [col for col in ["date", "customer_name", "phone", "do_code"] if col in df.columns]
     if not sort_cols:
         sort_cols = df.columns.tolist()
-    df = df.dropna(how="all").drop_duplicates().sort_values(by=sort_cols).reset_index(drop=True)
+    df = df.dropna(how="all").drop_duplicates()
+    df = _sort_dataframe_safe(df, sort_cols).reset_index(drop=True)
 
     cur = conn.cursor()
     seeded = 0
