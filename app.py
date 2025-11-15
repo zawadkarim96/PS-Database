@@ -205,6 +205,74 @@ def format_report_grid_rows_for_display(
     df = pd.DataFrame(formatted)
     return df.reindex(columns=REPORT_GRID_DISPLAY_COLUMNS)
 
+
+def _grid_rows_for_editor(rows: Iterable[dict]) -> list[dict[str, object]]:
+    """Coerce stored report rows into a format suitable for the data editor."""
+
+    normalized = _normalize_grid_rows(rows)
+    source_rows: list[dict[str, object]]
+    if normalized:
+        source_rows = normalized
+    else:
+        source_rows = [dict(entry) for entry in rows or []]  # type: ignore[arg-type]
+    if not source_rows:
+        return []
+
+    editor_rows: list[dict[str, object]] = []
+    for entry in source_rows:
+        editor_entry: dict[str, object] = {}
+        for key, config in REPORT_GRID_FIELDS.items():
+            value = entry.get(key)
+            if config["type"] == "text":
+                editor_entry[key] = clean_text(value) or ""
+            elif config["type"] == "number":
+                editor_entry[key] = _coerce_grid_number(value)
+            elif config["type"] == "date":
+                iso = to_iso_date(value)
+                if iso:
+                    try:
+                        editor_entry[key] = datetime.strptime(
+                            iso, "%Y-%m-%d"
+                        ).date()
+                    except ValueError:
+                        editor_entry[key] = None
+                else:
+                    editor_entry[key] = None
+            else:
+                editor_entry[key] = value
+        editor_rows.append(editor_entry)
+    return editor_rows
+
+
+def _grid_rows_from_editor(df: Optional[pd.DataFrame]) -> list[dict[str, object]]:
+    """Normalize rows captured from the Streamlit data editor widget."""
+
+    if df is None or not isinstance(df, pd.DataFrame):
+        return []
+    try:
+        records = df.to_dict("records")
+    except Exception:
+        return []
+    return _normalize_grid_rows(records)
+
+
+def _summarize_grid_column(rows: Iterable[dict[str, object]], key: str) -> Optional[str]:
+    """Combine a grid column into a legacy text summary for backwards compatibility."""
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        text = clean_text(row.get(key))
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        values.append(text)
+    if not values:
+        return None
+    return "\n".join(values)
+
 NOTIFICATION_BUFFER_KEY = "runtime_notifications"
 MAX_RUNTIME_NOTIFICATIONS = 40
 ACTIVITY_FEED_LIMIT = 25
@@ -8777,7 +8845,16 @@ def reports_page(conn):
 
     if submitted:
         cleanup_path: Optional[str] = None
-        grid_rows_to_store: list[dict[str, object]] = []
+        grid_rows_to_store = _grid_rows_from_editor(report_grid_df)
+        tasks_summary = _summarize_grid_column(
+            grid_rows_to_store, "reported_complaints"
+        )
+        remarks_summary = _summarize_grid_column(
+            grid_rows_to_store, "details_remarks"
+        )
+        research_summary = _summarize_grid_column(
+            grid_rows_to_store, "product_details"
+        )
         try:
             normalized_key, normalized_start, normalized_end = normalize_report_window(
                 period_choice, start_date, end_date
@@ -8833,34 +8910,37 @@ def reports_page(conn):
                 attachment_to_store = None
                 cleanup_path = existing_attachment_value
 
-
-                try:
-                    saved_id = upsert_work_report(
-                        conn,
-                        report_id=int(selected_report_id) if selected_report_id is not None else None,
-                        user_id=int(report_owner_id),
-                        period_type=normalized_key,
-                        period_start=normalized_start,
-                        period_end=normalized_end,
-                        tasks=None,
-                        remarks=None,
-                        research=None,
-                        grid_rows=grid_rows_to_store,
-                        attachment_path=attachment_to_store,
-                        current_attachment=existing_attachment_value,
-                    )
-                except ValueError as err:
-                    st.error(str(err))
+            if save_allowed and not attachment_save_failed:
+                if not grid_rows_to_store:
+                    st.error("Add at least one row to the report grid before saving.")
                 else:
-                    st.success("Report saved successfully.")
-                    if cleanup_path:
-                        old_path = resolve_upload_path(cleanup_path)
-                        if old_path and old_path.exists():
-                            with contextlib.suppress(OSError):
-                                old_path.unlink()
-                    st.session_state["report_edit_select_pending"] = saved_id
-                    st.session_state.pop("report_attachment_uploader", None)
-                    _safe_rerun()
+                    try:
+                        saved_id = upsert_work_report(
+                            conn,
+                            report_id=int(selected_report_id) if selected_report_id is not None else None,
+                            user_id=int(report_owner_id),
+                            period_type=normalized_key,
+                            period_start=normalized_start,
+                            period_end=normalized_end,
+                            tasks=tasks_summary,
+                            remarks=remarks_summary,
+                            research=research_summary,
+                            grid_rows=grid_rows_to_store,
+                            attachment_path=attachment_to_store,
+                            current_attachment=existing_attachment_value,
+                        )
+                    except ValueError as err:
+                        st.error(str(err))
+                    else:
+                        st.success("Report saved successfully.")
+                        if cleanup_path:
+                            old_path = resolve_upload_path(cleanup_path)
+                            if old_path and old_path.exists():
+                                with contextlib.suppress(OSError):
+                                    old_path.unlink()
+                        st.session_state["report_edit_select_pending"] = saved_id
+                        st.session_state.pop("report_attachment_uploader", None)
+                        _safe_rerun()
 
     st.markdown("---")
     st.markdown("#### Report history")
