@@ -8741,7 +8741,15 @@ def main():
                 "Maintenance and Service",
             ]
         else:
-            pages = ["Dashboard", "Warranties", "Import", "Reports", "Maintenance and Service"]
+            pages = [
+                "Dashboard",
+                "Customers",
+                "Customer Summary",
+                "Warranties",
+                "Import",
+                "Reports",
+                "Maintenance and Service",
+            ]
         if st.session_state.page not in pages:
             st.session_state.page = pages[0]
         current_index = pages.index(st.session_state.page)
