@@ -896,7 +896,7 @@ def normalize_quotation_items(
     return cleaned, totals
 
 
-def format_period_label(
+def format_period_span(
     start: Optional[str], end: Optional[str], *, joiner: str = " → "
 ) -> Optional[str]:
     start_clean = clean_text(start)
@@ -4297,7 +4297,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
     if not service_df.empty:
         service_df = fmt_dates(service_df, ["service_date", "service_start_date", "service_end_date"])
         service_df["service_period"] = service_df.apply(
-            lambda row: format_period_label(
+            lambda row: format_period_span(
                 row.get("service_start_date"), row.get("service_end_date")
             ),
             axis=1,
@@ -5323,7 +5323,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         )
         maintenance_df.drop(columns=["customer_id", "do_customer_id"], inplace=True, errors="ignore")
         maintenance_df["maintenance_period"] = maintenance_df.apply(
-            lambda row: format_period_label(
+            lambda row: format_period_span(
                 row.get("maintenance_start_date"), row.get("maintenance_end_date")
             ),
             axis=1,
@@ -5625,7 +5625,7 @@ def customer_summary_page(conn):
     service_df = fmt_dates(service_df, ["service_date", "service_start_date", "service_end_date"])
     if not service_df.empty:
         service_df["service_period"] = service_df.apply(
-            lambda row: format_period_label(
+            lambda row: format_period_span(
                 row.get("service_start_date"), row.get("service_end_date")
             ),
             axis=1,
@@ -5661,7 +5661,7 @@ def customer_summary_page(conn):
     )
     if not maintenance_df.empty:
         maintenance_df["maintenance_period"] = maintenance_df.apply(
-            lambda row: format_period_label(
+            lambda row: format_period_span(
                 row.get("maintenance_start_date"), row.get("maintenance_end_date")
             ),
             axis=1,
