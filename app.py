@@ -7081,12 +7081,32 @@ def scraps_page(conn):
 # ---------- Import helpers ----------
 def refine_multiline(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in df.columns:
-        df[col] = df[col].apply(
-            lambda x: [s.strip() for s in str(x).splitlines() if s.strip()] if isinstance(x, str) else [x]
-        )
-    df = df.explode(list(df.columns)).reset_index(drop=True)
-    return df
+
+    def _as_list(value: object) -> list[object]:
+        if isinstance(value, str):
+            items = [s.strip() for s in value.splitlines() if s.strip()]
+            return items or [None]
+        if pd.isna(value):
+            return [None]
+        return [value]
+
+    listified = {col: df[col].apply(_as_list) for col in df.columns}
+
+    normalized_rows: list[dict[str, object]] = []
+    for _, row in pd.DataFrame(listified).iterrows():
+        lengths = [len(values) for values in row]
+        max_len = max(lengths) if lengths else 0
+        if max_len == 0:
+            normalized_rows.append({col: None for col in df.columns})
+            continue
+        expanded = {
+            col: values + [None] * (max_len - len(values))
+            for col, values in row.items()
+        }
+        for idx in range(max_len):
+            normalized_rows.append({col: expanded[col][idx] for col in df.columns})
+
+    return pd.DataFrame(normalized_rows, columns=df.columns)
 
 
 _TRAILING_ZERO_NUMBER = re.compile(r"^-?\d+\.0+$")
