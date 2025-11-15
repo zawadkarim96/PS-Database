@@ -1936,24 +1936,29 @@ def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_customers_export(conn) -> pd.DataFrame:
+    scope_clause, scope_params = customer_scope_filter("c")
+    where_sql = f"WHERE {scope_clause}" if scope_clause else ""
     query = dedent(
-        """
-        SELECT customer_id,
-               name,
-               phone,
-               email,
-               address,
-               amount_spent,
-               purchase_date,
-               product_info,
-               delivery_order_code,
-               sales_person,
-               created_at
-        FROM customers
-        ORDER BY datetime(created_at) DESC, customer_id DESC
+        f"""
+        SELECT c.customer_id,
+               c.name,
+               c.phone,
+               c.email,
+               c.address,
+               c.amount_spent,
+               c.purchase_date,
+               c.product_info,
+               c.delivery_order_code,
+               c.sales_person,
+               c.created_at,
+               COALESCE(u.username, '(unknown)') AS uploaded_by
+        FROM customers c
+        LEFT JOIN users u ON u.user_id = c.created_by
+        {where_sql}
+        ORDER BY datetime(c.created_at) DESC, c.customer_id DESC
         """
     )
-    df = df_query(conn, query)
+    df = df_query(conn, query, scope_params if scope_clause else ())
     df = fmt_dates(df, ["purchase_date", "created_at"])
     return df.rename(
         columns={
@@ -1968,6 +1973,7 @@ def _build_customers_export(conn) -> pd.DataFrame:
             "delivery_order_code": "Delivery order",
             "sales_person": "Sales person",
             "created_at": "Created at",
+            "uploaded_by": "Uploaded by",
         }
     )
 
@@ -3852,27 +3858,55 @@ def customers_page(conn):
     sort_dir = st.radio("Sort by created date", ["Newest first", "Oldest first"], horizontal=True)
     order = "DESC" if sort_dir == "Newest first" else "ASC"
     q = st.text_input("Search (name/phone/address/product/DO)")
+    scope_clause, scope_params = customer_scope_filter("c")
+    search_clause = dedent(
+        """
+        (? = ''
+         OR c.name LIKE '%'||?||'%'
+         OR c.company_name LIKE '%'||?||'%'
+         OR c.phone LIKE '%'||?||'%'
+         OR c.email LIKE '%'||?||'%'
+         OR c.address LIKE '%'||?||'%'
+         OR c.delivery_address LIKE '%'||?||'%'
+         OR c.remarks LIKE '%'||?||'%'
+         OR c.product_info LIKE '%'||?||'%'
+         OR c.delivery_order_code LIKE '%'||?||'%'
+         OR c.sales_person LIKE '%'||?||'%')
+        """
+    ).strip()
+    where_parts = [search_clause]
+    params: list[object] = [q, q, q, q, q, q, q, q, q, q, q]
+    if scope_clause:
+        where_parts.append(scope_clause)
+        params.extend(scope_params)
+    where_sql = " AND ".join(where_parts)
     df_raw = df_query(
         conn,
         f"""
-        SELECT customer_id as id, name, company_name, phone, email, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, attachment_path, created_at, dup_flag
-        FROM customers
-        WHERE (
-            ? = ''
-            OR name LIKE '%'||?||'%'
-            OR company_name LIKE '%'||?||'%'
-            OR phone LIKE '%'||?||'%'
-            OR email LIKE '%'||?||'%'
-            OR address LIKE '%'||?||'%'
-            OR delivery_address LIKE '%'||?||'%'
-            OR remarks LIKE '%'||?||'%'
-            OR product_info LIKE '%'||?||'%'
-            OR delivery_order_code LIKE '%'||?||'%'
-            OR sales_person LIKE '%'||?||'%'
-        )
-        ORDER BY datetime(created_at) {order}
+        SELECT
+            c.customer_id AS id,
+            c.name,
+            c.company_name,
+            c.phone,
+            c.email,
+            c.address,
+            c.delivery_address,
+            c.remarks,
+            c.purchase_date,
+            c.product_info,
+            c.delivery_order_code,
+            c.sales_person,
+            c.attachment_path,
+            c.created_at,
+            c.dup_flag,
+            c.created_by,
+            COALESCE(u.username, '(unknown)') AS uploaded_by
+        FROM customers c
+        LEFT JOIN users u ON u.user_id = c.created_by
+        WHERE {where_sql}
+        ORDER BY datetime(c.created_at) {order}
     """,
-        (q, q, q, q, q, q, q, q, q, q, q),
+        tuple(params),
     )
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
@@ -3909,6 +3943,7 @@ def customers_page(conn):
                 "sales_person",
                 "duplicate",
                 "created_at",
+                "uploaded_by",
                 "Action",
             ]
             if col in editor_df.columns
@@ -3936,6 +3971,7 @@ def customers_page(conn):
                 "sales_person": st.column_config.TextColumn("Sales person"),
                 "duplicate": st.column_config.Column("Duplicate", disabled=True),
                 "created_at": st.column_config.DatetimeColumn("Created", format="DD-MM-YYYY HH:mm", disabled=True),
+                "uploaded_by": st.column_config.Column("Uploaded by", disabled=True),
                 "Action": st.column_config.SelectboxColumn("Action", options=["Keep", "Delete"], required=True),
             },
         )
@@ -4145,6 +4181,9 @@ def customers_page(conn):
             else:
                 st.caption("No customer PDF attached yet.")
             is_admin = user.get("role") == "admin"
+            uploader_name = clean_text(selected_raw.get("uploaded_by"))
+            if is_admin:
+                st.caption(f"Uploaded by: {uploader_name or '(unknown)'}")
             with st.form(f"edit_customer_{selected_customer_id}"):
                 name_edit = st.text_input("Name", value=clean_text(selected_raw.get("name")) or "")
                 company_edit = st.text_input(
@@ -4446,13 +4485,42 @@ def customers_page(conn):
                             conn.commit()
                             st.warning("Some changes were saved, but please review the errors above.")
     st.markdown("**Recently Added Customers**")
-    recent_df = df_query(conn, """
-        SELECT customer_id as id, name, company_name, phone, email, address, delivery_address, remarks, purchase_date, product_info, delivery_order_code, sales_person, amount_spent, created_at
-        FROM customers
-        ORDER BY datetime(created_at) DESC LIMIT 200
-    """)
+    recent_where = f"WHERE {scope_clause}" if scope_clause else ""
+    recent_params = scope_params if scope_clause else ()
+    recent_df = df_query(
+        conn,
+        f"""
+        SELECT
+            c.customer_id AS id,
+            c.name,
+            c.company_name,
+            c.phone,
+            c.email,
+            c.address,
+            c.delivery_address,
+            c.remarks,
+            c.purchase_date,
+            c.product_info,
+            c.delivery_order_code,
+            c.sales_person,
+            c.amount_spent,
+            c.created_at,
+            COALESCE(u.username, '(unknown)') AS uploaded_by
+        FROM customers c
+        LEFT JOIN users u ON u.user_id = c.created_by
+        {recent_where}
+        ORDER BY datetime(c.created_at) DESC LIMIT 200
+    """,
+        recent_params,
+    )
     recent_df = fmt_dates(recent_df, ["created_at", "purchase_date"])
-    recent_df = recent_df.rename(columns={"sales_person": "Sales person", "amount_spent": "Amount spent"})
+    recent_df = recent_df.rename(
+        columns={
+            "sales_person": "Sales person",
+            "amount_spent": "Amount spent",
+            "uploaded_by": "Uploaded by",
+        }
+    )
     st.dataframe(recent_df.drop(columns=["id"], errors="ignore"))
 def warranties_page(conn):
     st.subheader("🛡️ Warranties")
@@ -4537,7 +4605,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
     if allowed_customers is not None:
         do_df = do_df[do_df["customer_id"].apply(lambda value: int(value) in allowed_customers if pd.notna(value) else False)]
     do_options = [None]
-    do_labels = {None: "-- Select delivery order --"}
+    do_labels = {None: "No delivery order (manual entry)"}
     do_customer_map = {}
     do_customer_name_map = {}
     for _, row in do_df.iterrows():
@@ -4563,7 +4631,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
 
     with st.form("service_form"):
         selected_do = st.selectbox(
-            "Delivery Order *",
+            "Delivery order",
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
@@ -4588,7 +4656,7 @@ def _render_service_section(conn, *, show_heading: bool = True):
                 st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
             linked_customer = st.selectbox(
-                "Customer",
+                "Customer *",
                 options=choices,
                 format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                 key=state_key,
@@ -4701,80 +4769,83 @@ def _render_service_section(conn, *, show_heading: bool = True):
         submit = st.form_submit_button("Log service", type="primary")
 
     if submit:
-        if not selected_do:
-            st.error("Delivery Order is required for service records.")
-        else:
-            selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
-            selected_customer = int(selected_customer) if selected_customer is not None else None
-            cur = conn.cursor()
-            (
-                service_date_str,
-                service_start_str,
-                service_end_str,
-            ) = determine_period_strings(status_choice, service_period_value)
-            valid_entry = True
-            if status_choice == "Completed" and (
-                not service_start_str or not service_end_str
-            ):
-                st.error("Start and end dates are required for completed services.")
-                valid_entry = False
-            if status_choice != "Completed" and not service_start_str:
-                st.error("Select a start date for this service entry.")
-                valid_entry = False
-            if valid_entry:
-                _cleaned_service_products, service_product_labels = normalize_product_entries(
-                    service_product_entries
-                )
-                service_product_label = (
-                    "\n".join(service_product_labels) if service_product_labels else None
-                )
-                condition_value = (
-                    condition_option if condition_option in GENERATOR_CONDITION_OPTIONS else None
-                )
-                condition_notes_value = clean_text(condition_notes)
+        selected_customer = (
+            linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
+        )
+        selected_customer = int(selected_customer) if selected_customer is not None else None
+        cur = conn.cursor()
+        (
+            service_date_str,
+            service_start_str,
+            service_end_str,
+        ) = determine_period_strings(status_choice, service_period_value)
+        valid_entry = True
+        if selected_customer is None:
+            st.error("Select a customer to log this service entry.")
+            valid_entry = False
+        if status_choice == "Completed" and (
+            not service_start_str or not service_end_str
+        ):
+            st.error("Start and end dates are required for completed services.")
+            valid_entry = False
+        if status_choice != "Completed" and not service_start_str:
+            st.error("Select a start date for this service entry.")
+            valid_entry = False
+        if valid_entry:
+            _cleaned_service_products, service_product_labels = normalize_product_entries(
+                service_product_entries
+            )
+            service_product_label = (
+                "\n".join(service_product_labels) if service_product_labels else None
+            )
+            condition_value = (
+                condition_option if condition_option in GENERATOR_CONDITION_OPTIONS else None
+            )
+            condition_notes_value = clean_text(condition_notes)
+            bill_amount_value = None
+            try:
+                if bill_amount_input is not None and float(bill_amount_input) > 0:
+                    bill_amount_value = round(float(bill_amount_input), 2)
+            except Exception:
                 bill_amount_value = None
-                try:
-                    if bill_amount_input is not None and float(bill_amount_input) > 0:
-                        bill_amount_value = round(float(bill_amount_input), 2)
-                except Exception:
-                    bill_amount_value = None
-                cur.execute(
-                    """
-                    INSERT INTO services (
-                        do_number,
-                        customer_id,
-                        service_date,
-                        service_start_date,
-                        service_end_date,
-                        description,
-                        status,
-                        remarks,
-                        service_product_info,
-                        condition_status,
-                        condition_remarks,
-                        bill_amount,
-                        bill_document_path,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        selected_do,
-                        selected_customer,
-                        service_date_str,
-                        service_start_str,
-                        service_end_str,
-                        clean_text(description),
-                        status_value,
-                        clean_text(remarks),
-                        service_product_label,
-                        condition_value,
-                        condition_notes_value,
-                        bill_amount_value,
-                        None,
-                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
-                )
-                service_id = cur.lastrowid
+            cur.execute(
+                """
+                INSERT INTO services (
+                    do_number,
+                    customer_id,
+                    service_date,
+                    service_start_date,
+                    service_end_date,
+                    description,
+                    status,
+                    remarks,
+                    service_product_info,
+                    condition_status,
+                    condition_remarks,
+                    bill_amount,
+                    bill_document_path,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    selected_do,
+                    selected_customer,
+                    service_date_str,
+                    service_start_str,
+                    service_end_str,
+                    clean_text(description),
+                    status_value,
+                    clean_text(remarks),
+                    service_product_label,
+                    condition_value,
+                    condition_notes_value,
+                    bill_amount_value,
+                    None,
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            service_id = cur.lastrowid
+            if selected_do and selected_customer is not None:
                 link_delivery_order_to_customer(conn, selected_do, selected_customer)
                 saved_docs = attach_documents(
                     conn,
@@ -4799,7 +4870,9 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         )
                         bill_saved = True
                 conn.commit()
-                service_label = do_labels.get(selected_do) or f"Service #{service_id}"
+                service_label = do_labels.get(selected_do) if selected_do else None
+                if not service_label:
+                    service_label = f"Service #{service_id}"
                 customer_name = None
                 if selected_customer is not None:
                     customer_name = (
@@ -5650,8 +5723,15 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         ORDER BY datetime(d.created_at) DESC
         """,
     )
+    allowed_customers = accessible_customer_ids(conn)
+    if allowed_customers is not None:
+        do_df = do_df[
+            do_df["customer_id"].apply(
+                lambda value: int(value) in allowed_customers if pd.notna(value) else False
+            )
+        ]
     do_options = [None]
-    do_labels = {None: "-- Select delivery order --"}
+    do_labels = {None: "No delivery order (manual entry)"}
     do_customer_map = {}
     do_customer_name_map = {}
     for _, row in do_df.iterrows():
@@ -5677,7 +5757,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
 
     with st.form("maintenance_form"):
         selected_do = st.selectbox(
-            "Delivery Order *",
+            "Delivery order",
             options=do_options,
             format_func=lambda do: do_labels.get(do, str(do)),
         )
@@ -5702,7 +5782,7 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                 st.session_state[last_do_key] = selected_do
                 st.session_state[state_key] = None
             linked_customer = st.selectbox(
-                "Customer",
+                "Customer *",
                 options=choices,
                 format_func=lambda cid: customer_labels.get(cid, "-- Select customer --"),
                 key=state_key,
@@ -5786,81 +5866,83 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
         submit = st.form_submit_button("Log maintenance", type="primary")
 
     if submit:
-        if not selected_do:
-            st.error("Delivery Order is required for maintenance records.")
-        else:
-            selected_customer = linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
-            selected_customer = int(selected_customer) if selected_customer is not None else None
-            cur = conn.cursor()
-            (
-                maintenance_date_str,
-                maintenance_start_str,
-                maintenance_end_str,
-            ) = determine_period_strings(
-                maintenance_status_choice, maintenance_period_value
+        selected_customer = (
+            linked_customer if linked_customer is not None else do_customer_map.get(selected_do)
+        )
+        selected_customer = int(selected_customer) if selected_customer is not None else None
+        cur = conn.cursor()
+        (
+            maintenance_date_str,
+            maintenance_start_str,
+            maintenance_end_str,
+        ) = determine_period_strings(
+            maintenance_status_choice, maintenance_period_value
+        )
+        valid_entry = True
+        if selected_customer is None:
+            st.error("Select a customer to log this maintenance entry.")
+            valid_entry = False
+        if maintenance_status_choice == "Completed" and (
+            not maintenance_start_str or not maintenance_end_str
+        ):
+            st.error("Start and end dates are required for completed maintenance work.")
+            valid_entry = False
+        if maintenance_status_choice != "Completed" and not maintenance_start_str:
+            st.error("Select a start date for this maintenance entry.")
+            valid_entry = False
+        if valid_entry:
+            _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
+                maintenance_product_entries
             )
-            valid_entry = True
-            if maintenance_status_choice == "Completed" and (
-                not maintenance_start_str or not maintenance_end_str
-            ):
-                st.error("Start and end dates are required for completed maintenance work.")
-                valid_entry = False
-            if (
-                maintenance_status_choice != "Completed"
-                and not maintenance_start_str
-            ):
-                st.error("Select a start date for this maintenance entry.")
-                valid_entry = False
-            if valid_entry:
-                _cleaned_maintenance_products, maintenance_product_labels = normalize_product_entries(
-                    maintenance_product_entries
-                )
-                maintenance_product_label = (
-                    "\n".join(maintenance_product_labels)
-                    if maintenance_product_labels
-                    else None
-                )
-                cur.execute(
-                    """
-                    INSERT INTO maintenance_records (
-                        do_number,
-                        customer_id,
-                        maintenance_date,
-                        maintenance_start_date,
-                        maintenance_end_date,
-                        description,
-                        status,
-                        remarks,
-                        maintenance_product_info,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        selected_do,
-                        selected_customer,
-                        maintenance_date_str,
-                        maintenance_start_str,
-                        maintenance_end_str,
-                        clean_text(description),
-                        status_value,
-                        clean_text(remarks),
-                        maintenance_product_label,
-                        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
-                )
-                maintenance_id = cur.lastrowid
+            maintenance_product_label = (
+                "\n".join(maintenance_product_labels)
+                if maintenance_product_labels
+                else None
+            )
+            cur.execute(
+                """
+                INSERT INTO maintenance_records (
+                    do_number,
+                    customer_id,
+                    maintenance_date,
+                    maintenance_start_date,
+                    maintenance_end_date,
+                    description,
+                    status,
+                    remarks,
+                    maintenance_product_info,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    selected_do,
+                    selected_customer,
+                    maintenance_date_str,
+                    maintenance_start_str,
+                    maintenance_end_str,
+                    clean_text(description),
+                    status_value,
+                    clean_text(remarks),
+                    maintenance_product_label,
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            maintenance_id = cur.lastrowid
+            if selected_do and selected_customer is not None:
                 link_delivery_order_to_customer(conn, selected_do, selected_customer)
-                saved_docs = attach_documents(
-                    conn,
-                    "maintenance_documents",
-                    "maintenance_id",
-                    maintenance_id,
-                    maintenance_files,
-                    MAINTENANCE_DOCS_DIR,
-                    f"maintenance_{maintenance_id}",
-                )
-                conn.commit()
-                maintenance_label = do_labels.get(selected_do) or f"Maintenance #{maintenance_id}"
+            saved_docs = attach_documents(
+                conn,
+                "maintenance_documents",
+                "maintenance_id",
+                maintenance_id,
+                maintenance_files,
+                MAINTENANCE_DOCS_DIR,
+                f"maintenance_{maintenance_id}",
+            )
+            conn.commit()
+            maintenance_label = do_labels.get(selected_do) if selected_do else None
+            if not maintenance_label:
+                maintenance_label = f"Maintenance #{maintenance_id}"
                 customer_name = None
                 if selected_customer is not None:
                     customer_name = (
@@ -6149,18 +6231,28 @@ def customer_summary_page(conn):
     st.subheader("📒 Customer Summary")
     blank_label = "(blank)"
     complete_clause = customer_complete_clause()
+    scope_clause, scope_params = customer_scope_filter()
+    where_parts = [complete_clause]
+    params: list[object] = []
+    if scope_clause:
+        where_parts.append(scope_clause)
+        params.extend(scope_params)
+    where_sql = " AND ".join(where_parts)
     customers = df_query(
         conn,
         f"""
         SELECT TRIM(name) AS name, GROUP_CONCAT(customer_id) AS ids, COUNT(*) AS cnt
         FROM customers
-        WHERE {complete_clause}
+        WHERE {where_sql}
         GROUP BY TRIM(name)
         ORDER BY TRIM(name) ASC
         """,
+        tuple(params),
     )
     if customers.empty:
-        st.info("No complete customers yet. Check the Scraps page for records that need details.")
+        st.info(
+            "No complete customers available for your account. Check the Scraps page for records that need details."
+        )
         return
 
     names = customers["name"].tolist()
@@ -6173,6 +6265,7 @@ def customer_summary_page(conn):
     ids = [int(i) for i in str(row["ids"]).split(",") if i]
     cnt = int(row["cnt"])
 
+    placeholder_block = ','.join('?' * len(ids))
     info = df_query(
         conn,
         f"""
@@ -6184,7 +6277,7 @@ def customer_summary_page(conn):
             GROUP_CONCAT(DISTINCT product_info) AS products,
             GROUP_CONCAT(DISTINCT delivery_order_code) AS do_codes
         FROM customers
-        WHERE customer_id IN ({','.join('?'*len(ids))})
+        WHERE customer_id IN ({placeholder_block})
         """,
         ids,
     ).iloc[0].to_dict()
@@ -6594,14 +6687,22 @@ def scraps_page(conn):
     st.caption(
         "Rows listed here are missing key details (name, phone, or address). They stay hidden from summaries until completed."
     )
+    scope_clause, scope_params = customer_scope_filter()
+    where_parts = [customer_incomplete_clause()]
+    params: list[object] = []
+    if scope_clause:
+        where_parts.append(scope_clause)
+        params.extend(scope_params)
+    where_sql = " AND ".join(where_parts)
     scraps = df_query(
         conn,
         f"""
         SELECT customer_id as id, name, phone, email, address, remarks, purchase_date, product_info, delivery_order_code, created_at
         FROM customers
-        WHERE {customer_incomplete_clause()}
+        WHERE {where_sql}
         ORDER BY datetime(created_at) DESC
         """,
+        tuple(params),
     )
     scraps = fmt_dates(scraps, ["created_at", "purchase_date"])
     if scraps.empty:
@@ -7108,9 +7209,27 @@ def manual_merge_section(conn, customers_df: pd.DataFrame) -> None:
 
 def duplicates_page(conn):
     st.subheader("⚠️ Possible Duplicates")
+    scope_clause, scope_params = customer_scope_filter("c")
+    where_sql = f"WHERE {scope_clause}" if scope_clause else ""
     cust_raw = df_query(
         conn,
-        "SELECT customer_id as id, name, phone, email, address, purchase_date, product_info, delivery_order_code, dup_flag, created_at FROM customers ORDER BY datetime(created_at) DESC",
+        f"""
+        SELECT
+            c.customer_id as id,
+            c.name,
+            c.phone,
+            c.email,
+            c.address,
+            c.purchase_date,
+            c.product_info,
+            c.delivery_order_code,
+            c.dup_flag,
+            c.created_at
+        FROM customers c
+        {where_sql}
+        ORDER BY datetime(c.created_at) DESC
+        """,
+        scope_params if scope_clause else (),
     )
     warr = df_query(
         conn,
