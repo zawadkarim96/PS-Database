@@ -2,4 +2,3 @@ streamlit
 pandas
 python-dotenv
 openpyxl
-pywebview
