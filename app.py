@@ -70,6 +70,23 @@ REPORT_PERIOD_OPTIONS = OrderedDict(
     ]
 )
 
+NOTIFICATION_BUFFER_KEY = "runtime_notifications"
+MAX_RUNTIME_NOTIFICATIONS = 40
+ACTIVITY_FEED_LIMIT = 25
+
+NOTIFICATION_EVENT_LABELS = {
+    "customer_created": "Customer added",
+    "customer_updated": "Customer updated",
+    "customer_deleted": "Customer removed",
+    "service_created": "Service created",
+    "service_updated": "Service updated",
+    "maintenance_created": "Maintenance created",
+    "maintenance_updated": "Maintenance updated",
+    "warranty_updated": "Warranty updated",
+    "report_submitted": "Report submitted",
+    "report_updated": "Report updated",
+}
+
 
 def customer_complete_clause(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
@@ -278,6 +295,18 @@ CREATE TABLE IF NOT EXISTS needs (
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS activity_log (
+    activity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    event_type TEXT,
+    entity_type TEXT,
+    entity_id INTEGER,
+    description TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id);
 """
 
 # ---------- Helpers ----------
@@ -408,6 +437,26 @@ def ensure_schema_upgrades(conn):
     )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uniq_work_reports_user_period ON work_reports(user_id, period_type, period_start)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_log (
+            activity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            event_type TEXT,
+            entity_type TEXT,
+            entity_id INTEGER,
+            description TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id)"
     )
 
 
@@ -657,6 +706,174 @@ def clean_text(value):
         pass
     value = str(value).strip()
     return value or None
+
+
+def _parse_sqlite_timestamp(value: Optional[str]) -> Optional[datetime]:
+    text = clean_text(value)
+    if not text:
+        return None
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def format_time_ago(value: Optional[str]) -> str:
+    timestamp = _parse_sqlite_timestamp(value)
+    if not timestamp:
+        return clean_text(value) or ""
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)
+    seconds = max(int((datetime.utcnow() - timestamp).total_seconds()), 0)
+    if seconds < 5:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d ago"
+    weeks = days // 7
+    if weeks < 5:
+        return f"{weeks}w ago"
+    months = days // 30
+    if months < 12:
+        return f"{months}mo ago"
+    years = days // 365
+    return f"{years}y ago"
+
+
+def _notification_store() -> list[dict[str, object]]:
+    buffer = st.session_state.get(NOTIFICATION_BUFFER_KEY)
+    if not isinstance(buffer, list):
+        buffer = []
+    st.session_state[NOTIFICATION_BUFFER_KEY] = buffer
+    return buffer
+
+
+def get_runtime_notifications() -> list[dict[str, object]]:
+    return list(_notification_store())
+
+
+def push_runtime_notification(
+    title: Optional[str],
+    message: Optional[str],
+    *,
+    severity: str = "info",
+    details: Optional[Iterable[str]] = None,
+) -> None:
+    if not title and not message:
+        return
+    entry = {
+        "title": clean_text(title) or "Notification",
+        "message": clean_text(message) or "",
+        "severity": (clean_text(severity) or "info").lower(),
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "details": [
+            clean_text(item) for item in (details or []) if clean_text(item)
+        ],
+    }
+    buffer = _notification_store()
+    buffer.append(entry)
+    if len(buffer) > MAX_RUNTIME_NOTIFICATIONS:
+        del buffer[0 : len(buffer) - MAX_RUNTIME_NOTIFICATIONS]
+    st.session_state[NOTIFICATION_BUFFER_KEY] = buffer
+
+
+def log_activity(
+    conn,
+    *,
+    event_type: Optional[str],
+    description: Optional[str],
+    entity_type: Optional[str] = None,
+    entity_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+) -> None:
+    event_key = clean_text(event_type)
+    description_text = clean_text(description)
+    if not event_key and not description_text:
+        return
+    actor_id = user_id if user_id is not None else current_user_id()
+    try:
+        conn.execute(
+            """
+            INSERT INTO activity_log (user_id, event_type, entity_type, entity_id, description, created_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                actor_id,
+                event_key,
+                clean_text(entity_type),
+                entity_id,
+                description_text or description or "",
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+
+
+def fetch_activity_feed(conn, limit: int = ACTIVITY_FEED_LIMIT) -> list[dict[str, object]]:
+    try:
+        resolved_limit = int(limit)
+    except (TypeError, ValueError):
+        resolved_limit = ACTIVITY_FEED_LIMIT
+    resolved_limit = max(1, min(resolved_limit, 100))
+    df = df_query(
+        conn,
+        dedent(
+            """
+            SELECT a.activity_id,
+                   a.event_type,
+                   a.entity_type,
+                   a.entity_id,
+                   a.description,
+                   a.created_at,
+                   u.username
+            FROM activity_log a
+            LEFT JOIN users u ON u.user_id = a.user_id
+            ORDER BY datetime(a.created_at) DESC, a.activity_id DESC
+            LIMIT ?
+            """
+        ),
+        (resolved_limit,),
+    )
+    if df.empty:
+        return []
+    feed: list[dict[str, object]] = []
+    for record in df.to_dict("records"):
+        event_type = clean_text(record.get("event_type")) or "activity"
+        label = NOTIFICATION_EVENT_LABELS.get(
+            event_type, event_type.replace("_", " ").title()
+        )
+        feed.append(
+            {
+                "title": label,
+                "message": clean_text(record.get("description")) or "",
+                "timestamp": clean_text(record.get("created_at")) or "",
+                "actor": clean_text(record.get("username")) or "Team member",
+                "severity": "info",
+                "event_type": event_type,
+            }
+        )
+    return feed
 
 
 def to_iso_date(value) -> Optional[str]:
@@ -1609,16 +1826,17 @@ def delete_customer_record(conn, customer_id: int) -> None:
         return
 
     cur = conn.execute(
-        "SELECT phone, delivery_order_code, attachment_path FROM customers WHERE customer_id=?",
+        "SELECT name, phone, delivery_order_code, attachment_path FROM customers WHERE customer_id=?",
         (cid,),
     )
     row = cur.fetchone()
     if not row:
         return
 
-    phone_val = clean_text(row[0])
-    do_code = clean_text(row[1])
-    attachment_path = row[2]
+    name_val = clean_text(row[0])
+    phone_val = clean_text(row[1])
+    do_code = clean_text(row[2])
+    attachment_path = row[3]
 
     conn.execute("DELETE FROM customers WHERE customer_id=?", (cid,))
     if do_code:
@@ -1643,6 +1861,20 @@ def delete_customer_record(conn, customer_id: int) -> None:
                 path.unlink()
             except Exception:
                 pass
+
+    summary_bits: list[str] = []
+    if name_val:
+        summary_bits.append(name_val)
+    if phone_val:
+        summary_bits.append(f"phone {phone_val}")
+    description = "; ".join(summary_bits) or f"ID #{cid}"
+    log_activity(
+        conn,
+        event_type="customer_deleted",
+        description=f"Deleted customer {description}",
+        entity_type="customer",
+        entity_id=cid,
+    )
 
 
 def collapse_warranty_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -2227,6 +2459,39 @@ def init_ui():
     st.set_page_config(page_title="PS Mini CRM", page_icon="🧰", layout="wide")
     st.title("PS Engineering – Mini CRM")
     st.caption("Customers • Warranties • Needs • Summaries")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMetric"] {
+            background: #f5f9ff;
+            border-radius: 0.8rem;
+            padding: 0.85rem;
+            border: 1px solid rgba(49, 51, 63, 0.08);
+        }
+        div[data-testid="stPopover"] > button {
+            border: none !important;
+            background: transparent !important;
+            font-size: 1.25rem;
+            padding: 0.15rem 0.35rem !important;
+            color: #1d3b64 !important;
+        }
+        .ps-notification-popover {
+            display: flex;
+            justify-content: flex-end;
+        }
+        .ps-notification-popover button:hover {
+            background: rgba(29, 59, 100, 0.08) !important;
+        }
+        .ps-notification-section-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #1d3b64;
+            margin-bottom: 0.25rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     if "user" not in st.session_state:
         st.session_state.user = None
 
@@ -2267,6 +2532,9 @@ def dashboard(conn):
         "<div style='text-align: right; font-size: 0.6rem; color: #888;'>by ZAD</div>",
         unsafe_allow_html=True,
     )
+    header_cols = st.columns((0.85, 0.15))
+    with header_cols[1]:
+        render_notification_bell(conn)
     user = st.session_state.user or {}
     is_admin = user.get("role") == "admin"
     allowed_customers = accessible_customer_ids(conn)
@@ -2996,38 +3264,74 @@ def show_expiry_notifications(conn):
         st.session_state.just_logged_in = False
         return
 
-    try:
-        with st.modal("Daily alerts"):
-            if show_upcoming:
-                st.markdown("### Work starting today")
-                st.dataframe(upcoming_df, use_container_width=True)
-            if show_notes:
-                st.markdown("### Customer follow-ups due")
-                st.dataframe(notes_display, use_container_width=True)
-            if show_expired:
-                st.markdown("### Warranties needing attention")
-                st.write(
-                    f"Total expired: **{total_expired}**, expired this month: **{month_expired}**."
+    if show_upcoming:
+        upcoming_preview = upcoming_df.head(5)
+        upcoming_details = []
+        for record in upcoming_preview.to_dict("records"):
+            type_label = clean_text(record.get("Type")) or ""
+            customer_label = clean_text(record.get("Customer")) or "(unknown)"
+            start_label = clean_text(record.get("Start date")) or ""
+            description_label = clean_text(record.get("Description")) or clean_text(
+                record.get("Status")
+            ) or ""
+            detail_parts = [part for part in [type_label, customer_label, start_label] if part]
+            detail_line = " • ".join(detail_parts)
+            if description_label:
+                detail_line = (
+                    f"{detail_line} – {description_label}" if detail_line else description_label
                 )
-                if formatted is None or formatted.empty:
-                    st.info("No expired warranties found.")
-                else:
-                    st.dataframe(formatted, use_container_width=True)
-    except Exception:
-        if show_upcoming:
-            st.warning(
-                f"{len(upcoming_df)} scheduled service/maintenance task(s) start today."
-            )
-        if show_expired:
-            st.warning(
-                f"{total_expired} warranties are past expiry. {month_expired} expired this month."
-            )
+            upcoming_details.append(detail_line)
+        push_runtime_notification(
+            "Today's schedule",
+            f"{len(upcoming_df.index)} task(s) scheduled for today.",
+            severity="info",
+            details=upcoming_details,
+        )
 
-    try:
-        for message in upcoming_messages:
+    if show_notes:
+        notes_preview = notes_display.head(5)
+        notes_details = []
+        for record in notes_preview.to_dict("records"):
+            customer_label = clean_text(record.get("Customer")) or "(unknown)"
+            due_label = clean_text(record.get("Due date")) or ""
+            remark_label = clean_text(record.get("Remark")) or ""
+            detail_line = " • ".join(
+                part for part in [customer_label, due_label, remark_label] if part
+            )
+            notes_details.append(detail_line)
+        push_runtime_notification(
+            "Follow-up reminders",
+            f"{len(notes_display.index)} customer reminder(s) due.",
+            severity="warning",
+            details=notes_details,
+        )
+
+    if show_expired:
+        expiry_preview = formatted.head(5) if isinstance(formatted, pd.DataFrame) else pd.DataFrame()
+        expiry_details = []
+        if isinstance(expiry_preview, pd.DataFrame) and not expiry_preview.empty:
+            for record in expiry_preview.to_dict("records"):
+                customer_label = clean_text(record.get("Customer")) or "(unknown)"
+                product_label = clean_text(record.get("Product")) or clean_text(
+                    record.get("Model")
+                ) or ""
+                expiry_label = clean_text(record.get("Expiry date")) or ""
+                detail_line = " • ".join(
+                    part for part in [customer_label, product_label, expiry_label] if part
+                )
+                expiry_details.append(detail_line)
+        push_runtime_notification(
+            "Expired warranties",
+            f"{total_expired} warranty record(s) need attention ({month_expired} this month).",
+            severity="warning",
+            details=expiry_details,
+        )
+
+    for message in upcoming_messages:
+        try:
             st.toast(message)
-    except Exception:
-        pass
+        except Exception:
+            break
     try:
         if show_expired:
             st.toast(f"{total_expired} warranties require attention.")
@@ -3035,6 +3339,88 @@ def show_expiry_notifications(conn):
         pass
 
     st.session_state.just_logged_in = False
+
+
+def _render_notification_entry(entry: dict[str, object], *, include_actor: bool = False) -> None:
+    severity = str(entry.get("severity") or "info").lower()
+    icon = {
+        "warning": "🟠",
+        "error": "🔴",
+        "success": "🟢",
+    }.get(severity, "🔵")
+    title = clean_text(entry.get("title")) or "Notification"
+    message = clean_text(entry.get("message")) or ""
+    st.markdown(f"{icon} **{title}**")
+    if message:
+        st.write(message)
+    details = entry.get("details") or []
+    for detail in list(details)[:5]:
+        st.caption(f"• {detail}")
+    footer_bits: list[str] = []
+    if include_actor:
+        actor = clean_text(entry.get("actor"))
+        if actor:
+            footer_bits.append(actor)
+    time_label = format_time_ago(entry.get("timestamp"))
+    if time_label:
+        footer_bits.append(time_label)
+    if footer_bits:
+        st.caption(" · ".join(footer_bits))
+
+
+def _render_notification_section(
+    entries: list[dict[str, object]],
+    *,
+    include_actor: bool = False,
+    heading: Optional[str] = None,
+) -> None:
+    if not entries:
+        return
+    if heading:
+        st.markdown(
+            f"<div class='ps-notification-section-title'>{heading}</div>",
+            unsafe_allow_html=True,
+        )
+    first = True
+    for entry in entries:
+        if not first:
+            st.divider()
+        _render_notification_entry(entry, include_actor=include_actor)
+        first = False
+
+
+def _render_notification_body(
+    alerts: list[dict[str, object]],
+    activity: list[dict[str, object]],
+) -> None:
+    if not alerts and not activity:
+        st.caption("No notifications yet. Updates will appear here as your team works.")
+        return
+    _render_notification_section(alerts, heading="Alerts")
+    if alerts and activity:
+        st.divider()
+    _render_notification_section(activity, include_actor=True, heading="Recent activity")
+
+
+def render_notification_bell(conn) -> None:
+    if not current_user_is_admin():
+        return
+    alerts = list(reversed(get_runtime_notifications()))
+    activity = fetch_activity_feed(conn, limit=ACTIVITY_FEED_LIMIT)
+    total = len(alerts) + len(activity)
+    label = "🔔" if total == 0 else f"🔔 {total}"
+    container = st.container()
+    with container:
+        st.markdown("<div class='ps-notification-popover'>", unsafe_allow_html=True)
+        popover = getattr(st, "popover", None)
+        if callable(popover):
+            with popover(label, help="View alerts and staff activity", use_container_width=True):
+                _render_notification_body(alerts, activity)
+        else:
+            with st.expander(f"{label} Notifications", expanded=False):
+                _render_notification_body(alerts, activity)
+        st.markdown("</div>", unsafe_allow_html=True)
+
 
 def customers_page(conn):
     st.subheader("👥 Customers")
@@ -3325,6 +3711,22 @@ def customers_page(conn):
                 if phone_val:
                     recalc_customer_duplicate_flag(conn, phone_val)
                     conn.commit()
+                display_name = name_val or f"Customer #{int(cid)}"
+                product_count = len(
+                    [prod for prod in cleaned_products if prod.get("name")]
+                )
+                details = (
+                    f"{display_name} with {product_count} product(s)"
+                    if product_count
+                    else display_name
+                )
+                log_activity(
+                    conn,
+                    event_type="customer_created",
+                    description=f"Added {details}",
+                    entity_type="customer",
+                    entity_id=int(cid),
+                )
                 _reset_new_customer_form_state()
                 st.session_state["new_customer_feedback"] = (
                     "success",
@@ -3433,6 +3835,7 @@ def customers_page(conn):
                 updates = deletes = 0
                 errors: list[str] = []
                 made_updates = False
+                activity_events: list[tuple[str, int, str]] = []
                 for row in editor_result.to_dict("records"):
                     cid = int_or_none(row.get("id"))
                     if cid is None or cid not in original_map:
@@ -3466,6 +3869,7 @@ def customers_page(conn):
                     old_product = clean_text(original_row.get("product_info"))
                     old_do = clean_text(original_row.get("delivery_order_code"))
                     old_sales_person = clean_text(original_row.get("sales_person"))
+                    changes: list[str] = []
                     if (
                         new_name == old_name
                         and new_company == old_company
@@ -3495,6 +3899,26 @@ def customers_page(conn):
                             cid,
                         ),
                     )
+                    if new_name != old_name:
+                        changes.append("name")
+                    if new_company != old_company:
+                        changes.append("company")
+                    if new_phone != old_phone:
+                        changes.append("phone")
+                    if new_address != old_address:
+                        changes.append("billing address")
+                    if new_delivery_address != old_delivery_address:
+                        changes.append("delivery address")
+                    if new_remarks != old_remarks:
+                        changes.append("remarks")
+                    if purchase_str != old_purchase:
+                        changes.append("purchase date")
+                    if product_label != old_product:
+                        changes.append("products")
+                    if new_do != old_do:
+                        changes.append("DO code")
+                    if new_sales_person != old_sales_person:
+                        changes.append("sales person")
                     if new_do:
                         conn.execute(
                             """
@@ -3539,12 +3963,30 @@ def customers_page(conn):
                         phones_to_recalc.add(new_phone)
                     updates += 1
                     made_updates = True
+                    if changes:
+                        display_name = new_name or old_name or f"Customer #{cid}"
+                        summary = ", ".join(changes)
+                        activity_events.append(
+                            (
+                                "customer_updated",
+                                cid,
+                                f"Updated {display_name} ({summary})",
+                            )
+                        )
                 if made_updates:
                     conn.commit()
                 if phones_to_recalc:
                     for phone_value in phones_to_recalc:
                         recalc_customer_duplicate_flag(conn, phone_value)
                     conn.commit()
+                for event_type, entity_id, description in activity_events:
+                    log_activity(
+                        conn,
+                        event_type=event_type,
+                        description=description,
+                        entity_type="customer",
+                        entity_id=int(entity_id),
+                    )
                 if errors:
                     for err in errors:
                         st.error(err)
@@ -4242,6 +4684,25 @@ def _render_service_section(conn, *, show_heading: bool = True):
                         )
                         bill_saved = True
                 conn.commit()
+                service_label = do_labels.get(selected_do) or f"Service #{service_id}"
+                customer_name = None
+                if selected_customer is not None:
+                    customer_name = (
+                        label_by_id.get(int(selected_customer))
+                        or customer_label_map.get(int(selected_customer))
+                    )
+                summary_parts = [service_label]
+                if customer_name:
+                    summary_parts.append(customer_name)
+                status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
+                summary_parts.append(f"status {status_label}")
+                log_activity(
+                    conn,
+                    event_type="service_created",
+                    description=" – ".join(summary_parts),
+                    entity_type="service",
+                    entity_id=int(service_id),
+                )
                 message = "Service record saved."
                 if saved_docs:
                     message = f"{message} Attached {saved_docs} document(s)."
@@ -4547,6 +5008,18 @@ def _render_service_section(conn, *, show_heading: bool = True):
                     ),
                 )
                 conn.commit()
+                label_text = labels.get(int(selected_service_id), f"Service #{int(selected_service_id)}")
+                status_label = clean_text(new_status) or DEFAULT_SERVICE_STATUS
+                message_summary = label_text
+                if status_label:
+                    message_summary = f"{label_text} → {status_label}"
+                log_activity(
+                    conn,
+                    event_type="service_updated",
+                    description=message_summary,
+                    entity_type="service",
+                    entity_id=int(selected_service_id),
+                )
                 message_bits = ["Service record updated."]
                 if bill_amount_update is not None:
                     message_bits.append(f"Bill amount {format_money(bill_amount_update)}")
@@ -5272,6 +5745,25 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     f"maintenance_{maintenance_id}",
                 )
                 conn.commit()
+                maintenance_label = do_labels.get(selected_do) or f"Maintenance #{maintenance_id}"
+                customer_name = None
+                if selected_customer is not None:
+                    customer_name = (
+                        label_by_id.get(int(selected_customer))
+                        or customer_label_map.get(int(selected_customer))
+                    )
+                summary_parts = [maintenance_label]
+                if customer_name:
+                    summary_parts.append(customer_name)
+                status_label = clean_text(status_value) or DEFAULT_SERVICE_STATUS
+                summary_parts.append(f"status {status_label}")
+                log_activity(
+                    conn,
+                    event_type="maintenance_created",
+                    description=" – ".join(summary_parts),
+                    entity_type="maintenance",
+                    entity_id=int(maintenance_id),
+                )
                 message = "Maintenance record saved."
                 if saved_docs:
                     message = f"{message} Attached {saved_docs} document(s)."
@@ -5457,6 +5949,19 @@ def _render_maintenance_section(conn, *, show_heading: bool = True):
                     ),
                 )
                 conn.commit()
+                label_text = labels.get(
+                    int(selected_maintenance_id),
+                    f"Maintenance #{int(selected_maintenance_id)}",
+                )
+                status_label = clean_text(new_status) or DEFAULT_SERVICE_STATUS
+                summary = f"{label_text} → {status_label}" if status_label else label_text
+                log_activity(
+                    conn,
+                    event_type="maintenance_updated",
+                    description=summary,
+                    entity_type="maintenance",
+                    entity_id=int(selected_maintenance_id),
+                )
                 st.success("Maintenance record updated.")
                 _safe_rerun()
 
@@ -7173,6 +7678,7 @@ def upsert_work_report(
     else:
         attachment_value = attachment_path
 
+    created_new = False
     if effective_id is None:
         try:
             cur.execute(
@@ -7196,6 +7702,7 @@ def upsert_work_report(
                 "Another report already exists for this period. Select it from the dropdown to edit."
             ) from exc
         effective_id = int(cur.lastrowid)
+        created_new = True
     else:
         try:
             cur.execute(
@@ -7221,6 +7728,30 @@ def upsert_work_report(
             ) from exc
 
     conn.commit()
+    cadence_label = REPORT_PERIOD_OPTIONS.get(key, key.title())
+    period_label = format_period_range(start_iso, end_iso)
+    owner_label = None
+    try:
+        owner_row = conn.execute(
+            "SELECT username FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if owner_row:
+            owner_label = clean_text(owner_row[0])
+    except sqlite3.Error:
+        owner_label = None
+    actor = owner_label or f"User #{user_id}"
+    event_type = "report_submitted" if created_new else "report_updated"
+    verb = "submitted" if created_new else "updated"
+    description = f"{actor} {verb} {cadence_label.lower()} report ({period_label})"
+    log_activity(
+        conn,
+        event_type=event_type,
+        description=description,
+        entity_type="report",
+        entity_id=int(effective_id),
+        user_id=user_id,
+    )
     return effective_id
 
 
