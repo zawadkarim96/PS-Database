@@ -2650,6 +2650,121 @@ def dashboard(conn):
             st.caption(
                 f"Coverage for {format_period_range(report_iso, report_iso)} • Admins are excluded from this list."
             )
+            staff_options = [int(uid) for uid in staff_df["user_id"].tolist()]
+            staff_labels = {
+                int(row["user_id"]): row["username"] for _, row in staff_df.iterrows()
+            }
+            if staff_options:
+                st.markdown("##### Review daily submissions")
+                submitted_options = [
+                    int(uid)
+                    for uid in staff_df.loc[staff_df["Submitted"], "user_id"].tolist()
+                ]
+                default_staff_id = (
+                    submitted_options[0] if submitted_options else staff_options[0]
+                )
+                try:
+                    default_index = staff_options.index(default_staff_id)
+                except ValueError:
+                    default_index = 0
+                selected_staff_id = int(
+                    st.selectbox(
+                        "Team member report",
+                        staff_options,
+                        index=default_index,
+                        format_func=lambda uid: staff_labels.get(
+                            int(uid), f"User #{int(uid)}"
+                        ),
+                        key="dashboard_daily_report_user",
+                    )
+                )
+                selected_staff_name = staff_labels.get(
+                    selected_staff_id, f"User #{selected_staff_id}"
+                )
+                report_detail = df_query(
+                    conn,
+                    dedent(
+                        """
+                        SELECT report_id,
+                               tasks,
+                               remarks,
+                               research,
+                               attachment_path,
+                               period_start,
+                               period_end,
+                               created_at,
+                               updated_at
+                        FROM work_reports
+                        WHERE user_id=?
+                          AND period_type='daily'
+                          AND date(period_start) = date(?)
+                        ORDER BY datetime(updated_at) DESC, report_id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    (selected_staff_id, report_iso),
+                )
+                has_marked_submitted = bool(
+                    staff_df.loc[staff_df["user_id"] == selected_staff_id, "Submitted"].any()
+                )
+                if report_detail.empty:
+                    if has_marked_submitted:
+                        st.warning(
+                            f"No daily report could be located for {selected_staff_name}.",
+                            icon="⚠️",
+                        )
+                    else:
+                        st.info(
+                            f"{selected_staff_name} has not submitted a daily report for "
+                            f"{format_period_range(report_iso, report_iso)}.",
+                        )
+                else:
+                    record = report_detail.iloc[0].to_dict()
+                    st.markdown(
+                        f"**Period:** {format_period_range(record.get('period_start'), record.get('period_end'))}"
+                    )
+                    st.markdown("**Tasks completed**")
+                    st.write(clean_text(record.get("tasks")) or "—")
+                    st.markdown("**Remarks / blockers**")
+                    st.write(clean_text(record.get("remarks")) or "—")
+                    st.markdown("**Research / learnings**")
+                    st.write(clean_text(record.get("research")) or "—")
+                    submitted_label = (
+                        format_time_ago(record.get("created_at"))
+                        or format_period_range(record.get("created_at"), record.get("created_at"))
+                    )
+                    updated_label = (
+                        format_time_ago(record.get("updated_at"))
+                        or format_period_range(record.get("updated_at"), record.get("updated_at"))
+                    )
+                    st.caption(
+                        f"Submitted {submitted_label} • Last updated {updated_label}"
+                    )
+                    attachment_value = clean_text(record.get("attachment_path"))
+                    if attachment_value:
+                        attachment_path = resolve_upload_path(attachment_value)
+                        attachment_bytes = None
+                        if attachment_path and attachment_path.exists():
+                            try:
+                                attachment_bytes = attachment_path.read_bytes()
+                            except OSError:
+                                attachment_bytes = None
+                        if attachment_bytes:
+                            st.download_button(
+                                "Download attachment",
+                                data=attachment_bytes,
+                                file_name=(
+                                    attachment_path.name if attachment_path else "attachment"
+                                ),
+                                key=f"dashboard_report_attachment_{record.get('report_id')}",
+                            )
+                        else:
+                            st.warning(
+                                "The attached file could not be found on disk.",
+                                icon="⚠️",
+                            )
+                    else:
+                        st.caption("No attachment uploaded for this report.")
     else:
         st.info("Staff view: focus on upcoming activities below. Metrics are available to admins only.")
 
