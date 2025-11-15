@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import math
 import os
 import re
@@ -69,6 +70,140 @@ REPORT_PERIOD_OPTIONS = OrderedDict(
         ("monthly", "Monthly"),
     ]
 )
+
+REPORT_GRID_FIELDS = OrderedDict(
+    [
+        ("customer_name", {"label": "Customer Name", "type": "text"}),
+        (
+            "reported_complaints",
+            {"label": "Reported Complaints", "type": "text"},
+        ),
+        ("product_details", {"label": "Product Details", "type": "text"}),
+        ("details_remarks", {"label": "Details Remarks", "type": "text"}),
+        ("status", {"label": "Status", "type": "text"}),
+        ("quotation_tk", {"label": "Quotation Tk", "type": "number"}),
+        ("bill_tk", {"label": "Bill TK", "type": "number"}),
+        ("work_done_date", {"label": "Work Done Date", "type": "date"}),
+        ("donation_cost", {"label": "Donation Cost", "type": "number"}),
+    ]
+)
+
+REPORT_GRID_DISPLAY_COLUMNS = [
+    config["label"] for config in REPORT_GRID_FIELDS.values()
+]
+
+
+def _default_report_grid_row() -> dict[str, object]:
+    row: dict[str, object] = {}
+    for key, config in REPORT_GRID_FIELDS.items():
+        if config["type"] == "number":
+            row[key] = None
+        else:
+            row[key] = ""
+    return row
+
+
+def _coerce_grid_number(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        cleaned = cleaned.replace(",", "")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_grid_rows(rows: Iterable[dict]) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    if not rows:
+        return normalized
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        entry: dict[str, object] = {}
+        for key, config in REPORT_GRID_FIELDS.items():
+            value = raw.get(key)
+            if config["type"] == "text":
+                entry[key] = clean_text(value)
+            elif config["type"] == "number":
+                entry[key] = _coerce_grid_number(value)
+            elif config["type"] == "date":
+                entry[key] = to_iso_date(value)
+            else:
+                entry[key] = value
+        if any(val not in (None, "") for val in entry.values()):
+            normalized.append(entry)
+    return normalized
+
+
+def parse_report_grid_payload(value: Optional[str]) -> list[dict[str, object]]:
+    text = clean_text(value)
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        return _normalize_grid_rows(parsed)
+    return []
+
+
+def prepare_report_grid_payload(rows: Iterable[dict]) -> Optional[str]:
+    normalized = _normalize_grid_rows(rows)
+    if not normalized:
+        return None
+    return json.dumps(normalized, ensure_ascii=False)
+
+
+def format_report_grid_rows_for_display(
+    rows: Iterable[dict], *, empty_ok: bool = False
+) -> pd.DataFrame:
+    normalized = _normalize_grid_rows(rows)
+    if not normalized and not empty_ok:
+        return pd.DataFrame(columns=REPORT_GRID_DISPLAY_COLUMNS)
+    if not normalized:
+        normalized = []
+    formatted: list[dict[str, object]] = []
+    for entry in normalized:
+        display_row: dict[str, object] = {}
+        for key, config in REPORT_GRID_FIELDS.items():
+            label = config["label"]
+            value = entry.get(key)
+            if config["type"] == "text":
+                display_row[label] = clean_text(value) or ""
+            elif config["type"] == "number":
+                display_row[label] = value if value is not None else None
+            elif config["type"] == "date":
+                iso = to_iso_date(value)
+                if iso:
+                    try:
+                        parsed = datetime.strptime(iso, "%Y-%m-%d")
+                        display_row[label] = parsed.strftime(DATE_FMT)
+                    except ValueError:
+                        display_row[label] = iso
+                else:
+                    display_row[label] = ""
+            else:
+                display_row[label] = value
+        formatted.append(display_row)
+    if not formatted:
+        return pd.DataFrame(columns=REPORT_GRID_DISPLAY_COLUMNS)
+    df = pd.DataFrame(formatted)
+    return df.reindex(columns=REPORT_GRID_DISPLAY_COLUMNS)
 
 NOTIFICATION_BUFFER_KEY = "runtime_notifications"
 MAX_RUNTIME_NOTIFICATIONS = 40
@@ -278,6 +413,7 @@ CREATE TABLE IF NOT EXISTS work_reports (
     tasks TEXT,
     remarks TEXT,
     research TEXT,
+    grid_payload TEXT,
     attachment_path TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
@@ -365,6 +501,7 @@ def ensure_schema_upgrades(conn):
     add_column("delivery_orders", "remarks", "TEXT")
     add_column("import_history", "amount_spent", "REAL")
     add_column("import_history", "imported_by", "INTEGER")
+    add_column("work_reports", "grid_payload", "TEXT")
     add_column("work_reports", "attachment_path", "TEXT")
 
     cur = conn.execute(
@@ -3977,6 +4114,43 @@ def customers_page(conn):
         )
         if not is_admin:
             st.caption("Set Action to “Delete” requires admin access; non-admin changes will be ignored.")
+        if is_admin and not editor_df.empty:
+            delete_labels: dict[int, str] = {}
+            for record in editor_df.to_dict("records"):
+                cid = int_or_none(record.get("id"))
+                if cid is None:
+                    continue
+                name_val = clean_text(record.get("name")) or "(no name)"
+                phone_val = clean_text(record.get("phone")) or "-"
+                delete_labels[cid] = f"#{cid} – {name_val} | {phone_val}"
+            delete_choices = sorted(
+                delete_labels.keys(), key=lambda cid: delete_labels[cid].lower()
+            )
+            with st.form("bulk_customer_delete"):
+                selected_delete_ids = st.multiselect(
+                    "Select customers to delete",
+                    delete_choices,
+                    format_func=lambda cid: delete_labels.get(
+                        int(cid), f"Customer #{cid}"
+                    ),
+                    help="Removes the selected customers and their related records.",
+                )
+                bulk_delete_submit = st.form_submit_button(
+                    "Delete selected customers",
+                    disabled=not selected_delete_ids,
+                    type="secondary",
+                )
+            if bulk_delete_submit and selected_delete_ids:
+                deleted_count = 0
+                for cid in selected_delete_ids:
+                    try:
+                        delete_customer_record(conn, int(cid))
+                        deleted_count += 1
+                    except Exception as err:
+                        st.error(f"Unable to delete customer #{cid}: {err}")
+                if deleted_count:
+                    st.warning(f"Deleted {deleted_count} customer(s).")
+                    _safe_rerun()
         if st.button("Apply table updates", type="primary"):
             editor_result = editor_state if isinstance(editor_state, pd.DataFrame) else pd.DataFrame(editor_state)
             if editor_result.empty:
@@ -7549,38 +7723,41 @@ def _import_clean6(conn, df, tag="Import"):
     created_by = current_user_id()
     for _, r in df.iterrows():
         d = r.get("date", pd.NaT)
-        cust = r.get("customer_name"); addr = r.get("address")
-        phone = r.get("phone"); email = r.get("email"); prod = r.get("product")
-        do_code = r.get("do_code")
+        cust = clean_text(r.get("customer_name"))
+        addr = clean_text(r.get("address"))
+        phone = clean_text(r.get("phone"))
+        email = clean_text(r.get("email"))
+        product_label = clean_text(r.get("product"))
+        do_serial = clean_text(r.get("do_code"))
         remarks_val = clean_text(r.get("remarks"))
         amount_value = parse_amount(r.get("amount_spent"))
-        if pd.isna(cust) and pd.isna(phone) and pd.isna(prod):
+        if cust is None and phone is None and product_label is None:
             continue
-        cust = str(cust) if pd.notna(cust) else None
-        addr = str(addr) if pd.notna(addr) else None
-        phone = str(phone) if pd.notna(phone) else None
-        email = str(email) if pd.notna(email) else None
-        prod = str(prod) if pd.notna(prod) else None
         purchase_dt = parse_date_value(d)
         purchase_str = purchase_dt.strftime("%Y-%m-%d") if isinstance(purchase_dt, pd.Timestamp) else None
         # dup checks
-        def exists_phone(phone_value, purchase_value):
+        def exists_phone(phone_value, purchase_value, do_value, product_value):
             normalized_phone = clean_text(phone_value)
             if not normalized_phone:
                 return False
+            clauses = ["phone = ?"]
+            params: list[object] = [normalized_phone]
             if purchase_value:
-                cur.execute(
-                    "SELECT 1 FROM customers WHERE phone = ? AND IFNULL(purchase_date, '') = ? LIMIT 1",
-                    (normalized_phone, purchase_value),
-                )
+                clauses.append("IFNULL(purchase_date, '') = ?")
+                params.append(purchase_value)
             else:
-                cur.execute(
-                    "SELECT 1 FROM customers WHERE phone = ? AND (purchase_date IS NULL OR purchase_date = '') LIMIT 1",
-                    (normalized_phone,),
-                )
+                clauses.append("(purchase_date IS NULL OR purchase_date = '')")
+            if do_value:
+                clauses.append("LOWER(IFNULL(delivery_order_code, '')) = LOWER(?)")
+                params.append(do_value)
+            elif product_value:
+                clauses.append("LOWER(IFNULL(product_info, '')) = LOWER(?)")
+                params.append(product_value)
+            query = f"SELECT 1 FROM customers WHERE {' AND '.join(clauses)} LIMIT 1"
+            cur.execute(query, tuple(params))
             return cur.fetchone() is not None
 
-        dupc = 1 if exists_phone(phone, purchase_str) else 0
+        dupc = 1 if exists_phone(phone, purchase_str, do_serial, product_label) else 0
         cur.execute(
             "INSERT INTO customers (name, phone, email, address, remarks, amount_spent, created_by, dup_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (cust, phone, email, addr, remarks_val, amount_value, created_by, dupc),
@@ -7593,7 +7770,7 @@ def _import_clean6(conn, df, tag="Import"):
             if normalized_phone:
                 phones_to_recalc.add(normalized_phone)
 
-        name, model = split_product_label(prod)
+        name, model = split_product_label(product_label)
 
         def exists_prod(name, model):
             if not name:
@@ -7648,9 +7825,8 @@ def _import_clean6(conn, df, tag="Import"):
         )
         warranty_id = cur.lastrowid
 
-        do_serial = clean_text(do_code)
         if do_serial:
-            description = clean_text(prod)
+            description = product_label
             cur.execute(
                 "INSERT OR IGNORE INTO delivery_orders (do_number, customer_id, order_id, description, sales_person, remarks, file_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -7668,7 +7844,7 @@ def _import_clean6(conn, df, tag="Import"):
             "UPDATE customers SET purchase_date=?, product_info=?, delivery_order_code=?, remarks=?, amount_spent=? WHERE customer_id=?",
             (
                 purchase_date,
-                prod,
+                product_label,
                 do_serial,
                 remarks_val,
                 amount_value,
@@ -7689,7 +7865,7 @@ def _import_clean6(conn, df, tag="Import"):
                 cust,
                 addr,
                 phone,
-                prod,
+                product_label,
                 remarks_val,
                 amount_value,
                 created_by,
@@ -7892,6 +8068,7 @@ def upsert_work_report(
     tasks: Optional[str],
     remarks: Optional[str],
     research: Optional[str],
+    grid_rows: Optional[Iterable[dict]] = None,
     attachment_path=_ATTACHMENT_UNCHANGED,
     current_attachment: Optional[str] = None,
 ) -> int:
@@ -7907,6 +8084,7 @@ def upsert_work_report(
     tasks_val = _normalize_report_text(tasks)
     remarks_val = _normalize_report_text(remarks)
     research_val = _normalize_report_text(research)
+    grid_payload_val = prepare_report_grid_payload(grid_rows or [])
 
     cur = conn.cursor()
     effective_id = report_id
@@ -7950,8 +8128,8 @@ def upsert_work_report(
         try:
             cur.execute(
                 """
-                INSERT INTO work_reports (user_id, period_type, period_start, period_end, tasks, remarks, research, attachment_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO work_reports (user_id, period_type, period_start, period_end, tasks, remarks, research, grid_payload, attachment_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -7961,6 +8139,7 @@ def upsert_work_report(
                     tasks_val,
                     remarks_val,
                     research_val,
+                    grid_payload_val,
                     attachment_value,
                 ),
             )
@@ -7975,7 +8154,7 @@ def upsert_work_report(
             cur.execute(
                 """
                 UPDATE work_reports
-                SET period_type=?, period_start=?, period_end=?, tasks=?, remarks=?, research=?, attachment_path=?, updated_at=datetime('now')
+                SET period_type=?, period_start=?, period_end=?, tasks=?, remarks=?, research=?, grid_payload=?, attachment_path=?, updated_at=datetime('now')
                 WHERE report_id=?
                 """,
                 (
@@ -7985,6 +8164,7 @@ def upsert_work_report(
                     tasks_val,
                     remarks_val,
                     research_val,
+                    grid_payload_val,
                     attachment_value,
                     effective_id,
                 ),
@@ -8181,6 +8361,13 @@ def reports_page(conn):
         return
 
     is_admin = user.get("role") == "admin"
+    today = datetime.now().date()
+    current_week_start = today - timedelta(days=today.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+    current_month_start = date(today.year, today.month, 1)
+    current_month_end = date(
+        today.year, today.month, monthrange(today.year, today.month)[1]
+    )
     st.caption(
         "Staff can see only their own entries. Admins can review every team member's submissions."
     )
@@ -8226,59 +8413,9 @@ def reports_page(conn):
             f"Recording progress for **{label_map.get(viewer_id, 'you')}**.",
             icon="📝",
         )
-
-    owner_reports = df_query(
-        conn,
-        dedent(
-            """
-            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, attachment_path, created_at, updated_at
-            FROM work_reports
-            WHERE user_id=?
-            ORDER BY date(period_start) DESC, report_id DESC
-            LIMIT 50
-            """
-        ),
-        (report_owner_id,),
-    )
-    record_labels: dict[int, str] = {}
-    if not owner_reports.empty:
-        owner_reports["report_id"] = owner_reports["report_id"].apply(lambda val: int(float(val)))
-        for _, row in owner_reports.iterrows():
-            rid = int(row["report_id"])
-            record_labels[rid] = (
-                f"{format_period_label(row.get('period_type'))} – "
-                f"{format_period_range(row.get('period_start'), row.get('period_end'))}"
-            )
-
-    report_choices = [None] + owner_reports.get("report_id", pd.Series(dtype=int)).tolist()
-
-    def _format_report_choice(value):
-        if value is None:
-            return "➕ Create new report"
-        try:
-            return record_labels.get(int(value), f"Report #{int(value)}")
-        except Exception:
-            return "Report"
-
-    if "report_edit_select_pending" in st.session_state:
-        pending_selection = st.session_state.pop("report_edit_select_pending")
-        if pending_selection is not None:
-            st.session_state["report_edit_select"] = pending_selection
-
-    selected_report_id = st.selectbox(
-        "Load an existing report",
-        report_choices,
-        format_func=_format_report_choice,
-        key="report_edit_select",
-    )
-
-    editing_record: Optional[dict] = None
-    if selected_report_id is not None and not owner_reports.empty:
-        match = owner_reports[owner_reports["report_id"] == int(selected_report_id)]
-        if not match.empty:
-            editing_record = match.iloc[0].to_dict()
-
-    today = datetime.now().date()
+        st.caption(
+            "Daily entries are limited to today. Weekly reports unlock on Saturdays, and monthly reports cover only the current month."
+        )
 
     def _date_or(value, fallback: date) -> date:
         if value is None:
@@ -8301,15 +8438,129 @@ def reports_page(conn):
             parsed = parsed[0]
         return pd.Timestamp(parsed).date()
 
-    def _text_seed(value) -> str:
+    def _staff_report_window_allows_edit(
+        row,
+        *,
+        today: date,
+        week_start: date,
+        week_end: date,
+        month_start: date,
+        month_end: date,
+    ) -> bool:
+        period_key = clean_text(row.get("period_type")) or ""
+        period_key = period_key.lower()
+        row_start = _date_or(row.get("period_start"), today)
+        row_end = _date_or(row.get("period_end"), row_start)
+        if period_key == "daily":
+            return row_start == today == row_end
+        if period_key == "weekly":
+            return (
+                row_start == week_start
+                and row_end == week_end
+                and today.weekday() == 5
+            )
+        if period_key == "monthly":
+            return row_start == month_start and row_end == month_end
+        return False
+
+    def _grid_rows_for_editor(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        editor_rows: list[dict[str, object]] = []
+        for entry in rows:
+            row = {key: entry.get(key) for key in REPORT_GRID_FIELDS.keys()}
+            work_date = row.get("work_done_date")
+            if work_date:
+                iso = to_iso_date(work_date)
+                if iso:
+                    try:
+                        row["work_done_date"] = datetime.strptime(
+                            iso, "%Y-%m-%d"
+                        ).date()
+                    except ValueError:
+                        row["work_done_date"] = iso
+            editor_rows.append(row)
+        return editor_rows
+
+    owner_reports = df_query(
+        conn,
+        dedent(
+            """
+            SELECT report_id, period_type, period_start, period_end, tasks, remarks, research, grid_payload, attachment_path, created_at, updated_at
+            FROM work_reports
+            WHERE user_id=?
+            ORDER BY date(period_start) DESC, report_id DESC
+            LIMIT 50
+            """
+        ),
+        (report_owner_id,),
+    )
+    record_labels: dict[int, str] = {}
+    selectable_reports = owner_reports.copy()
+    if not owner_reports.empty:
+        selectable_reports["report_id"] = selectable_reports["report_id"].apply(
+            lambda val: int(float(val))
+        )
+        for _, row in selectable_reports.iterrows():
+            rid = int(row["report_id"])
+            record_labels[rid] = (
+                f"{format_period_label(row.get('period_type'))} – "
+                f"{format_period_range(row.get('period_start'), row.get('period_end'))}"
+            )
+        if not is_admin:
+            selectable_reports["__staff_can_edit__"] = selectable_reports.apply(
+                lambda row: _staff_report_window_allows_edit(
+                    row,
+                    today=today,
+                    week_start=current_week_start,
+                    week_end=current_week_end,
+                    month_start=current_month_start,
+                    month_end=current_month_end,
+                ),
+                axis=1,
+            )
+            selectable_reports = selectable_reports[
+                selectable_reports["__staff_can_edit__"] == True  # noqa: E712
+            ].copy()
+            selectable_reports.drop(
+                columns=["__staff_can_edit__"],
+                inplace=True,
+                errors="ignore",
+            )
+
+    selectable_ids: list[int] = []
+    if not selectable_reports.empty and "report_id" in selectable_reports.columns:
+        selectable_ids = (
+            selectable_reports["report_id"].astype(int).tolist()
+        )
+
+    report_choices = [None] + selectable_ids
+
+    def _format_report_choice(value):
         if value is None:
-            return ""
+            return "➕ Create new report"
         try:
-            if pd.isna(value):
-                return ""
+            return record_labels.get(int(value), f"Report #{int(value)}")
         except Exception:
-            pass
-        return str(value)
+            return "Report"
+
+    if "report_edit_select_pending" in st.session_state:
+        pending_selection = st.session_state.pop("report_edit_select_pending")
+        if pending_selection is not None:
+            st.session_state["report_edit_select"] = pending_selection
+
+    selected_report_id = st.selectbox(
+        "Load an existing report",
+        report_choices,
+        format_func=_format_report_choice,
+        key="report_edit_select",
+    )
+
+    editing_record: Optional[dict] = None
+    if selected_report_id is not None and not selectable_reports.empty:
+        match = selectable_reports[
+            selectable_reports["report_id"] == int(selected_report_id)
+        ]
+        if not match.empty:
+            editing_record = match.iloc[0].to_dict()
 
     default_period_key = "daily"
     if editing_record:
@@ -8319,13 +8570,27 @@ def reports_page(conn):
             if seed_period in REPORT_PERIOD_OPTIONS:
                 default_period_key = seed_period
     period_keys = list(REPORT_PERIOD_OPTIONS.keys())
-    period_index = period_keys.index(default_period_key) if default_period_key in period_keys else 0
+    if not is_admin:
+        allowed_periods = ["daily"]
+        if today.weekday() == 5 or default_period_key == "weekly":
+            allowed_periods.append("weekly")
+        allowed_periods.append("monthly")
+        period_keys = [key for key in period_keys if key in allowed_periods]
+    if not period_keys:
+        period_keys = ["daily"]
+    if default_period_key not in period_keys:
+        default_period_key = period_keys[0]
+    period_index = (
+        period_keys.index(default_period_key)
+        if default_period_key in period_keys
+        else 0
+    )
 
     default_start = _date_or(editing_record.get("period_start") if editing_record else None, today)
     default_end = _date_or(editing_record.get("period_end") if editing_record else None, default_start)
-    tasks_seed = _text_seed(editing_record.get("tasks") if editing_record else None)
-    remarks_seed = _text_seed(editing_record.get("remarks") if editing_record else None)
-    research_seed = _text_seed(editing_record.get("research") if editing_record else None)
+    legacy_tasks = clean_text(editing_record.get("tasks")) if editing_record else None
+    legacy_remarks = clean_text(editing_record.get("remarks")) if editing_record else None
+    legacy_research = clean_text(editing_record.get("research")) if editing_record else None
 
     start_date = default_start
     end_date = default_end
@@ -8333,6 +8598,22 @@ def reports_page(conn):
     existing_attachment_value: Optional[str] = (
         editing_record.get("attachment_path") if editing_record else None
     )
+
+    grid_seed_rows = (
+        parse_report_grid_payload(editing_record.get("grid_payload"))
+        if editing_record
+        else []
+    )
+    if not grid_seed_rows:
+        fallback_row = _default_report_grid_row()
+        if legacy_tasks:
+            fallback_row["reported_complaints"] = legacy_tasks
+        if legacy_remarks:
+            fallback_row["details_remarks"] = legacy_remarks
+        if legacy_research:
+            fallback_row["product_details"] = legacy_research
+        if any(val not in (None, "") for val in fallback_row.values()):
+            grid_seed_rows = [fallback_row]
     existing_attachment_path = (
         resolve_upload_path(existing_attachment_value)
         if existing_attachment_value
@@ -8356,20 +8637,30 @@ def reports_page(conn):
             key="report_period_type",
         )
         if period_choice == "daily":
+            day_kwargs: dict[str, object] = {}
+            if not is_admin:
+                day_kwargs["min_value"] = today
+                day_kwargs["max_value"] = today
             day_value = st.date_input(
                 "Report date",
                 value=default_start,
                 key="report_period_daily",
+                **day_kwargs,
             )
             start_date = day_value
             end_date = day_value
         elif period_choice == "weekly":
             base_start = default_start if editing_record else today - timedelta(days=today.weekday())
             base_end = default_end if editing_record else base_start + timedelta(days=6)
+            week_kwargs: dict[str, object] = {}
+            if not is_admin:
+                week_kwargs["min_value"] = current_week_start
+                week_kwargs["max_value"] = current_week_end
             week_value = st.date_input(
                 "Week range",
                 value=(base_start, base_end),
                 key="report_period_weekly",
+                **week_kwargs,
             )
             if isinstance(week_value, (list, tuple)) and len(week_value) == 2:
                 start_date, end_date = week_value
@@ -8385,10 +8676,15 @@ def reports_page(conn):
                 month_seed = base_month.replace(day=1)
             except Exception:
                 month_seed = date(today.year, today.month, 1)
+            month_kwargs: dict[str, object] = {}
+            if not is_admin:
+                month_kwargs["min_value"] = current_month_start
+                month_kwargs["max_value"] = current_month_end
             month_value = st.date_input(
                 "Month",
                 value=month_seed,
                 key="report_period_monthly",
+                **month_kwargs,
             )
             if isinstance(month_value, (list, tuple)) and month_value:
                 month_seed = month_value[0]
@@ -8406,20 +8702,67 @@ def reports_page(conn):
                 f"Selected window: {format_period_range(to_iso_date(start_date), to_iso_date(end_date))}"
             )
 
-        tasks_input = st.text_area(
-            "Tasks completed",
-            value=tasks_seed,
-            help="Summarize what was delivered in this period.",
+        st.caption(
+            "Log service progress in a spreadsheet-style grid. Add rows for each customer or job completed."
         )
-        remarks_input = st.text_area(
-            "Remarks / blockers",
-            value=remarks_seed,
-            help="Track follow-ups, risks, or additional notes.",
-        )
-        research_input = st.text_area(
-            "Research / learnings",
-            value=research_seed,
-            help="Capture findings, experiments, or ideas to explore next.",
+        seed_for_editor = grid_seed_rows or [_default_report_grid_row()]
+        editor_seed = _grid_rows_for_editor(seed_for_editor)
+        if not editor_seed:
+            editor_seed = _grid_rows_for_editor([_default_report_grid_row()])
+        grid_df_seed = pd.DataFrame(editor_seed, columns=REPORT_GRID_FIELDS.keys())
+        column_config = {
+            "customer_name": st.column_config.TextColumn(
+                REPORT_GRID_FIELDS["customer_name"]["label"],
+                help="Who received the service work.",
+            ),
+            "reported_complaints": st.column_config.TextColumn(
+                REPORT_GRID_FIELDS["reported_complaints"]["label"],
+                help="Issues raised by the customer.",
+            ),
+            "product_details": st.column_config.TextColumn(
+                REPORT_GRID_FIELDS["product_details"]["label"],
+                help="Model, serial, or generator description.",
+            ),
+            "details_remarks": st.column_config.TextColumn(
+                REPORT_GRID_FIELDS["details_remarks"]["label"],
+                help="Technician notes or actions taken.",
+            ),
+            "status": st.column_config.TextColumn(
+                REPORT_GRID_FIELDS["status"]["label"],
+                help="Current job status (e.g. Completed, Pending).",
+            ),
+            "quotation_tk": st.column_config.NumberColumn(
+                REPORT_GRID_FIELDS["quotation_tk"]["label"],
+                help="Quoted amount in Taka.",
+                format="%.2f",
+                step=100.0,
+            ),
+            "bill_tk": st.column_config.NumberColumn(
+                REPORT_GRID_FIELDS["bill_tk"]["label"],
+                help="Billed amount in Taka.",
+                format="%.2f",
+                step=100.0,
+            ),
+            "work_done_date": st.column_config.DateColumn(
+                REPORT_GRID_FIELDS["work_done_date"]["label"],
+                help="When the work was completed.",
+                format="DD-MM-YYYY",
+            ),
+            "donation_cost": st.column_config.NumberColumn(
+                REPORT_GRID_FIELDS["donation_cost"]["label"],
+                help="Any donation or complimentary cost.",
+                format="%.2f",
+                step=100.0,
+            ),
+        }
+        report_grid_df = st.data_editor(
+            grid_df_seed,
+            column_config=column_config,
+            column_order=list(REPORT_GRID_FIELDS.keys()),
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="report_grid_editor",
         )
         remove_attachment = False
         attachment_upload = None
@@ -8451,6 +8794,7 @@ def reports_page(conn):
 
     if submitted:
         cleanup_path: Optional[str] = None
+        grid_rows_to_store: list[dict[str, object]] = []
         try:
             normalized_key, normalized_start, normalized_end = normalize_report_window(
                 period_choice, start_date, end_date
@@ -8460,7 +8804,46 @@ def reports_page(conn):
         else:
             attachment_to_store = _ATTACHMENT_UNCHANGED
             attachment_save_failed = False
-            if attachment_upload is not None:
+            save_allowed = True
+            grid_records: list[dict[str, object]] = []
+            if isinstance(report_grid_df, pd.DataFrame):
+                grid_records = (
+                    report_grid_df.replace({pd.NaT: None}).to_dict("records")
+                )
+            elif isinstance(report_grid_df, list):
+                grid_records = report_grid_df
+            normalized_grid_rows = _normalize_grid_rows(grid_records)
+            if not normalized_grid_rows:
+                st.error("Add at least one row to the report.")
+                save_allowed = False
+            else:
+                grid_rows_to_store = normalized_grid_rows
+            if not is_admin:
+                validation_error: Optional[str] = None
+                if normalized_key == "daily":
+                    if normalized_start != today or normalized_end != today:
+                        validation_error = "Daily reports can only be submitted for today."
+                elif normalized_key == "weekly":
+                    if today.weekday() != 5:
+                        validation_error = "Weekly reports can only be submitted on Saturdays."
+                    elif not (
+                        normalized_start == current_week_start
+                        and normalized_end == current_week_end
+                    ):
+                        validation_error = (
+                            "Weekly reports must cover the current week (Monday to Sunday)."
+                        )
+                elif normalized_key == "monthly":
+                    if not (
+                        normalized_start == current_month_start
+                        and normalized_end == current_month_end
+                    ):
+                        validation_error = "Monthly reports must cover the current month."
+                if validation_error:
+                    st.error(validation_error)
+                    save_allowed = False
+
+            if save_allowed and attachment_upload is not None:
                 identifier = (
                     f"user{report_owner_id}_{normalized_key}_{normalized_start.isoformat()}"
                 )
@@ -8475,11 +8858,11 @@ def reports_page(conn):
                 else:
                     st.error("Attachment could not be saved. Please try again.")
                     attachment_save_failed = True
-            elif remove_attachment and existing_attachment_value:
+            elif save_allowed and remove_attachment and existing_attachment_value:
                 attachment_to_store = None
                 cleanup_path = existing_attachment_value
 
-            if not attachment_save_failed:
+            if save_allowed and not attachment_save_failed and grid_rows_to_store:
                 try:
                     saved_id = upsert_work_report(
                         conn,
@@ -8488,9 +8871,10 @@ def reports_page(conn):
                         period_type=normalized_key,
                         period_start=normalized_start,
                         period_end=normalized_end,
-                        tasks=tasks_input,
-                        remarks=remarks_input,
-                        research=research_input,
+                        tasks=None,
+                        remarks=None,
+                        research=None,
+                        grid_rows=grid_rows_to_store,
                         attachment_path=attachment_to_store,
                         current_attachment=existing_attachment_value,
                     )
@@ -8600,7 +8984,7 @@ def reports_page(conn):
         dedent(
             f"""
             SELECT wr.report_id, wr.user_id, wr.period_type, wr.period_start, wr.period_end,
-                   wr.tasks, wr.remarks, wr.research, wr.attachment_path, wr.created_at, wr.updated_at,
+                   wr.tasks, wr.remarks, wr.research, wr.grid_payload, wr.attachment_path, wr.created_at, wr.updated_at,
                    u.username
             FROM work_reports wr
             JOIN users u ON u.user_id = wr.user_id
@@ -8621,43 +9005,95 @@ def reports_page(conn):
         axis=1,
     )
 
-    display = history_df.copy()
-    display["Owner"] = display["username"]
-    display["Type"] = display["period_type"].apply(format_period_label)
-    display["Period"] = display.apply(
-        lambda row: format_period_range(row.get("period_start"), row.get("period_end")),
+    history_df["grid_rows"] = history_df.apply(
+        lambda row: parse_report_grid_payload(row.get("grid_payload")),
         axis=1,
     )
-    display["Attachment"] = display["attachment_path"].apply(
-        lambda value: "📎" if clean_text(value) else "—"
-    )
-    for col in ("created_at", "updated_at"):
-        display[col] = pd.to_datetime(display[col], errors="coerce").dt.strftime(DATE_FMT)
-    for col in ("tasks", "remarks", "research"):
-        display[col] = display[col].apply(_display_text)
-    display.rename(
-        columns={
-            "tasks": "Tasks",
-            "remarks": "Remarks",
-            "research": "Research",
-            "created_at": "Created",
-            "updated_at": "Updated",
-        },
-        inplace=True,
-    )
-    table = display[
-        ["Owner", "Type", "Period", "Tasks", "Remarks", "Research", "Attachment", "Created", "Updated"]
-    ]
-    st.dataframe(table, use_container_width=True)
 
-    csv_data = table.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download filtered reports",
-        data=csv_data,
-        file_name="work_reports.csv",
-        mime="text/csv",
-        key="reports_download",
+    def _legacy_rows(row: pd.Series) -> list[dict[str, object]]:
+        fallback = _default_report_grid_row()
+        legacy_flag = False
+        if clean_text(row.get("tasks")):
+            fallback["reported_complaints"] = clean_text(row.get("tasks"))
+            legacy_flag = True
+        if clean_text(row.get("remarks")):
+            fallback["details_remarks"] = clean_text(row.get("remarks"))
+            legacy_flag = True
+        if clean_text(row.get("research")):
+            fallback["product_details"] = clean_text(row.get("research"))
+            legacy_flag = True
+        return [fallback] if legacy_flag else []
+
+    history_df["grid_rows"] = history_df.apply(
+        lambda row: row.get("grid_rows") or _legacy_rows(row),
+        axis=1,
     )
+
+    entry_records: list[dict[str, object]] = []
+    download_records: list[dict[str, object]] = []
+    for _, record in history_df.iterrows():
+        owner = record.get("username") or f"User #{int(record.get('user_id'))}"
+        cadence_label = format_period_label(record.get("period_type"))
+        period_label = format_period_range(
+            record.get("period_start"), record.get("period_end")
+        )
+        grid_rows = record.get("grid_rows") or []
+        display_df = format_report_grid_rows_for_display(
+            grid_rows, empty_ok=True
+        )
+        if display_df.empty:
+            continue
+        for entry in display_df.to_dict("records"):
+            entry_records.append(entry)
+            download_entry = {
+                "Team member": owner,
+                "Cadence": cadence_label,
+                "Period": period_label,
+            }
+            download_entry.update(entry)
+            download_records.append(download_entry)
+
+    entry_table = pd.DataFrame(entry_records)
+    if not entry_table.empty:
+        for key, config in REPORT_GRID_FIELDS.items():
+            label = config["label"]
+            if label not in entry_table.columns:
+                entry_table[label] = pd.NA
+            if config["type"] == "number":
+                entry_table[label] = pd.to_numeric(
+                    entry_table[label], errors="coerce"
+                )
+            else:
+                entry_table[label] = entry_table[label].fillna("")
+        entry_table = entry_table.reindex(columns=REPORT_GRID_DISPLAY_COLUMNS)
+        st.dataframe(entry_table, use_container_width=True)
+    else:
+        st.info(
+            "No structured report entries are available for the selected filters."
+        )
+
+    download_df = pd.DataFrame(download_records)
+    if not download_df.empty:
+        desired_columns = [
+            "Team member",
+            "Cadence",
+            "Period",
+            *REPORT_GRID_DISPLAY_COLUMNS,
+        ]
+        download_df = download_df.reindex(columns=desired_columns, fill_value="")
+    elif not entry_table.empty:
+        download_df = entry_table.reindex(
+            columns=REPORT_GRID_DISPLAY_COLUMNS, fill_value=""
+        )
+    if not download_df.empty:
+        csv_data = download_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download filtered reports",
+            data=csv_data,
+            file_name="work_reports.csv",
+            mime="text/csv",
+            key="reports_download",
+        )
 
     cadence_summary = (
         history_df.assign(label=history_df["period_type"].apply(format_period_label))
@@ -8700,12 +9136,22 @@ def reports_page(conn):
                 f"({format_period_range(row.get('period_start'), row.get('period_end'))})"
             )
             with st.expander(header, expanded=False):
-                st.markdown("**Tasks completed**")
-                st.write(_display_text(row.get("tasks")) or "—")
-                st.markdown("**Remarks / blockers**")
-                st.write(_display_text(row.get("remarks")) or "—")
-                st.markdown("**Research / learnings**")
-                st.write(_display_text(row.get("research")) or "—")
+                grid_df = format_report_grid_rows_for_display(
+                    row.get("grid_rows"), empty_ok=True
+                )
+                if not grid_df.empty:
+                    st.dataframe(grid_df, use_container_width=True)
+                else:
+                    st.write("No structured entries recorded for this report.")
+                    legacy_blocks = [
+                        ("Tasks completed", _display_text(row.get("tasks"))),
+                        ("Remarks / blockers", _display_text(row.get("remarks"))),
+                        ("Research / learnings", _display_text(row.get("research"))),
+                    ]
+                    for title, text in legacy_blocks:
+                        if text:
+                            st.markdown(f"**{title}**")
+                            st.write(text)
                 created_label = format_period_range(
                     row.get("created_at"), row.get("created_at")
                 )
