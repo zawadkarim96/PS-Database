@@ -8463,22 +8463,6 @@ def reports_page(conn):
             return row_start == month_start and row_end == month_end
         return False
 
-    def _grid_rows_for_editor(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-        editor_rows: list[dict[str, object]] = []
-        for entry in rows:
-            row = {key: entry.get(key) for key in REPORT_GRID_FIELDS.keys()}
-            work_date = row.get("work_done_date")
-            if work_date:
-                iso = to_iso_date(work_date)
-                if iso:
-                    try:
-                        row["work_done_date"] = datetime.strptime(
-                            iso, "%Y-%m-%d"
-                        ).date()
-                    except ValueError:
-                        row["work_done_date"] = iso
-            editor_rows.append(row)
-        return editor_rows
 
     owner_reports = df_query(
         conn,
@@ -8561,7 +8545,6 @@ def reports_page(conn):
         ]
         if not match.empty:
             editing_record = match.iloc[0].to_dict()
-
     default_period_key = "daily"
     if editing_record:
         seed_period = clean_text(editing_record.get("period_type"))
@@ -8805,19 +8788,7 @@ def reports_page(conn):
             attachment_to_store = _ATTACHMENT_UNCHANGED
             attachment_save_failed = False
             save_allowed = True
-            grid_records: list[dict[str, object]] = []
-            if isinstance(report_grid_df, pd.DataFrame):
-                grid_records = (
-                    report_grid_df.replace({pd.NaT: None}).to_dict("records")
-                )
-            elif isinstance(report_grid_df, list):
-                grid_records = report_grid_df
-            normalized_grid_rows = _normalize_grid_rows(grid_records)
-            if not normalized_grid_rows:
-                st.error("Add at least one row to the report.")
-                save_allowed = False
-            else:
-                grid_rows_to_store = normalized_grid_rows
+
             if not is_admin:
                 validation_error: Optional[str] = None
                 if normalized_key == "daily":
@@ -8862,7 +8833,7 @@ def reports_page(conn):
                 attachment_to_store = None
                 cleanup_path = existing_attachment_value
 
-            if save_allowed and not attachment_save_failed and grid_rows_to_store:
+
                 try:
                     saved_id = upsert_work_report(
                         conn,
