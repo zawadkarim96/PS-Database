@@ -25,7 +25,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - defensive for bundled test imports
     import importlib.util
 
-    _storage_module_path = Path(__file__).resolve().parent / "storage_paths.py"
+    _storage_module_path = Path(__file__).resolve().parents[2] / "storage_paths.py"
     spec = importlib.util.spec_from_file_location("storage_paths", _storage_module_path)
     module = importlib.util.module_from_spec(spec)
     loader = spec.loader
@@ -34,16 +34,20 @@ except ModuleNotFoundError:  # pragma: no cover - defensive for bundled test imp
     loader.exec_module(module)
     get_storage_dir = module.get_storage_dir
 
+from .config import settings
+from .db import database_path, get_connection as _shared_get_connection
+from .utils import render_signature
+
 # ---------- Config ----------
 load_dotenv()
 DEFAULT_BASE_DIR = get_storage_dir()
-BASE_DIR = Path(os.getenv("APP_STORAGE_DIR", DEFAULT_BASE_DIR))
+BASE_DIR = settings.base_dir
 BASE_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
-DATE_FMT = "%d-%m-%Y"
-CURRENCY_SYMBOL = os.getenv("APP_CURRENCY_SYMBOL", "₹")
+DB_PATH = str(database_path())
+DATE_FMT = settings.date_format
+CURRENCY_SYMBOL = settings.currency_symbol
 
-UPLOADS_DIR = BASE_DIR / "uploads"
+UPLOADS_DIR = settings.uploads
 DELIVERY_ORDER_DIR = UPLOADS_DIR / "delivery_orders"
 SERVICE_DOCS_DIR = UPLOADS_DIR / "service_documents"
 MAINTENANCE_DOCS_DIR = UPLOADS_DIR / "maintenance_documents"
@@ -313,6 +317,9 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT UNIQUE,
     pass_hash TEXT,
     role TEXT DEFAULT 'staff',
+    display_name TEXT,
+    designation TEXT,
+    phone TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS customers (
@@ -515,9 +522,7 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, 
 
 # ---------- Helpers ----------
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+    return _shared_get_connection()
 
 def init_schema(conn):
     ensure_upload_dirs()
@@ -571,6 +576,9 @@ def ensure_schema_upgrades(conn):
     add_column("import_history", "imported_by", "INTEGER")
     add_column("work_reports", "grid_payload", "TEXT")
     add_column("work_reports", "attachment_path", "TEXT")
+    add_column("users", "display_name", "TEXT")
+    add_column("users", "designation", "TEXT")
+    add_column("users", "phone", "TEXT")
 
     cur = conn.execute(
         """
@@ -9232,7 +9240,7 @@ def reports_page(conn):
                 st.caption(f"Logged on {created_label} • Last updated {updated_label}")
 
 # ---------- Main ----------
-def main():
+def main(page_override: Optional[str] = None, disable_nav: bool = False):
     init_ui()
     conn = get_conn()
     init_schema(conn)
@@ -9243,38 +9251,45 @@ def main():
 
     user = st.session_state.user or {}
     role = user.get("role")
-    with st.sidebar:
-        if role == "admin":
-            pages = [
-                "Dashboard",
-                "Customers",
-                "Customer Summary",
-                "Scraps",
-                "Warranties",
-                "Import",
-                "Reports",
-                "Duplicates",
-                "Users (Admin)",
-                "Maintenance and Service",
-            ]
-        else:
-            pages = [
-                "Dashboard",
-                "Customers",
-                "Customer Summary",
-                "Warranties",
-                "Import",
-                "Reports",
-                "Maintenance and Service",
-            ]
-        if st.session_state.page not in pages:
-            st.session_state.page = pages[0]
-        current_index = pages.index(st.session_state.page)
-        page = st.radio("Navigate", pages, index=current_index, key="nav_page")
-        st.session_state.page = page
+    if disable_nav and page_override:
+        page = page_override
+    else:
+        with st.sidebar:
+            if role == "admin":
+                pages = [
+                    "Dashboard",
+                    "Customers",
+                    "Customer Summary",
+                    "Scraps",
+                    "Warranties",
+                    "Import",
+                    "Reports",
+                    "Duplicates",
+                    "Users (Admin)",
+                    "Maintenance and Service",
+                ]
+            else:
+                pages = [
+                    "Dashboard",
+                    "Customers",
+                    "Customer Summary",
+                    "Warranties",
+                    "Import",
+                    "Reports",
+                    "Maintenance and Service",
+                ]
+            if st.session_state.page not in pages:
+                st.session_state.page = pages[0]
+            current_index = pages.index(st.session_state.page)
+            page = st.radio("Navigate", pages, index=current_index, key="nav_page")
+            st.session_state.page = page
 
     show_expiry_notifications(conn)
+    _render_named_page(page, conn)
+    render_signature()
 
+
+def _render_named_page(page: str, conn) -> None:
     if page == "Dashboard":
         dashboard(conn)
     elif page == "Customers":
@@ -9295,8 +9310,21 @@ def main():
         users_admin_page(conn)
     elif page == "Maintenance and Service":
         service_maintenance_page(conn)
+    else:
+        st.warning("Unknown page requested.")
 
-if _streamlit_runtime_active():
-    main()
-elif __name__ == "__main__":
+
+def render_page(page_name: str):
+    init_ui()
+    conn = get_conn()
+    init_schema(conn)
+    login_box(conn)
+    if not st.session_state.get("user"):
+        st.stop()
+    show_expiry_notifications(conn)
+    _render_named_page(page_name, conn)
+    render_signature()
+
+
+if __name__ == "__main__":
     _bootstrap_streamlit_app()

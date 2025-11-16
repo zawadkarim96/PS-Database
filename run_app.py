@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convenience launcher for the PS Service Software desktop app.
+"""Convenience launcher for the PS Business Suite desktop app.
 
 Running this script will create (or reuse) a local virtual environment in
-```.venv``` next to the repository, install the dependencies declared in
+``.venv`` next to the repository, install the dependencies declared in
 ``requirements.txt``, and finally launch the Streamlit app inside the
 pywebview-powered desktop shell. Subsequent runs reuse the cached
 environment unless the requirements file changes. It is intended to provide a

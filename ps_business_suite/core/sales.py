@@ -25,6 +25,10 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from .config import settings
+from .db import database_path
+from .utils import render_signature
+
 from ps_sales import (
     AccountLockoutService,
     NotificationScheduler,
@@ -40,6 +44,10 @@ from ps_sales import (
 # Global application services
 # ---------------------------------------------------------------------------
 
+
+os.environ.setdefault("PS_SALES_DATA_DIR", str((settings.base_dir / "sales_data").expanduser()))
+db_url = f"sqlite:///{database_path().as_posix()}"
+os.environ.setdefault("PS_SALES_DB_URL", db_url)
 
 CONFIG = load_config()
 DATABASE = Database.from_config(CONFIG)
@@ -2247,6 +2255,10 @@ def mark_notification_read(notification_id: int) -> None:
         )
 
 
+def init_schema(_conn=None) -> None:
+    init_db()
+
+
 def get_user_notifications(user_id: int, include_read: bool = False) -> pd.DataFrame:
     query = "SELECT * FROM notifications WHERE user_id=?"
     params: List = [user_id]
@@ -3159,7 +3171,7 @@ def render_dashboard(user: Dict) -> None:
     notifications_df = get_user_notifications(user["user_id"], include_read=False)
     st.header("Revenue & Follow-up Dashboard")
     st.markdown(
-        "<div style='text-align:right;font-size:0.75rem;opacity:0.7;'>by ZAD</div>",
+        "<div style='text-align:right;font-size:0.75rem;opacity:0.7;'>by Zad</div>",
         unsafe_allow_html=True,
     )
     if user["role"] == "admin" and not notifications_df.empty:
@@ -5666,8 +5678,9 @@ def render_settings() -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    st.set_page_config(page_title="PS Sales Manager", layout="wide")
+def main(configure_page: bool = True) -> None:
+    if configure_page:
+        st.set_page_config(page_title="PS Sales Manager", layout="wide")
     if "user" not in st.session_state:
         login_screen()
         return
@@ -5695,6 +5708,12 @@ def main() -> None:
         render_notifications(user)
     elif page == "settings":
         render_settings()
+
+
+def render_page() -> None:
+    init_db()
+    main(configure_page=False)
+    render_signature()
 
 
 if __name__ == "__main__":
