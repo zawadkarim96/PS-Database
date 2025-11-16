@@ -115,9 +115,9 @@ def test_scrap_record_completion_moves_out_of_scraps(db_conn, app_module):
     assert complete_after == 1
 
 
-def test_streamlit_flag_options_from_env_uses_port_and_host(monkeypatch, app_module):
+def test_streamlit_flag_options_from_env_uses_port_and_bind_address(monkeypatch, app_module):
     monkeypatch.setenv("PORT", "9999")
-    monkeypatch.setenv("HOST", "1.2.3.4")
+    monkeypatch.setenv("BIND_ADDRESS", "1.2.3.4")
     flags = app_module._streamlit_flag_options_from_env()
     assert flags["server.port"] == 9999
     assert flags["server.address"] == "1.2.3.4"
@@ -132,7 +132,6 @@ def test_streamlit_flag_options_from_env_respects_headless(monkeypatch, app_modu
 
 def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_module):
     monkeypatch.setenv("PORT", "not-a-number")
-    monkeypatch.delenv("HOST", raising=False)
     monkeypatch.delenv("BIND_ADDRESS", raising=False)
     monkeypatch.delenv("RENDER_EXTERNAL_HOSTNAME", raising=False)
     monkeypatch.delenv("STREAMLIT_SERVER_HEADLESS", raising=False)
@@ -144,7 +143,6 @@ def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_m
 
 def test_streamlit_flag_options_from_env_supports_streamlit_specific_env(monkeypatch, app_module):
     monkeypatch.delenv("PORT", raising=False)
-    monkeypatch.delenv("HOST", raising=False)
     monkeypatch.delenv("BIND_ADDRESS", raising=False)
     monkeypatch.setenv("STREAMLIT_SERVER_PORT", "8123")
     monkeypatch.setenv("STREAMLIT_SERVER_ADDRESS", "10.10.0.5")
@@ -165,13 +163,30 @@ def test_ps_suite_streamlit_flags_ignore_render_hostname(monkeypatch):
 
     from ps_business_suite import app as suite_app
 
-    monkeypatch.delenv("HOST", raising=False)
     monkeypatch.delenv("BIND_ADDRESS", raising=False)
     monkeypatch.setenv("RENDER_EXTERNAL_HOSTNAME", "myapp.onrender.com")
 
     flags = suite_app._streamlit_flag_options_from_env()
     assert flags["server.address"] == "0.0.0.0"
     assert flags["browser.serverAddress"] == "myapp.onrender.com"
+
+
+def test_ps_suite_streamlit_flags_use_railway_domain(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from ps_business_suite import app as suite_app
+
+    monkeypatch.delenv("BIND_ADDRESS", raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "demo.up.railway.app")
+
+    flags = suite_app._streamlit_flag_options_from_env()
+    assert flags["server.address"] == "0.0.0.0"
+    assert flags["browser.serverAddress"] == "demo.up.railway.app"
 
 
 def test_export_database_to_excel_has_curated_sheets(db_conn, app_module):
