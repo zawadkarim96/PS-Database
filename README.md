@@ -68,7 +68,7 @@ The CRM logic now ensures the shared `users` table contains the extra `display_n
 2. Runs `ps_business_suite/core/sales.init_schema(conn)` to create Sales tables in the same file.
 3. Keeps uploads under `<APP_STORAGE_DIR>/uploads` and Sales attachments under `<APP_STORAGE_DIR>/sales_data/uploads`.
 
-To migrate an existing PS Mini CRM database, copy `ps_crm.db` to the storage directory and rename it to `ps_business_suite.db`. Run the new app once; the upgrade routine will add the new Sales columns automatically.
+Existing installations that already have a `ps_crm.db` file are detected automatically. On first launch the app moves that legacy file into place as `ps_business_suite.db` so the merged experience immediately shows historical records. The upgrade routine then adds the new Sales columns automatically.
 
 ## Combined features
 

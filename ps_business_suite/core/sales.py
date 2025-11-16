@@ -40,6 +40,10 @@ from ps_sales import (
 )
 
 
+DELIVERY_TABLE = "sales_delivery_orders"
+LEGACY_DELIVERY_TABLE = "delivery_orders"
+
+
 # ---------------------------------------------------------------------------
 # Global application services
 # ---------------------------------------------------------------------------
@@ -1448,6 +1452,137 @@ PRODUCT_LIST_SUBQUERY = textwrap.dedent(
 )
 
 
+def _sales_delivery_schema_sql(table_name: str = DELIVERY_TABLE) -> str:
+    return textwrap.dedent(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            do_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type      TEXT NOT NULL CHECK(source_type IN ('work_order', 'quotation', 'third_party')),
+            salesperson_id   INTEGER NOT NULL,
+            work_order_id    INTEGER,
+            quotation_id     INTEGER,
+            third_party_name TEXT,
+            do_number        TEXT NOT NULL,
+            upload_date      TEXT NOT NULL,
+            pdf_path         TEXT,
+            price            REAL NOT NULL DEFAULT 0,
+            payment_received INTEGER NOT NULL DEFAULT 0,
+            payment_date     TEXT,
+            notes            TEXT,
+            receipt_path     TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(work_order_id) REFERENCES work_orders(work_order_id) ON DELETE SET NULL,
+            FOREIGN KEY(quotation_id) REFERENCES quotations(quotation_id) ON DELETE SET NULL,
+            FOREIGN KEY(salesperson_id) REFERENCES users(user_id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
+def _sales_delivery_rebuild_sql(table_name: str = DELIVERY_TABLE) -> str:
+    return textwrap.dedent(
+        f"""
+        ALTER TABLE {table_name} RENAME TO {table_name}_old;
+
+        CREATE TABLE {table_name} (
+            do_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type      TEXT NOT NULL CHECK(source_type IN ('work_order', 'quotation', 'third_party')),
+            salesperson_id   INTEGER NOT NULL,
+            work_order_id    INTEGER,
+            quotation_id     INTEGER,
+            third_party_name TEXT,
+            do_number        TEXT NOT NULL,
+            upload_date      TEXT NOT NULL,
+            pdf_path         TEXT,
+            price            REAL NOT NULL DEFAULT 0,
+            payment_received INTEGER NOT NULL DEFAULT 0,
+            payment_date     TEXT,
+            notes            TEXT,
+            receipt_path     TEXT,
+            created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(work_order_id) REFERENCES work_orders(work_order_id) ON DELETE SET NULL,
+            FOREIGN KEY(quotation_id) REFERENCES quotations(quotation_id) ON DELETE SET NULL,
+            FOREIGN KEY(salesperson_id) REFERENCES users(user_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO {table_name}(
+            do_id, source_type, salesperson_id, work_order_id, quotation_id,
+            third_party_name, do_number, upload_date, pdf_path, price,
+            payment_received, payment_date, notes, receipt_path, created_at
+        )
+        SELECT
+            old.do_id,
+            'work_order',
+            q.salesperson_id,
+            old.work_order_id,
+            w.quotation_id,
+            NULL,
+            old.do_number,
+            old.upload_date,
+            old.pdf_path,
+            old.price,
+            old.payment_received,
+            old.payment_date,
+            old.notes,
+            NULL,
+            COALESCE(old.created_at, datetime('now'))
+        FROM {table_name}_old old
+        JOIN work_orders w ON w.work_order_id = old.work_order_id
+        JOIN quotations q ON q.quotation_id = w.quotation_id;
+
+        DROP TABLE {table_name}_old;
+        """
+    )
+
+
+def _looks_like_sales_delivery_table(columns: set[str]) -> bool:
+    if not columns:
+        return False
+    if "customer_id" in columns:
+        return False
+    return any(
+        column in columns
+        for column in ("work_order_id", "salesperson_id", "source_type", "do_id")
+    )
+
+
+def _ensure_sales_delivery_orders_table(cur: sqlite3.Cursor) -> None:
+    def table_exists(name: str) -> bool:
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        )
+        return cur.fetchone() is not None
+
+    def table_columns(name: str) -> set[str]:
+        cur.execute(f"PRAGMA table_info({name})")
+        return {row[1] for row in cur.fetchall()}
+
+    has_new_table = table_exists(DELIVERY_TABLE)
+    if not has_new_table and table_exists(LEGACY_DELIVERY_TABLE):
+        legacy_columns = table_columns(LEGACY_DELIVERY_TABLE)
+        if _looks_like_sales_delivery_table(legacy_columns):
+            cur.execute(
+                f"ALTER TABLE {LEGACY_DELIVERY_TABLE} RENAME TO {DELIVERY_TABLE}"
+            )
+            has_new_table = True
+
+    if not has_new_table:
+        cur.executescript(_sales_delivery_schema_sql(DELIVERY_TABLE))
+        has_new_table = True
+
+    columns = table_columns(DELIVERY_TABLE) if has_new_table else set()
+    if not columns:
+        return
+
+    if "source_type" not in columns and "work_order_id" in columns:
+        cur.executescript(_sales_delivery_rebuild_sql(DELIVERY_TABLE))
+        columns = table_columns(DELIVERY_TABLE)
+
+    if "receipt_path" not in columns:
+        cur.execute(f"ALTER TABLE {DELIVERY_TABLE} ADD COLUMN receipt_path TEXT")
+
+
 def init_db() -> None:
     with get_cursor() as cur:
         cur.executescript(
@@ -1541,20 +1676,7 @@ def init_db() -> None:
                 FOREIGN KEY(quotation_id) REFERENCES quotations(quotation_id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS delivery_orders (
-                do_id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_order_id    INTEGER NOT NULL,
-                do_number        TEXT NOT NULL,
-                upload_date      TEXT NOT NULL,
-                pdf_path         TEXT,
-                price            REAL NOT NULL DEFAULT 0,
-                payment_received INTEGER NOT NULL DEFAULT 0,
-                payment_date     TEXT,
-                notes            TEXT,
-                receipt_path     TEXT,
-                created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY(work_order_id) REFERENCES work_orders(work_order_id) ON DELETE CASCADE
-            );
+            {delivery_table_sql}
 
             CREATE TABLE IF NOT EXISTS quotation_letters (
                 letter_id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1613,7 +1735,7 @@ def init_db() -> None:
                 value TEXT NOT NULL
             );
             """
-        )
+        ).format(delivery_table_sql=_sales_delivery_schema_sql())
         cur.execute("PRAGMA table_info(users)")
         user_columns = {row[1] for row in cur.fetchall()}
         if "display_name" not in user_columns:
@@ -1797,68 +1919,7 @@ def init_db() -> None:
                 )
             )
 
-        cur.execute("PRAGMA table_info(delivery_orders)")
-        delivery_columns = {row[1] for row in cur.fetchall()}
-        if "source_type" not in delivery_columns:
-            cur.executescript(
-                textwrap.dedent(
-                    """
-                    ALTER TABLE delivery_orders RENAME TO delivery_orders_old;
-
-                    CREATE TABLE delivery_orders (
-                        do_id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                        source_type      TEXT NOT NULL CHECK(source_type IN ('work_order', 'quotation', 'third_party')),
-                        salesperson_id   INTEGER NOT NULL,
-                        work_order_id    INTEGER,
-                        quotation_id     INTEGER,
-                        third_party_name TEXT,
-                        do_number        TEXT NOT NULL,
-                        upload_date      TEXT NOT NULL,
-                        pdf_path         TEXT,
-                        price            REAL NOT NULL DEFAULT 0,
-                        payment_received INTEGER NOT NULL DEFAULT 0,
-                        payment_date     TEXT,
-                        notes            TEXT,
-                        receipt_path     TEXT,
-                        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-                        FOREIGN KEY(work_order_id) REFERENCES work_orders(work_order_id) ON DELETE SET NULL,
-                        FOREIGN KEY(quotation_id) REFERENCES quotations(quotation_id) ON DELETE SET NULL,
-                        FOREIGN KEY(salesperson_id) REFERENCES users(user_id) ON DELETE CASCADE
-                    );
-
-                    INSERT INTO delivery_orders(
-                        do_id, source_type, salesperson_id, work_order_id, quotation_id,
-                        third_party_name, do_number, upload_date, pdf_path, price,
-                        payment_received, payment_date, notes, receipt_path, created_at
-                    )
-                    SELECT
-                        old.do_id,
-                        'work_order',
-                        q.salesperson_id,
-                        old.work_order_id,
-                        w.quotation_id,
-                        NULL,
-                        old.do_number,
-                        old.upload_date,
-                        old.pdf_path,
-                        old.price,
-                        old.payment_received,
-                        old.payment_date,
-                        old.notes,
-                        NULL,
-                        old.created_at
-                    FROM delivery_orders_old old
-                    JOIN work_orders w ON w.work_order_id = old.work_order_id
-                    JOIN quotations q ON q.quotation_id = w.quotation_id;
-
-                    DROP TABLE delivery_orders_old;
-                    """
-                )
-            )
-            cur.execute("PRAGMA table_info(delivery_orders)")
-            delivery_columns = {row[1] for row in cur.fetchall()}
-        if "receipt_path" not in delivery_columns:
-            cur.execute("ALTER TABLE delivery_orders ADD COLUMN receipt_path TEXT")
+        _ensure_sales_delivery_orders_table(cur)
 
     with get_cursor() as cur:
         cur.executemany(
@@ -2175,12 +2236,12 @@ def export_data_frames() -> Dict[str, pd.DataFrame]:
         """
     )
     frames["Delivery orders"] = fetchall_df(
-        """
+        f"""
         SELECT d.do_id, d.source_type, d.do_number, d.upload_date, d.price,
                d.payment_received, d.payment_date, d.receipt_path, d.notes,
                COALESCE(c.name, d.third_party_name, '—') AS company,
                q.quotation_id
-        FROM delivery_orders d
+        FROM {DELIVERY_TABLE} d
         LEFT JOIN quotations q ON q.quotation_id = COALESCE(d.quotation_id, (
             SELECT quotation_id FROM work_orders WHERE work_order_id = d.work_order_id
         ))
@@ -2829,8 +2890,8 @@ def upsert_delivery_order(data: Dict) -> int:
         if data.get("do_id"):
             cur.execute(
                 textwrap.dedent(
-                    """
-                    UPDATE delivery_orders
+                    f"""
+                    UPDATE {DELIVERY_TABLE}
                     SET source_type=?, salesperson_id=?, work_order_id=?, quotation_id=?, third_party_name=?,
                         do_number=?, upload_date=?, pdf_path=?, price=?,
                         payment_received=?, payment_date=?, notes=?, receipt_path=?
@@ -2857,8 +2918,8 @@ def upsert_delivery_order(data: Dict) -> int:
             return data["do_id"]
         cur.execute(
             textwrap.dedent(
-                """
-                INSERT INTO delivery_orders(source_type, salesperson_id, work_order_id, quotation_id, third_party_name,
+                f"""
+                INSERT INTO {DELIVERY_TABLE}(source_type, salesperson_id, work_order_id, quotation_id, third_party_name,
                     do_number, upload_date, pdf_path, price, payment_received, payment_date, notes, receipt_path)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
@@ -2950,7 +3011,7 @@ def revenue_summary(user: Dict) -> pd.DataFrame:
             COALESCE(u.display_name, u.username) AS salesperson,
             COALESCE(comp.name, d.third_party_name, 'Unassigned') AS company,
             dist.name AS district
-        FROM delivery_orders d
+        FROM {DELIVERY_TABLE} d
         LEFT JOIN work_orders w ON w.work_order_id = d.work_order_id
         LEFT JOIN quotations q ON q.quotation_id = COALESCE(d.quotation_id, w.quotation_id)
         LEFT JOIN companies comp ON comp.company_id = q.company_id
@@ -4803,18 +4864,19 @@ def render_delivery_orders(user: Dict) -> None:
         ).format(condition="WHERE q.salesperson_id=?" if user["role"] == "staff" else "")
         quotations = conn.execute(quotation_query, params).fetchall()
 
+        delivery_condition = "WHERE d.salesperson_id=?" if user["role"] == "staff" else ""
         delivery_query = textwrap.dedent(
-            """
+            f"""
             SELECT d.*, COALESCE(c.name, d.third_party_name, '—') AS company_name,
                    q.quotation_id AS linked_quotation_id
-            FROM delivery_orders d
+            FROM {DELIVERY_TABLE} d
             LEFT JOIN work_orders w ON w.work_order_id = d.work_order_id
             LEFT JOIN quotations q ON q.quotation_id = COALESCE(d.quotation_id, w.quotation_id)
             LEFT JOIN companies c ON c.company_id = q.company_id
-            {condition}
+            {delivery_condition}
             ORDER BY d.upload_date DESC
             """
-        ).format(condition="WHERE d.salesperson_id=?" if user["role"] == "staff" else "")
+        )
         delivery_orders = conn.execute(
             delivery_query, (user["user_id"],) if user["role"] == "staff" else ()
         ).fetchall()
@@ -5160,13 +5222,13 @@ def load_admin_dataset() -> pd.DataFrame:
         JOIN users u ON u.user_id = q.salesperson_id
         LEFT JOIN ({subquery}) prod ON prod.quotation_id = q.quotation_id
         LEFT JOIN work_orders w ON w.quotation_id = q.quotation_id
-        LEFT JOIN delivery_orders do_tbl ON (
+        LEFT JOIN {delivery_table} do_tbl ON (
             (do_tbl.work_order_id = w.work_order_id AND do_tbl.source_type = 'work_order')
             OR (do_tbl.quotation_id = q.quotation_id AND do_tbl.source_type = 'quotation')
         )
         ORDER BY q.quote_date DESC
         """
-    ).format(subquery=PRODUCT_LIST_SUBQUERY)
+    ).format(subquery=PRODUCT_LIST_SUBQUERY, delivery_table=DELIVERY_TABLE)
     return fetchall_df(query)
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from storage_paths import get_storage_dir
+from storage_paths import resolve_app_base_dir, resolve_database_path
 
 
 @dataclass(slots=True)
@@ -26,11 +26,8 @@ class Settings:
 
 
 load_dotenv()
-_DEFAULT_BASE = Path(get_storage_dir())
-_BASE = Path(os.getenv("APP_STORAGE_DIR", _DEFAULT_BASE)).expanduser()
-_BASE.mkdir(parents=True, exist_ok=True)
-_DB_PATH = Path(os.getenv("DB_PATH", _BASE / "ps_business_suite.db")).expanduser()
-_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_BASE = resolve_app_base_dir()
+_DB_PATH = resolve_database_path()
 
 settings = Settings(
     base_dir=_BASE,

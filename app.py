@@ -21,7 +21,11 @@ import streamlit as st
 from collections import OrderedDict
 
 try:
-    from storage_paths import get_storage_dir
+    from storage_paths import (
+        get_storage_dir,
+        resolve_app_base_dir,
+        resolve_database_path,
+    )
 except ModuleNotFoundError:  # pragma: no cover - defensive for bundled test imports
     import importlib.util
 
@@ -33,13 +37,14 @@ except ModuleNotFoundError:  # pragma: no cover - defensive for bundled test imp
         raise
     loader.exec_module(module)
     get_storage_dir = module.get_storage_dir
+    resolve_app_base_dir = module.resolve_app_base_dir
+    resolve_database_path = module.resolve_database_path
 
 # ---------- Config ----------
 load_dotenv()
 DEFAULT_BASE_DIR = get_storage_dir()
-BASE_DIR = Path(os.getenv("APP_STORAGE_DIR", DEFAULT_BASE_DIR))
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "ps_crm.db"))
+BASE_DIR = resolve_app_base_dir()
+DB_PATH = str(resolve_database_path())
 DATE_FMT = "%d-%m-%Y"
 CURRENCY_SYMBOL = os.getenv("APP_CURRENCY_SYMBOL", "₹")
 
