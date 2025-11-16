@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import streamlit as st
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ps_business_suite.core import crm, db
 
