@@ -142,6 +142,19 @@ def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_m
     assert flags["server.headless"] is True
 
 
+def test_streamlit_flag_options_from_env_supports_streamlit_specific_env(monkeypatch, app_module):
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("BIND_ADDRESS", raising=False)
+    monkeypatch.setenv("STREAMLIT_SERVER_PORT", "8123")
+    monkeypatch.setenv("STREAMLIT_SERVER_ADDRESS", "10.10.0.5")
+
+    flags = app_module._streamlit_flag_options_from_env()
+
+    assert flags["server.port"] == 8123
+    assert flags["server.address"] == "10.10.0.5"
+
+
 def test_ps_suite_streamlit_flags_ignore_render_hostname(monkeypatch):
     import sys
     from pathlib import Path
