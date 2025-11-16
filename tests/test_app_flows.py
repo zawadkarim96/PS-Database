@@ -142,6 +142,25 @@ def test_streamlit_flag_options_from_env_handles_invalid_port(monkeypatch, app_m
     assert flags["server.headless"] is True
 
 
+def test_ps_suite_streamlit_flags_ignore_render_hostname(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from ps_business_suite import app as suite_app
+
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("BIND_ADDRESS", raising=False)
+    monkeypatch.setenv("RENDER_EXTERNAL_HOSTNAME", "myapp.onrender.com")
+
+    flags = suite_app._streamlit_flag_options_from_env()
+    assert flags["server.address"] == "0.0.0.0"
+    assert flags["browser.serverAddress"] == "myapp.onrender.com"
+
+
 def test_export_database_to_excel_has_curated_sheets(db_conn, app_module):
     cur = db_conn.cursor()
     cur.execute(
