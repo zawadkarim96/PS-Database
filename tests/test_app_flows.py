@@ -1,5 +1,7 @@
 import hashlib
 import io
+import os
+from pathlib import Path
 
 import pandas as pd
 
@@ -187,6 +189,34 @@ def test_ps_suite_streamlit_flags_use_railway_domain(monkeypatch):
     flags = suite_app._streamlit_flag_options_from_env()
     assert flags["server.address"] == "0.0.0.0"
     assert flags["browser.serverAddress"] == "demo.up.railway.app"
+
+
+def test_storage_helper_promotes_legacy_database(tmp_path, monkeypatch):
+    monkeypatch.delenv("DB_PATH", raising=False)
+    monkeypatch.setenv("APP_STORAGE_DIR", str(tmp_path))
+
+    legacy_path = Path(tmp_path) / "ps_crm.db"
+    legacy_path.write_text("legacy-data")
+
+    from storage_paths import resolve_database_path
+
+    resolved = resolve_database_path()
+
+    assert resolved.name == "ps_business_suite.db"
+    assert resolved.read_text() == "legacy-data"
+    assert not legacy_path.exists()
+
+
+def test_storage_helper_honors_db_path_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "custom.db"))
+    monkeypatch.setenv("APP_STORAGE_DIR", str(tmp_path / "ignored"))
+
+    from storage_paths import resolve_database_path
+
+    resolved = resolve_database_path()
+
+    assert resolved == Path(os.getenv("DB_PATH"))
+    assert resolved.parent.exists()
 
 
 def test_export_database_to_excel_has_curated_sheets(db_conn, app_module):
