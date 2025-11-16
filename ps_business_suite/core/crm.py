@@ -2606,7 +2606,11 @@ def _streamlit_flag_options_from_env() -> dict[str, object]:
         if port and port > 0:
             flag_options["server.port"] = port
 
-    address_env = os.getenv("HOST") or os.getenv("BIND_ADDRESS")
+    address_env = (
+        os.getenv("BIND_ADDRESS")
+        or os.getenv("STREAMLIT_SERVER_ADDRESS")
+        or os.getenv("STREAMLIT_SERVER_HOST")
+    )
     flag_options["server.address"] = address_env or "0.0.0.0"
 
     headless_env = os.getenv("STREAMLIT_SERVER_HEADLESS")

@@ -57,16 +57,20 @@ def _streamlit_flag_options_from_env() -> dict[str, object]:
             flag_options["server.port"] = port
 
     address_env = (
-        os.getenv("HOST")
-        or os.getenv("BIND_ADDRESS")
+        os.getenv("BIND_ADDRESS")
         or os.getenv("STREAMLIT_SERVER_ADDRESS")
         or os.getenv("STREAMLIT_SERVER_HOST")
     )
     flag_options["server.address"] = address_env or "0.0.0.0"
 
-    external_host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    external_host = (
+        os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        or os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or os.getenv("RAILWAY_STATIC_URL")
+    )
     if external_host:
-        flag_options["browser.serverAddress"] = external_host
+        cleaned_host = external_host.split("//")[-1].split("/")[0]
+        flag_options["browser.serverAddress"] = cleaned_host
 
     headless_env = os.getenv("STREAMLIT_SERVER_HEADLESS")
     if headless_env is None:
