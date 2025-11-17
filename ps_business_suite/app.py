@@ -11,6 +11,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ps_business_suite.core import crm, db
+from ps_business_suite.core.health import register_health_route
+
+register_health_route()
 
 
 def _streamlit_runtime_active() -> bool:
