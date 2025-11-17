@@ -12,6 +12,7 @@ if __package__ in (None, ""):
 
 from ps_business_suite.core import crm, db
 from ps_business_suite.core.health import register_health_route
+from storage_paths import resolve_app_base_dir, storage_fallback_active
 
 register_health_route()
 
@@ -95,13 +96,18 @@ def _bootstrap_streamlit_app() -> None:
     try:
         from streamlit.web import bootstrap
     except Exception:  # pragma: no cover - Streamlit not installed
+        print(
+            "Streamlit is required to run the PS Business Suite. "
+            "Install dependencies with 'pip install -r requirements.txt' "
+            "and launch using 'streamlit run ps_business_suite/app.py'."
+        )
         return
 
     flag_options = _streamlit_flag_options_from_env()
     try:
         bootstrap.load_config_options(flag_options)
-    except Exception:  # pragma: no cover - defensive best effort
-        pass
+    except Exception as exc:  # pragma: no cover - defensive best effort
+        print(f"Warning: unable to load Streamlit options ({exc}). Continuing with defaults.")
 
     try:
         bootstrap.run(
@@ -110,12 +116,38 @@ def _bootstrap_streamlit_app() -> None:
             [],
             flag_options,
         )
-    except Exception:  # pragma: no cover - Streamlit bootstrap failure
-        pass
+    except Exception as exc:  # pragma: no cover - Streamlit bootstrap failure
+        print(
+            "Unable to start the Streamlit runtime automatically. "
+            "Please run 'streamlit run ps_business_suite/app.py' instead. "
+            f"Details: {exc}"
+        )
+
+
+def _log_runtime_configuration() -> None:
+    """Print the key runtime paths so platform logs show our setup."""
+
+    try:
+        base_dir = resolve_app_base_dir()
+        db_path = db.database_path()
+        print(
+            f"PS Business Suite starting with data directory: {base_dir}"
+        )
+        print(f"Using database file: {db_path}")
+    except Exception:
+        # Avoid crashing startup just because logging failed
+        return
 
 
 def main() -> None:
     st.set_page_config(page_title="PS Business Suite", layout="wide")
+    _log_runtime_configuration()
+    if storage_fallback_active():
+        st.warning(
+            "Using a temporary storage folder because the configured "
+            "APP_STORAGE_DIR was not writable. Restart the service with a "
+            "writable volume to retain data between deployments."
+        )
     db.init_shared_schema()
     crm.render_page("Dashboard")
 
