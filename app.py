@@ -98,6 +98,15 @@ REPORT_GRID_DISPLAY_COLUMNS = [
 ]
 
 
+REPORT_GRID_REQUIRED_HEADERS = [
+    config["label"] for config in REPORT_GRID_FIELDS.values()
+]
+
+REPORT_GRID_IMPORT_ROWS_KEY = "report_grid_import_rows"
+REPORT_GRID_IMPORT_CONTEXT_KEY = "report_grid_import_context"
+REPORT_GRID_IMPORT_FILENAME_KEY = "report_grid_import_filename"
+
+
 def _default_report_grid_row() -> dict[str, object]:
     row: dict[str, object] = {}
     for key, config in REPORT_GRID_FIELDS.items():
@@ -259,6 +268,59 @@ def _grid_rows_from_editor(df: Optional[pd.DataFrame]) -> list[dict[str, object]
     except Exception:
         return []
     return _normalize_grid_rows(records)
+
+
+def _grid_rows_from_excel_upload(uploaded_file) -> tuple[list[dict[str, object]], Optional[str]]:
+    """Read a ``.xlsx`` upload into normalised report grid rows."""
+
+    if uploaded_file is None:
+        return [], None
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        # ``UploadedFile`` objects expose ``seek`` but fall back gracefully if missing.
+        pass
+    try:
+        df = pd.read_excel(uploaded_file)
+    except Exception as exc:
+        return [], f"Could not read the Excel file. {exc}"
+    if df is None:
+        return [], "No data found in the uploaded file."
+    if not isinstance(df, pd.DataFrame):
+        return [], "Uploaded file could not be interpreted as a table."
+
+    normalized_columns = {
+        str(col).strip().lower(): col for col in df.columns if str(col).strip()
+    }
+    expected_mapping: dict[str, tuple[str, str]] = {
+        config["label"].strip().lower(): (key, config["label"])
+        for key, config in REPORT_GRID_FIELDS.items()
+    }
+    missing = [
+        label
+        for normalized_label, (_, label) in expected_mapping.items()
+        if normalized_label not in normalized_columns
+    ]
+    if missing:
+        missing_list = ", ".join(missing)
+        required_list = ", ".join(REPORT_GRID_REQUIRED_HEADERS)
+        return [], (
+            f"Missing required columns: {missing_list}. "
+            f"Ensure your sheet includes: {required_list}."
+        )
+
+    raw_rows: list[dict[str, object]] = []
+    for _, row in df.iterrows():
+        entry: dict[str, object] = {}
+        for normalized_label, (key, _) in expected_mapping.items():
+            source_column = normalized_columns.get(normalized_label)
+            if source_column is None:
+                continue
+            entry[key] = row.get(source_column)
+        raw_rows.append(entry)
+
+    normalized_rows = _normalize_grid_rows(raw_rows)
+    return normalized_rows, None
 
 
 def _summarize_grid_column(rows: Iterable[dict[str, object]], key: str) -> Optional[str]:
@@ -8685,6 +8747,25 @@ def reports_page(conn):
         if editing_record
         else []
     )
+    current_report_context = (
+        int(selected_report_id) if selected_report_id is not None else None
+    )
+    stored_import_context = st.session_state.get(
+        REPORT_GRID_IMPORT_CONTEXT_KEY, "__unset__"
+    )
+    if stored_import_context == "__unset__":
+        st.session_state[REPORT_GRID_IMPORT_CONTEXT_KEY] = current_report_context
+    elif stored_import_context != current_report_context:
+        st.session_state[REPORT_GRID_IMPORT_CONTEXT_KEY] = current_report_context
+        st.session_state.pop(REPORT_GRID_IMPORT_ROWS_KEY, None)
+        st.session_state.pop(REPORT_GRID_IMPORT_FILENAME_KEY, None)
+        st.session_state.pop("report_grid_import_file", None)
+
+    if (
+        st.session_state.get(REPORT_GRID_IMPORT_CONTEXT_KEY) == current_report_context
+        and REPORT_GRID_IMPORT_ROWS_KEY in st.session_state
+    ):
+        grid_seed_rows = st.session_state.get(REPORT_GRID_IMPORT_ROWS_KEY) or []
     if not grid_seed_rows:
         fallback_row = _default_report_grid_row()
         if legacy_tasks:
@@ -8709,6 +8790,8 @@ def reports_page(conn):
         except OSError:
             existing_attachment_bytes = None
 
+    clear_import = False
+    submitted = False
     with st.form("work_report_form"):
         period_choice = st.selectbox(
             "Report cadence",
@@ -8786,8 +8869,72 @@ def reports_page(conn):
         st.caption(
             "Log service progress in a spreadsheet-style grid. Add rows for each customer or job completed."
         )
-        seed_for_editor = grid_seed_rows or [_default_report_grid_row()]
-        editor_seed = _grid_rows_for_editor(seed_for_editor)
+        seed_for_editor = grid_seed_rows or []
+        if not seed_for_editor:
+            seed_for_editor = [_default_report_grid_row()]
+        seed_for_editor_local = seed_for_editor
+
+        import_feedback = st.empty()
+        required_columns_note = ", ".join(REPORT_GRID_REQUIRED_HEADERS)
+        import_help = (
+            "Optional. Upload an Excel sheet to populate the grid. "
+            f"Required columns: {required_columns_note}."
+        )
+        grid_import_file = st.file_uploader(
+            "Import rows from Excel (.xlsx)",
+            type=["xlsx"],
+            key="report_grid_import_file",
+            help=import_help,
+        )
+        import_context_matches = (
+            st.session_state.get(REPORT_GRID_IMPORT_CONTEXT_KEY)
+            == current_report_context
+        )
+        if grid_import_file is not None:
+            imported_rows, import_error = _grid_rows_from_excel_upload(
+                grid_import_file
+            )
+            if import_error:
+                st.session_state.pop(REPORT_GRID_IMPORT_ROWS_KEY, None)
+                st.session_state.pop(REPORT_GRID_IMPORT_FILENAME_KEY, None)
+                st.session_state[REPORT_GRID_IMPORT_CONTEXT_KEY] = (
+                    current_report_context
+                )
+                import_feedback.error(import_error)
+            else:
+                st.session_state[REPORT_GRID_IMPORT_ROWS_KEY] = imported_rows
+                st.session_state[REPORT_GRID_IMPORT_FILENAME_KEY] = (
+                    grid_import_file.name
+                )
+                st.session_state[REPORT_GRID_IMPORT_CONTEXT_KEY] = (
+                    current_report_context
+                )
+                st.session_state.pop("report_grid_editor", None)
+                seed_for_editor_local = imported_rows or []
+                row_count = len(imported_rows)
+                if row_count:
+                    plural = "s" if row_count != 1 else ""
+                    import_feedback.success(
+                        f"Imported {row_count} row{plural} from {grid_import_file.name}."
+                    )
+                else:
+                    import_feedback.info(
+                        f"{grid_import_file.name} did not contain any data rows. Blank rows were skipped."
+                    )
+        else:
+            if import_context_matches and st.session_state.get(
+                REPORT_GRID_IMPORT_FILENAME_KEY
+            ):
+                stored_name = st.session_state[REPORT_GRID_IMPORT_FILENAME_KEY]
+                import_feedback.info(
+                    f"Showing data imported from {stored_name}. Upload a new file or clear the import to revert to the saved data."
+                )
+            if import_context_matches and REPORT_GRID_IMPORT_ROWS_KEY in st.session_state:
+                stored_rows = st.session_state.get(REPORT_GRID_IMPORT_ROWS_KEY)
+                if stored_rows is not None:
+                    seed_for_editor_local = stored_rows or seed_for_editor_local
+
+        editor_seed = _grid_rows_for_editor(seed_for_editor_local)
         if not editor_seed:
             editor_seed = _grid_rows_for_editor([_default_report_grid_row()])
         grid_df_seed = pd.DataFrame(editor_seed, columns=REPORT_GRID_FIELDS.keys())
@@ -8871,7 +9018,32 @@ def reports_page(conn):
             key="report_attachment_uploader",
             help="Optional proof of work, photos, or documentation.",
         )
-        submitted = st.form_submit_button("Save report", type="primary")
+        import_active = import_context_matches and bool(
+            st.session_state.get(REPORT_GRID_IMPORT_FILENAME_KEY)
+        )
+        actions_col1, actions_col2 = st.columns(2)
+        with actions_col1:
+            clear_import = st.form_submit_button(
+                "Clear imported grid",
+                type="secondary",
+                use_container_width=True,
+                disabled=not import_active,
+            )
+        with actions_col2:
+            submitted = st.form_submit_button(
+                "Save report",
+                type="primary",
+                use_container_width=True,
+            )
+
+    if clear_import:
+        st.session_state.pop(REPORT_GRID_IMPORT_ROWS_KEY, None)
+        st.session_state.pop(REPORT_GRID_IMPORT_FILENAME_KEY, None)
+        st.session_state[REPORT_GRID_IMPORT_CONTEXT_KEY] = current_report_context
+        st.session_state.pop("report_grid_import_file", None)
+        st.session_state.pop("report_grid_editor", None)
+        _safe_rerun()
+        return
 
     if submitted:
         cleanup_path: Optional[str] = None
@@ -8963,6 +9135,10 @@ def reports_page(conn):
                         st.error(str(err))
                     else:
                         st.success("Report saved successfully.")
+                        st.session_state.pop(REPORT_GRID_IMPORT_ROWS_KEY, None)
+                        st.session_state.pop(REPORT_GRID_IMPORT_FILENAME_KEY, None)
+                        st.session_state.pop("report_grid_import_file", None)
+                        st.session_state.pop("report_grid_editor", None)
                         if cleanup_path:
                             old_path = resolve_upload_path(cleanup_path)
                             if old_path and old_path.exists():
