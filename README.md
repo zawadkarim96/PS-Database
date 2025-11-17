@@ -1,82 +1,79 @@
-# PS Business Suite
+# PS Sales Manager
 
-The PS Business Suite merges the legacy **PS Mini CRM** and **PS Sales Manager** systems into a single multi-page Streamlit experience powered by one SQLite database. Admins and staff log in once to work on customers, service operations, sales quotations, letters, and analytics without switching apps.
+PS Sales Manager is a Streamlit application for managing quotations, work orders,
+delivery orders and follow-up notifications for sales teams. The tool focuses on
+sales workflows (from quotation to payment collection) while adopting the
+structure and best practices of the PS Service Software project.
 
-Every Streamlit page shows the credit text **“by Zad”** in a compact footer as requested.
+## Features
 
-## Project layout
+- **Secure authentication** – Username/password login with SHA-256 hashing and
+  role-based access (admin vs. staff).
+- **Quotation management** – Create quotations, upload PDF documents, manage
+  statuses (pending, accepted, declined, inform later) and schedule follow-up
+  reminders automatically.
+- **Work & delivery orders** – Track downstream documents, upload PDFs and
+  monitor missing steps through automated notifications.
+- **Company, category and district catalogue** – Maintain master data with
+  multi-category assignments per company.
+- **Notifications** – Built-in reminder system covering follow-ups, missing work
+  orders/delivery orders and overdue payments.
+- **Dashboards** – Streamlit charts for quotation trends, revenue insights and
+  performance metrics.
+- **Configurable grace periods** – Admins can adjust reminder lead times from
+  the settings page.
 
-```
-ps_business_suite/
-├── app.py                 # Dashboard landing page
-├── core/
-│   ├── __init__.py
-│   ├── auth.py (future expansion placeholder)
-│   ├── config.py          # Runtime settings & storage paths
-│   ├── crm.py             # Legacy CRM logic (customers, warranties, service, reports)
-│   ├── db.py              # Shared SQLite helpers + schema bootstrapper
-│   ├── sales.py           # Legacy PS-SALES UI and services
-│   └── utils.py           # UI helpers (includes the “by Zad” footer)
-├── pages/
-│   ├── dashboard.py       # CRM dashboard
-│   ├── customers.py       # Customers/Warranties/Imports tabs
-│   ├── database.py        # SQLite inspector & backup tools
-│   ├── sales.py           # PS Sales Manager workspace
-│   ├── reports.py         # Work reports
-│   └── admin.py           # User admin utilities
-└── static/
-    ├── css/
-    └── uploads/
-```
+## Installation
 
-The shared SQLite file defaults to `<APP_STORAGE_DIR>/ps_business_suite.db` (per `storage_paths.py`). Both CRM and Sales schemas live inside this database.
-
-## Running locally
-
-1. Install dependencies:
+1. Create and activate a virtual environment (recommended).
+2. Install dependencies:
 
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
    pip install -r requirements.txt
    ```
 
-2. Launch Streamlit:
+3. (Optional) Override the data directory by setting `PS_SALES_DATA_DIR` if the
+   default home-based location is not writable (for example on Render).
+
+4. Run the application with Streamlit:
 
    ```bash
-   streamlit run ps_business_suite/app.py
+   streamlit run sales_app.py
    ```
 
-3. Sign in with the default admin (`admin` / `admin123`). Create staff accounts from **Admin ➜ Users**.
+The application stores its SQLite database and uploads under the user-specific
+`~/.ps_sales/` directory (or `%APPDATA%\ps_sales\` on Windows). On container
+platforms such as Render, the app falls back to a `.ps_sales/` directory inside
+the working directory so the service can write files. The directory is created
+automatically on first launch together with default configuration settings and a
+pair of seed accounts for testing: an administrator (`admin` / `admin`) and a
+staff salesperson (`salesperson` / `admin`).
 
-The app automatically creates the SQLite schema, uploads folders, and default lookups on first launch.
+## Usage Overview
 
-## Railway deployment
+- **Login** with your credentials. Use the seeded admin account on first run and
+  change the password immediately.
+- **Navigation** is available via the sidebar. Admin users can access all
+  management pages; staff users see only their own records.
+- **Quotations** support inline company creation, category insights, follow-up
+  reminders and PDF uploads stored safely under the uploads directory.
+- **Work orders** become available after quotations are marked as accepted; the
+  system warns users if work orders or delivery orders are missing after the
+  configured grace periods.
+- **Delivery orders** include revenue tracking and payment monitoring. Overdue
+  payments automatically create notifications for both the salesperson and admin
+  team.
+- **Notifications** can be reviewed and marked as read. The dashboard also shows
+  upcoming reminders.
 
-1. Push this repository to GitHub.
-2. Create a new Railway project and connect it to the repo.
-3. Set the service environment variables if you need custom paths:
-   - `APP_STORAGE_DIR` – persistent volume mount (`/data/ps-suite` recommended)
-   - `ADMIN_USER`, `ADMIN_PASS` – bootstrap credentials
-4. Railway detects the `Procfile` and runs `streamlit run ps_business_suite/app.py` listening on `$PORT`.
+## Desktop Packaging
 
-## Database migrations
+To distribute a desktop executable (for Windows/macOS/Linux), use tools such as
+`pyinstaller` or `briefcase`. Ensure that the packaging process preserves the
+`~/.ps_sales/` data directory so documents and the SQLite database remain
+accessible between sessions.
 
-The CRM logic now ensures the shared `users` table contains the extra `display_name`, `designation`, and `phone` columns required by the Sales module. On startup the app:
+## License
 
-1. Runs `ps_business_suite/core/crm.init_schema(conn)` to create/upgrade CRM tables.
-2. Runs `ps_business_suite/core/sales.init_schema(conn)` to create Sales tables in the same file.
-3. Keeps uploads under `<APP_STORAGE_DIR>/uploads` and Sales attachments under `<APP_STORAGE_DIR>/sales_data/uploads`.
-
-Existing installations that already have a `ps_crm.db` file are detected automatically. On first launch the app moves that legacy file into place as `ps_business_suite.db` so the merged experience immediately shows historical records. The upgrade routine then adds the new Sales columns automatically.
-
-## Combined features
-
-- CRM: Dashboards, customers, warranty tracking, maintenance/service tickets, Excel importer, duplicate inspector, work reports, and admin tools.
-- Sales: Quotation letters, quotations, work/delivery orders, document uploads, payment tracking, notifications, and account lockout rules.
-- Shared login with admin/staff roles and one credentials table.
-- Database maintenance page to download backups or vacuum the file.
-
-## Tests
-
-Use `python -m compileall ps_business_suite` for a quick syntax validation pass. Full unit tests from each legacy project still run under `pytest` if needed.
+This project inherits the licensing terms of the surrounding repository. Review
+those terms before redistribution.
